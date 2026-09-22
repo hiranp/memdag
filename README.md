@@ -2,7 +2,7 @@
 
 ![memdag logo](memdag-logo.svg)
 
-> Local-first relational DAG and FTS5 memory engine for AI coding harnesses.
+> Local-first relational DAG memory engine and dependency-aware task tracker for AI coding harnesses.
 
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](https://www.rust-lang.org/)
 [![SQLite](https://img.shields.io/badge/sqlite-WAL%20%2B%20FTS5-blue.svg)](https://www.sqlite.org/)
@@ -10,7 +10,7 @@
 [![MCP](https://img.shields.io/badge/protocol-MCP%20Stdio-purple.svg)](https://modelcontextprotocol.io/)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 
-memdag is a local, durable memory layer for AI coding agents. It stores memories as a directed graph, supports full-text retrieval, keeps decisions and context synchronized, and avoids the operational cost of background daemons and fragile flat-note systems.
+memdag is a local, durable memory layer for AI coding agents. It stores memories as a directed graph, supports full-text retrieval, keeps decisions and context synchronized, and avoids the operational cost of background daemons and fragile flat-note systems. `task`/`blocker` memory kinds plus dependency edges and a computed [ready queue](#task-tracking) also make it a lightweight dependency-aware task tracker on the same schema — see [Task Tracking](#task-tracking).
 
 ## Why memdag
 

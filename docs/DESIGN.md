@@ -73,14 +73,19 @@ The MCP controller (`src/mcp.rs`) and CLI parser (`src/cli.rs` + `src/main.rs`) 
 
 ### 4.1 Schema Definition
 
-Source of truth: `src/db.rs::SCHEMA_SQL`, applied via `execute_batch` on every connection open (idempotent `IF NOT EXISTS`).
+Source of truth: `src/db.rs`. Every connection open runs `PRAGMA_SQL` (cheap, per-connection
+state) unconditionally, then checks `sqlite_master` for the `memories` table and only runs the
+`DDL_SQL` batch (`CREATE TABLE`/`INDEX`/`TRIGGER`/`VIRTUAL TABLE`, all idempotent `IF NOT
+EXISTS`) if it's missing — see §8.1 for why that guard exists.
 
 ```sql
+-- PRAGMA_SQL: applied on every open()
 PRAGMA journal_mode = WAL;
 PRAGMA busy_timeout = 5000;
 PRAGMA foreign_keys = ON;
 PRAGMA synchronous = NORMAL;
 
+-- DDL_SQL: applied once, only if the schema doesn't exist yet
 -- Core memory entities (decisions, tasks, bugs, invariant facts)
 CREATE TABLE IF NOT EXISTS memories (
     id TEXT PRIMARY KEY,
@@ -253,6 +258,26 @@ ORDER BY v.distance ASC;
 ### 6.5 Secret Denylist
 `check_for_secrets` (`src/store.rs`) runs on `title`/`body`/`tags` inside `record_memory` and `consolidate_session`, before any row is inserted. It's a case-insensitive substring match against a fixed list of common credential markers (`sk-`, `ghp_`/`gho_`/`github_pat_`, `xoxb-`/`xoxp-`, `AKIA`, `AIza`, `-----BEGIN `, `api_key=`, `Authorization: Bearer`, etc.). A match aborts the write with an error naming the matched pattern (never the matched secret itself). This is a denylist, not a scanner — it catches obvious accidental paste-ins, not deliberately obfuscated secrets; extend `SECRET_PATTERNS` if a new credential shape shows up in the wild.
 
+### 6.6 Ready Queue (Multi-Agent Coordination)
+`MemoryStore::list_ready` returns `kind IN ('task', 'blocker')` rows with `status = 'active'` and no incoming active `blocks` edge, in one indexed query:
+
+```sql
+SELECT {MEMORY_COLS} FROM memories m
+WHERE m.status = 'active'
+  AND m.kind IN ('task', 'blocker')
+  AND NOT EXISTS (
+      SELECT 1 FROM memory_relations r
+      JOIN memories b ON r.source_id = b.id
+      WHERE r.target_id = m.id
+        AND r.relation_type = 'blocks'
+        AND b.status = 'active'
+  )
+ORDER BY m.created_at ASC
+LIMIT :limit;
+```
+
+Exposed as CLI `memdag ready` and MCP `list_ready`. It exists so multiple agents/subagents working the same project can each ask "what's claimable right now" in one call instead of `list_memories` + `get_memory`-per-row to check `blocked_by` relations. It is **not** an atomic claim: two agents can both read the same ready item before either resolves it (no `assignee`/`claimed_by` column). See README §Scope & Limitations for the comparison against tools (e.g. beads) that do provide atomic claiming.
+
 ---
 
 ## 7. Model Context Protocol (MCP) Interface
@@ -265,7 +290,7 @@ Per JSON-RPC 2.0 §4.1:
 - Client notifications (no `id` field) **MUST NOT receive a response frame**, including unrecognized ones. `handle_request`'s catch-all arm checks `req_id.as_ref()?` before building an error response, so any notification — known or not — is silently dropped instead of triggering a `-32601 Method not found` reply that would violate the spec.
 
 ### 7.2 Agent-Facing Instructions
-The `initialize` response includes an `instructions` string (`AGENT_INSTRUCTIONS` in `mcp.rs`) telling the calling model to call `search_memory` before starting a task, `record_memory`/`link_entities` at decision points, and `consolidate_session` before ending a session. Clients that surface MCP server instructions to the model (Claude Code, Claude Desktop) inject this automatically — no project-level hooks or prompt scaffolding required. Clients that don't honor the field can get the same guidance by copying it into `AGENTS.md`/`CLAUDE.md` (see README).
+The `initialize` response includes an `instructions` string (`AGENT_INSTRUCTIONS` in `mcp.rs`) telling the calling model to call `search_memory` before starting a task, `record_memory`/`link_entities` at decision points, `list_ready` before claiming task/blocker work (especially when other agents may be on the same project), and `consolidate_session` before ending a session. Clients that surface MCP server instructions to the model (Claude Code, Claude Desktop) inject this automatically — no project-level hooks or prompt scaffolding required. Clients that don't honor the field can get the same guidance by copying it into `AGENTS.md`/`CLAUDE.md` (see README).
 
 ### 7.3 MCP Tool Surface
 
@@ -277,6 +302,7 @@ The `initialize` response includes an `instructions` string (`AGENT_INSTRUCTIONS
 | `search_vector` | `embedding`, `limit` | Markdown list + DAG | KNN vector search with 1-hop expansion |
 | `get_memory` | `id` | Markdown detail + DAG | Direct entity lookup with all incoming/outgoing edges |
 | `list_memories` | `kind`, `status`, `limit` | Markdown list | Filtered list of memory nodes |
+| `list_ready` | `limit` | Markdown list | Claimable tasks/blockers: active, no incoming active `blocks` edge (§6.6) |
 | `resolve_memory` | `id`, `note` | Markdown confirmation | Transitions a memory to `resolved`, appending an optional note to its body |
 | `consolidate_session` | `session_id`, `learnings`, `purge_ephemeral` | Markdown summary | Records durable learnings; purges or archives the session's ephemeral nodes |
 
@@ -291,9 +317,10 @@ The CLI's `mcp install`/`mcp uninstall` subcommands (`src/main.rs`) merge or rem
 - `PRAGMA journal_mode = WAL`: Readers do not block writers; writers do not block readers.
 - `PRAGMA busy_timeout = 5000`: Under contention, queries automatically retry for up to 5 seconds before returning a busy error.
 - `PRAGMA synchronous = NORMAL`: Guarantees durability across application crashes while minimizing disk sync overhead.
+- **DDL contention under concurrent short-lived processes**: `CREATE TABLE/INDEX IF NOT EXISTS` is idempotent in effect, but each statement still takes a schema lock to check. A 20-process × 5-record concurrency stress test (multiple `memdag record` CLI invocations against one db file, simulating concurrent subagents) surfaced sporadic `SQLITE_BUSY` ("database is locked") when the full DDL batch ran on every process start, even with `busy_timeout` set. Fixed by gating `DDL_SQL` behind a `sqlite_master` existence check (§4.1) so it only runs once per database's lifetime; verified with the same stress test at higher volume afterward with zero errors.
 
 ### 8.2 Execution Latency
-- Full in-memory integration test suite (15 tests across 4 binaries): **< 0.1s** total execution time.
+- Full in-memory integration test suite (16 tests across 4 binaries): **< 0.1s** total execution time.
 - FTS5 query + 1-hop DAG expansion and atomic supersession transactions both complete in low-single-digit milliseconds against an in-memory database; no dedicated on-disk benchmark harness exists yet — treat these as order-of-magnitude, not measured SLAs.
 
 ---
@@ -302,7 +329,7 @@ The CLI's `mcp install`/`mcp uninstall` subcommands (`src/main.rs`) merge or rem
 
 Every commit to `memdag` should pass:
 1. `cargo build`
-2. `cargo test` (all unit + integration tests, currently 15)
+2. `cargo test` (all unit + integration tests, currently 16)
 3. `cargo clippy --all-targets` (zero warnings)
 4. `cargo fmt --all -- --check`
 
