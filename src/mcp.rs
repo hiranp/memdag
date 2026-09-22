@@ -478,7 +478,7 @@ impl McpServer {
         vec![
             json!({
                 "name": "record_memory",
-                "description": "Record a new memory node (decision, task, invariant, blocker, ephemeral) with optional atomic DAG supersession. When supersedes_id is provided, automatically marks the target memory as 'superseded' and records a 'supersedes' DAG relation in an atomic transaction.",
+                "description": "Record a new memory node (decision, task, invariant, blocker, ephemeral) with optional atomic DAG supersession. When supersedes_id is provided, automatically marks the target memory as 'superseded' and records a 'supersedes' DAG relation in an atomic transaction. Use kind='task' for work items and kind='blocker' for anything blocking one; link them with link_entities(blocker_id, task_id, 'blocks') and use list_ready to find unblocked work.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

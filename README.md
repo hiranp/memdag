@@ -122,10 +122,29 @@ memdag mcp uninstall --global
 
 The `initialize` response includes an `instructions` field telling the agent to call
 `search_memory` before starting a task, `record_memory`/`link_entities` at decision points,
-and `consolidate_session` before ending a session. Clients that surface MCP server
-instructions to the model (Claude Code, Claude Desktop) pick this up automatically — no
-project hooks or extra setup required. For clients that don't (or for extra reliability),
-copy the same guidance into your project's `AGENTS.md`/`CLAUDE.md`.
+`list_ready` before claiming task/blocker work, and `consolidate_session` before ending a
+session. Clients that surface MCP server instructions to the model (Claude Code, Claude
+Desktop) pick this up automatically — no project hooks or extra setup required.
+
+**Most other MCP clients don't render the `instructions` field at all**, so the agent only
+sees each tool's one-line `description`. Those are self-explanatory enough for basic use, but
+for reliable task-tracking behavior (using `kind='task'`/`kind='blocker'`, calling `list_ready`
+before claiming work) on a client that ignores `instructions`, paste this into your project's
+`AGENTS.md`/`CLAUDE.md`:
+
+```markdown
+This project uses memdag (MCP) for durable memory and task tracking.
+
+- Call `search_memory` before starting a task to recall past decisions/invariants/blockers.
+- Call `record_memory` for decisions/invariants worth remembering, and for tasks
+  (kind='task') and things blocking them (kind='blocker').
+- Call `link_entities(blocker_id, task_id, 'blocks')` to connect a blocker to a task.
+- Call `list_ready` to find claimable, unblocked tasks/blockers — don't just scan
+  `list_memories` and eyeball it, especially if other agents may be working on this project.
+- Call `resolve_memory` when a task or blocker is done.
+- Call `consolidate_session` before ending a session to promote durable learnings and
+  purge scratch/ephemeral notes.
+```
 
 ### Manual Configuration
 
