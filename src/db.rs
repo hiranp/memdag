@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{ffi, Connection};
+use rusqlite::{Connection, ffi};
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 
@@ -7,6 +7,7 @@ static INIT_SQLITE_VEC: Once = Once::new();
 
 pub fn ensure_sqlite_vec_registered() {
     INIT_SQLITE_VEC.call_once(|| unsafe {
+        #[allow(clippy::missing_transmute_annotations)]
         ffi::sqlite3_auto_extension(Some(std::mem::transmute(
             sqlite_vec::sqlite3_vec_init as *const (),
         )));
@@ -94,8 +95,7 @@ pub fn open_connection<P: AsRef<Path>>(path: P) -> Result<Connection> {
 
 pub fn open_in_memory() -> Result<Connection> {
     ensure_sqlite_vec_registered();
-    let conn = Connection::open_in_memory()
-        .context("Failed to open in-memory SQLite database")?;
+    let conn = Connection::open_in_memory().context("Failed to open in-memory SQLite database")?;
     init_pragmas_and_schema(&conn)?;
     Ok(conn)
 }

@@ -1,10 +1,8 @@
 use crate::models::{MemoryKind, RelationType, SessionLearning};
-use crate::store::{
-    format_search_results_for_llm, MemoryStore, RecordOptions, SearchOptions,
-};
+use crate::store::{MemoryStore, RecordOptions, SearchOptions, format_search_results_for_llm};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::{BufRead, Write};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -52,7 +50,10 @@ impl McpServer {
         let mut stdout = std::io::stdout();
         let reader = stdin.lock();
 
-        eprintln!("[memdag-mcp] Starting Stdio MCP Server (PID: {})", std::process::id());
+        eprintln!(
+            "[memdag-mcp] Starting Stdio MCP Server (PID: {})",
+            std::process::id()
+        );
 
         for line in reader.lines() {
             let line = match line {
@@ -125,8 +126,11 @@ impl McpServer {
                     error: None,
                 })
             }
-            "notifications/initialized" => {
-                // MCP notification, no response required
+            "notifications/initialized"
+            | "initialized"
+            | "notifications/cancelled"
+            | "$/cancelRequest" => {
+                // MCP notifications, no response required per JSON-RPC 2.0
                 None
             }
             "ping" => Some(JsonRpcResponse {
@@ -186,16 +190,20 @@ impl McpServer {
                     }
                 }
             }
-            unknown => Some(JsonRpcResponse {
-                jsonrpc: "2.0",
-                id: req_id,
-                result: None,
-                error: Some(JsonRpcError {
-                    code: -32601,
-                    message: format!("Method not found: {}", unknown),
-                    data: None,
-                }),
-            }),
+            unknown => {
+                // Per JSON-RPC 2.0: If req_id is None, this is a notification, MUST NOT reply.
+                req_id.as_ref()?;
+                Some(JsonRpcResponse {
+                    jsonrpc: "2.0",
+                    id: req_id,
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32601,
+                        message: format!("Method not found: {}", unknown),
+                        data: None,
+                    }),
+                })
+            }
         }
     }
 
@@ -208,8 +216,7 @@ impl McpServer {
                     .get("kind")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow::anyhow!("Missing 'kind' parameter"))?;
-                let kind = MemoryKind::from_str(kind_str)
-                    .map_err(|e| anyhow::anyhow!(e))?;
+                let kind = MemoryKind::from_str(kind_str).map_err(|e| anyhow::anyhow!(e))?;
 
                 let title = args
                     .get("title")
@@ -223,7 +230,10 @@ impl McpServer {
                     .ok_or_else(|| anyhow::anyhow!("Missing 'body' parameter"))?
                     .to_string();
 
-                let tags = args.get("tags").and_then(|v| v.as_str()).map(str::to_string);
+                let tags = args
+                    .get("tags")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
                 let supersedes_id = args
                     .get("supersedes_id")
                     .and_then(|v| v.as_str())
@@ -263,8 +273,8 @@ impl McpServer {
                     .get("relation_type")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow::anyhow!("Missing 'relation_type'"))?;
-                let relation_type = RelationType::from_str(rel_str)
-                    .map_err(|e| anyhow::anyhow!(e))?;
+                let relation_type =
+                    RelationType::from_str(rel_str).map_err(|e| anyhow::anyhow!(e))?;
 
                 store.link_entities(source_id, target_id, relation_type)?;
                 Ok(format!(
@@ -286,10 +296,7 @@ impl McpServer {
                     .get("include_resolved")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let limit = args
-                    .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(10) as usize;
+                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
 
                 let results = store.search_memory(SearchOptions {
                     query,
@@ -323,7 +330,10 @@ impl McpServer {
                         .and_then(|v| v.as_str())
                         .ok_or_else(|| anyhow::anyhow!("Learning missing 'body'"))?
                         .to_string();
-                    let tags = item.get("tags").and_then(|v| v.as_str()).map(str::to_string);
+                    let tags = item
+                        .get("tags")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
                     let kind = item
                         .get("kind")
                         .and_then(|v| v.as_str())
@@ -353,6 +363,166 @@ impl McpServer {
                     summary.ephemeral_archived,
                     summary.recorded_ids
                 ))
+            }
+            "get_memory" => {
+                let id = args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'id' parameter"))?;
+
+                match store.get_memory(id)? {
+                    Some((mem, rels)) => {
+                        let mut out = format!(
+                            "### [{}] {} (kind: {}, status: {})
+- **Body**: {}
+",
+                            mem.id,
+                            mem.title,
+                            mem.kind,
+                            mem.status,
+                            mem.body.trim()
+                        );
+                        if let Some(tags) = mem.tags.as_deref().filter(|t| !t.trim().is_empty()) {
+                            out.push_str(&format!("- **Tags**: {}\n", tags));
+                        }
+                        if !rels.is_empty() {
+                            out.push_str(
+                                "- **Relations (1-Hop DAG)**:
+",
+                            );
+                            for r in &rels {
+                                let title = r.target_title.as_deref().unwrap_or("Unknown");
+                                let status = r
+                                    .target_status
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                match r.direction {
+                                    crate::models::EdgeDirection::Outgoing => {
+                                        out.push_str(&format!(
+                                            "  - `{}` ➔ [{}] {} ({})
+",
+                                            r.relation_type, r.target_id, title, status
+                                        ));
+                                    }
+                                    crate::models::EdgeDirection::Incoming => {
+                                        out.push_str(&format!(
+                                            "  - `{}` ◄ [{}] {} ({})
+",
+                                            r.relation_type.inverse(),
+                                            r.target_id,
+                                            title,
+                                            status
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        Ok(out)
+                    }
+                    None => Ok(format!("Memory with ID '{}' not found.", id)),
+                }
+            }
+            "list_memories" => {
+                let status_filter = args.get("status").and_then(|v| v.as_str()).and_then(|s| {
+                    if s == "all" {
+                        None
+                    } else {
+                        crate::models::MemoryStatus::from_str(s).ok()
+                    }
+                });
+
+                let kind_filter = args
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .and_then(|k| crate::models::MemoryKind::from_str(k).ok());
+
+                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+
+                let list = store.list_memories(status_filter, kind_filter, limit)?;
+                if list.is_empty() {
+                    Ok("No memories found matching criteria.".to_string())
+                } else {
+                    let mut out = format!(
+                        "Found {} memories:
+
+",
+                        list.len()
+                    );
+                    for m in list {
+                        out.push_str(&format!(
+                            "- `[{}]` ({}) **{}**: {}
+",
+                            m.id, m.status, m.title, m.kind
+                        ));
+                    }
+                    Ok(out)
+                }
+            }
+            "resolve_memory" => {
+                let id = args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'id' parameter"))?;
+
+                let note = args.get("note").and_then(|v| v.as_str());
+                let updated = store.resolve_memory(id, note)?;
+                Ok(format!(
+                    "Successfully resolved memory [{}] '{}' (status: {})",
+                    updated.id, updated.title, updated.status
+                ))
+            }
+            "search_vector" => {
+                let emb_vals = args
+                    .get("embedding")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'embedding' float array"))?;
+
+                let embedding: Vec<f32> = emb_vals
+                    .iter()
+                    .filter_map(|v| v.as_f64().map(|f| f as f32))
+                    .collect();
+
+                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+
+                let results = store.search_vector(&embedding, limit)?;
+                if results.is_empty() {
+                    Ok("No vector matches found.".to_string())
+                } else {
+                    let mut out = format!(
+                        "Found {} vector nearest neighbors:
+
+",
+                        results.len()
+                    );
+                    for (i, (mem, dist, rels)) in results.iter().enumerate() {
+                        out.push_str(&format!(
+                            "### {}. [{}] {} (distance: {:.4}, kind: {})
+- **Body**: {}
+",
+                            i + 1,
+                            mem.id,
+                            mem.title,
+                            dist,
+                            mem.kind,
+                            mem.body.trim()
+                        ));
+                        if !rels.is_empty() {
+                            out.push_str(
+                                "- **Relations**:
+",
+                            );
+                            for r in rels {
+                                let title = r.target_title.as_deref().unwrap_or("Unknown");
+                                out.push_str(&format!(
+                                    "  - `{}` [{}] {}
+",
+                                    r.relation_type, r.target_id, title
+                                ));
+                            }
+                        }
+                    }
+                    Ok(out)
+                }
             }
             unknown => anyhow::bail!("Unknown tool: '{}'", unknown),
         }
@@ -484,7 +654,81 @@ impl McpServer {
                     },
                     "required": ["session_id", "learnings"]
                 }
-            })
+            }),
+            json!({
+                "name": "get_memory",
+                "description": "Retrieve a specific memory by ID along with its full body and bidirectional 1-hop DAG relations (outgoing and incoming dependencies, blockers, and supersessions).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "The memory ID to retrieve."
+                        }
+                    },
+                    "required": ["id"]
+                }
+            }),
+            json!({
+                "name": "list_memories",
+                "description": "List stored memories with optional status and kind filters.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "status": {
+                            "type": "string",
+                            "enum": ["active", "superseded", "resolved", "ephemeral", "all"],
+                            "description": "Filter by status (default: all active)."
+                        },
+                        "kind": {
+                            "type": "string",
+                            "enum": ["decision", "task", "invariant", "blocker", "ephemeral"],
+                            "description": "Optional filter by memory kind."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum number of memories to return (default: 20)."
+                        }
+                    }
+                }
+            }),
+            json!({
+                "name": "resolve_memory",
+                "description": "Mark an active task, blocker, or observation as resolved, with an optional resolution note.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "The memory ID to mark as resolved."
+                        },
+                        "note": {
+                            "type": "string",
+                            "description": "Optional note describing the resolution."
+                        }
+                    },
+                    "required": ["id"]
+                }
+            }),
+            json!({
+                "name": "search_vector",
+                "description": "Search memories by semantic similarity using sqlite-vec KNN on float[384] embeddings.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "embedding": {
+                            "type": "array",
+                            "items": { "type": "number" },
+                            "description": "Dense vector float array of dimension 384."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Number of nearest neighbors to return (default: 5)."
+                        }
+                    },
+                    "required": ["embedding"]
+                }
+            }),
         ]
     }
 }

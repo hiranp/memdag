@@ -132,6 +132,16 @@ pub enum Commands {
         no_purge: bool,
     },
 
+    /// Mark a memory as resolved
+    Resolve {
+        /// Memory ID
+        id: String,
+
+        /// Optional resolution note
+        #[arg(short, long)]
+        note: Option<String>,
+    },
+
     /// Show database summary statistics
     Stats,
 }

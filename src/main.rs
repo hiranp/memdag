@@ -5,9 +5,7 @@ use cli::{Cli, Commands};
 use memdag::db::{default_db_path, open_connection};
 use memdag::mcp::McpServer;
 use memdag::models::{MemoryKind, MemoryStatus, RelationType, SessionLearning};
-use memdag::store::{
-    format_search_results_for_llm, MemoryStore, RecordOptions, SearchOptions,
-};
+use memdag::store::{MemoryStore, RecordOptions, SearchOptions, format_search_results_for_llm};
 use std::io::IsTerminal;
 use std::str::FromStr;
 
@@ -36,8 +34,7 @@ fn main() -> anyhow::Result<()> {
             session,
             id,
         }) => {
-            let memory_kind = MemoryKind::from_str(&kind)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let memory_kind = MemoryKind::from_str(&kind).map_err(|e| anyhow::anyhow!(e))?;
 
             let record = store.record_memory(RecordOptions {
                 id,
@@ -62,11 +59,13 @@ fn main() -> anyhow::Result<()> {
             target_id,
             relation,
         }) => {
-            let rel_type = RelationType::from_str(&relation)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let rel_type = RelationType::from_str(&relation).map_err(|e| anyhow::anyhow!(e))?;
 
             store.link_entities(&source_id, &target_id, rel_type)?;
-            println!("Linked: [{}] --({})--> [{}]", source_id, rel_type, target_id);
+            println!(
+                "Linked: [{}] --({})--> [{}]",
+                source_id, rel_type, target_id
+            );
         }
         Some(Commands::Search {
             query,
@@ -88,41 +87,50 @@ fn main() -> anyhow::Result<()> {
 
             println!("{}", format_search_results_for_llm(&results));
         }
-        Some(Commands::Get { id }) => {
-            match store.get_memory(&id)? {
-                Some((mem, rels)) => {
-                    println!("ID:          {}", mem.id);
-                    println!("Title:       {}", mem.title);
-                    println!("Kind:        {}", mem.kind);
-                    println!("Status:      {}", mem.status);
-                    if let Some(tags) = mem.tags {
-                        println!("Tags:        {}", tags);
-                    }
-                    if let Some(sess) = mem.session_id {
-                        println!("Session:     {}", sess);
-                    }
-                    println!("Created At:  {}", mem.created_at);
-                    println!("Updated At:  {}", mem.updated_at);
-                    println!("\nBody:\n{}", mem.body);
-
-                    if !rels.is_empty() {
-                        println!("\nRelations:");
-                        for r in rels {
-                            println!(
-                                "  - {} -> [{}] {} ({:?})",
-                                r.relation_type,
-                                r.target_id,
-                                r.target_title.unwrap_or_default(),
-                                r.target_status
-                            );
-                        }
-                    }
+        Some(Commands::Get { id }) => match store.get_memory(&id)? {
+            Some((mem, rels)) => {
+                println!("ID:          {}", mem.id);
+                println!("Title:       {}", mem.title);
+                println!("Kind:        {}", mem.kind);
+                println!("Status:      {}", mem.status);
+                if let Some(tags) = mem.tags {
+                    println!("Tags:        {}", tags);
                 }
-                None => {
-                    println!("Memory with ID '{}' not found.", id);
+                if let Some(sess) = mem.session_id {
+                    println!("Session:     {}", sess);
+                }
+                println!("Created At:  {}", mem.created_at);
+                println!("Updated At:  {}", mem.updated_at);
+                println!("\nBody:\n{}", mem.body);
+
+                if !rels.is_empty() {
+                    println!("\nRelations:");
+                    for r in rels {
+                        let arrow = if r.direction == memdag::models::EdgeDirection::Outgoing {
+                            "➔"
+                        } else {
+                            "◄"
+                        };
+                        let rel_label = if r.direction == memdag::models::EdgeDirection::Outgoing {
+                            r.relation_type.as_str().to_string()
+                        } else {
+                            r.relation_type.inverse().to_string()
+                        };
+                        println!(
+                            "  - {} {} [{}] {} ({:?})",
+                            rel_label,
+                            arrow,
+                            r.target_id,
+                            r.target_title.unwrap_or_default(),
+                            r.target_status
+                        );
+                    }
                 }
             }
-        }
+            None => {
+                println!("Memory with ID '{}' not found.", id);
+            }
+        },
         Some(Commands::List {
             status,
             kind,
@@ -160,8 +168,7 @@ fn main() -> anyhow::Result<()> {
             tags,
             no_purge,
         }) => {
-            let learning_kind = MemoryKind::from_str(&kind)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let learning_kind = MemoryKind::from_str(&kind).map_err(|e| anyhow::anyhow!(e))?;
 
             let learnings = vec![SessionLearning {
                 title,
@@ -176,6 +183,13 @@ fn main() -> anyhow::Result<()> {
             println!("  Ephemeral purged:    {}", summary.ephemeral_purged);
             println!("  Ephemeral archived:  {}", summary.ephemeral_archived);
             println!("  Recorded IDs:        {:?}", summary.recorded_ids);
+        }
+        Some(Commands::Resolve { id, note }) => {
+            let updated = store.resolve_memory(&id, note.as_deref())?;
+            println!(
+                "Resolved memory [{}] {} (status: {})",
+                updated.id, updated.title, updated.status
+            );
         }
         Some(Commands::Stats) => {
             let stats = store.stats()?;
@@ -200,8 +214,13 @@ fn main() -> anyhow::Result<()> {
                 let mcp = McpServer::new(store);
                 mcp.run_stdio()?;
             } else {
-                println!("memdag v{} - Relational DAG & FTS5 memory engine with sqlite-vec", env!("CARGO_PKG_VERSION"));
-                println!("Run 'memdag --help' for CLI usage or 'memdag serve' to start the stdio MCP server.");
+                println!(
+                    "memdag v{} - Relational DAG & FTS5 memory engine with sqlite-vec",
+                    env!("CARGO_PKG_VERSION")
+                );
+                println!(
+                    "Run 'memdag --help' for CLI usage or 'memdag serve' to start the stdio MCP server."
+                );
             }
         }
     }

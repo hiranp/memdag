@@ -45,7 +45,9 @@ fn test_record_and_atomic_supersession() {
             id: Some("DEC-002".to_string()),
             kind: MemoryKind::Decision,
             title: "Migrate to SQLite WAL + FTS5 Relational DAG".to_string(),
-            body: "Flat markdown leads to context bloat and zombie context. Use SQLite DAG instead.".to_string(),
+            body:
+                "Flat markdown leads to context bloat and zombie context. Use SQLite DAG instead."
+                    .to_string(),
             tags: Some("sqlite wal fts5 dag".to_string()),
             supersedes_id: Some("DEC-001".to_string()),
             session_id: Some("sess-2".to_string()),
@@ -57,11 +59,17 @@ fn test_record_and_atomic_supersession() {
     assert_eq!(dec2.status, MemoryStatus::Active);
 
     // 3. Verify DEC-001 was automatically marked as superseded
-    let (old_mem, _) = store.get_memory("DEC-001").expect("get dec1").expect("found");
+    let (old_mem, _) = store
+        .get_memory("DEC-001")
+        .expect("get dec1")
+        .expect("found");
     assert_eq!(old_mem.status, MemoryStatus::Superseded);
 
     // 4. Verify supersedes relation edge exists in DEC-002
-    let (new_mem, rels) = store.get_memory("DEC-002").expect("get dec2").expect("found");
+    let (new_mem, rels) = store
+        .get_memory("DEC-002")
+        .expect("get dec2")
+        .expect("found");
     assert_eq!(new_mem.status, MemoryStatus::Active);
     assert_eq!(rels.len(), 1);
     assert_eq!(rels[0].relation_type, RelationType::Supersedes);
@@ -80,7 +88,8 @@ fn test_fts5_search_and_1_hop_dag_expansion() {
             id: Some("INV-001".to_string()),
             kind: MemoryKind::Invariant,
             title: "Zero Daemon Requirement".to_string(),
-            body: "Never run external background services; everything must be embedded in-process.".to_string(),
+            body: "Never run external background services; everything must be embedded in-process."
+                .to_string(),
             tags: Some("daemon zero-service embedded".to_string()),
             supersedes_id: None,
             session_id: None,
@@ -106,7 +115,9 @@ fn test_fts5_search_and_1_hop_dag_expansion() {
             id: Some("TSK-050".to_string()),
             kind: MemoryKind::Task,
             title: "Benchmark Multi-Process Lock Contention".to_string(),
-            body: "Run 100 concurrent subagents hitting BEGIN IMMEDIATE to test sqlite lock handling.".to_string(),
+            body:
+                "Run 100 concurrent subagents hitting BEGIN IMMEDIATE to test sqlite lock handling."
+                    .to_string(),
             tags: Some("benchmark lock wal contention".to_string()),
             supersedes_id: None,
             session_id: None,
@@ -133,13 +144,24 @@ fn test_fts5_search_and_1_hop_dag_expansion() {
         .expect("search");
 
     assert!(!results.is_empty());
-    let dec_res = results.iter().find(|r| r.memory.id == "DEC-010").expect("DEC-010 found");
+    let dec_res = results
+        .iter()
+        .find(|r| r.memory.id == "DEC-010")
+        .expect("DEC-010 found");
     assert_eq!(dec_res.relations.len(), 2);
 
-    let dep = dec_res.relations.iter().find(|r| r.target_id == "INV-001").expect("dep found");
+    let dep = dec_res
+        .relations
+        .iter()
+        .find(|r| r.target_id == "INV-001")
+        .expect("dep found");
     assert_eq!(dep.relation_type, RelationType::DependsOn);
 
-    let blk = dec_res.relations.iter().find(|r| r.target_id == "TSK-050").expect("blk found");
+    let blk = dec_res
+        .relations
+        .iter()
+        .find(|r| r.target_id == "TSK-050")
+        .expect("blk found");
     assert_eq!(blk.relation_type, RelationType::Blocks);
 }
 
@@ -188,7 +210,10 @@ fn test_session_consolidation_and_ephemeral_purge() {
     assert!(eph_after.is_none());
 
     // Verify new learning is active
-    let (learning, _) = store.get_memory(&res.recorded_ids[0]).expect("get").expect("found");
+    let (learning, _) = store
+        .get_memory(&res.recorded_ids[0])
+        .expect("get")
+        .expect("found");
     assert_eq!(learning.status, MemoryStatus::Active);
     assert_eq!(learning.kind, MemoryKind::Invariant);
 }
@@ -196,7 +221,7 @@ fn test_session_consolidation_and_ephemeral_purge() {
 #[test]
 fn test_sqlite_vec_extension_operations() {
     let conn = open_in_memory().expect("open db");
-    
+
     // Check vec_version()
     let version: String = conn
         .query_row("SELECT vec_version()", [], |r| r.get(0))
@@ -225,9 +250,34 @@ fn test_sqlite_vec_extension_operations() {
     // Query vec table directly
     let count: i64 = store
         .connection()
-        .query_row("SELECT count(*) FROM memories_vec WHERE id = 'VEC-001'", [], |r| r.get(0))
+        .query_row(
+            "SELECT count(*) FROM memories_vec WHERE id = 'VEC-001'",
+            [],
+            |r| r.get(0),
+        )
         .expect("count vec");
     assert_eq!(count, 1);
+
+    // Test KNN vector distance search with sqlite-vec
+    let emb_str = format!(
+        "[{}]",
+        embedding
+            .iter()
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let (match_id, distance): (String, f64) = store
+        .connection()
+        .query_row(
+            "SELECT id, distance FROM memories_vec WHERE embedding MATCH ?1 AND k = 1",
+            rusqlite::params![emb_str],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("knn match query");
+
+    assert_eq!(match_id, "VEC-001");
+    assert!(distance < 0.001);
 }
 
 #[test]
@@ -253,7 +303,9 @@ fn test_mcp_tool_execution() {
         }
     });
 
-    let resp = mcp.handle_request(serde_json::from_value(record_req).unwrap()).expect("response");
+    let resp = mcp
+        .handle_request(serde_json::from_value(record_req).unwrap())
+        .expect("response");
     assert!(resp.error.is_none());
     let res_val = resp.result.unwrap();
     let text = res_val["content"][0]["text"].as_str().unwrap();
@@ -272,8 +324,234 @@ fn test_mcp_tool_execution() {
         }
     });
 
-    let resp2 = mcp.handle_request(serde_json::from_value(search_req).unwrap()).expect("response");
+    let resp2 = mcp
+        .handle_request(serde_json::from_value(search_req).unwrap())
+        .expect("response");
     let res2_val = resp2.result.unwrap();
     let text2 = res2_val["content"][0]["text"].as_str().unwrap();
     assert!(text2.contains("DEC-TEST-001"));
+}
+
+#[test]
+fn test_mcp_notifications_silence() {
+    let conn = open_in_memory().expect("open db");
+    let store = MemoryStore::new(conn);
+    let mcp = memdag::McpServer::new(store);
+
+    // 1. Standard MCP client initialized notification (no id)
+    let init_notif = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "initialized"
+    });
+    let resp = mcp.handle_request(serde_json::from_value(init_notif).unwrap());
+    assert!(resp.is_none(), "Notifications MUST NOT receive a response");
+
+    // 2. notifications/initialized
+    let init_notif2 = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized"
+    });
+    let resp2 = mcp.handle_request(serde_json::from_value(init_notif2).unwrap());
+    assert!(resp2.is_none());
+
+    // 3. Unknown notification with id: null should also never produce an error response
+    let unknown_notif = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/unknown_custom"
+    });
+    let resp3 = mcp.handle_request(serde_json::from_value(unknown_notif).unwrap());
+    assert!(
+        resp3.is_none(),
+        "Unknown notifications must be silently ignored without error responses"
+    );
+}
+
+#[test]
+fn test_bidirectional_dag_relations() {
+    let conn = open_in_memory().expect("open db");
+    let mut store = MemoryStore::new(conn);
+
+    store
+        .record_memory(RecordOptions {
+            id: Some("DEC-A".to_string()),
+            kind: MemoryKind::Decision,
+            title: "Decision A".to_string(),
+            body: "Body A".to_string(),
+            tags: None,
+            supersedes_id: None,
+            session_id: None,
+            embedding: None,
+        })
+        .expect("rec A");
+
+    store
+        .record_memory(RecordOptions {
+            id: Some("TSK-B".to_string()),
+            kind: MemoryKind::Task,
+            title: "Task B".to_string(),
+            body: "Body B".to_string(),
+            tags: None,
+            supersedes_id: None,
+            session_id: None,
+            embedding: None,
+        })
+        .expect("rec B");
+
+    // Link: DEC-A blocks TSK-B
+    store
+        .link_entities("DEC-A", "TSK-B", RelationType::Blocks)
+        .expect("link");
+
+    // 1. Inspect source (DEC-A): Outgoing relation
+    let (dec_a, rels_a) = store.get_memory("DEC-A").expect("get A").expect("found");
+    assert_eq!(dec_a.id, "DEC-A");
+    assert_eq!(rels_a.len(), 1);
+    assert_eq!(rels_a[0].target_id, "TSK-B");
+    assert_eq!(rels_a[0].relation_type, RelationType::Blocks);
+    assert_eq!(rels_a[0].direction, memdag::models::EdgeDirection::Outgoing);
+
+    // 2. Inspect target (TSK-B): Incoming relation (bidirectional awareness!)
+    let (tsk_b, rels_b) = store.get_memory("TSK-B").expect("get B").expect("found");
+    assert_eq!(tsk_b.id, "TSK-B");
+    assert_eq!(rels_b.len(), 1);
+    assert_eq!(rels_b[0].target_id, "DEC-A");
+    assert_eq!(rels_b[0].relation_type, RelationType::Blocks);
+    assert_eq!(rels_b[0].direction, memdag::models::EdgeDirection::Incoming);
+}
+
+#[test]
+fn test_mcp_expanded_tools() {
+    let conn = open_in_memory().expect("open db");
+    let mut store = MemoryStore::new(conn);
+
+    // Record an active task
+    store
+        .record_memory(RecordOptions {
+            id: Some("TSK-001".to_string()),
+            kind: MemoryKind::Task,
+            title: "Investigate Memory Leaks".to_string(),
+            body: "Check long-lived Tokio task spawned handles.".to_string(),
+            tags: Some("tokio leak memory".to_string()),
+            supersedes_id: None,
+            session_id: None,
+            embedding: Some(vec![0.2f32; 384]),
+        })
+        .expect("rec");
+
+    let mcp = memdag::McpServer::new(store);
+
+    // 1. Test get_memory tool
+    let get_req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "tools/call",
+        "params": {
+            "name": "get_memory",
+            "arguments": { "id": "TSK-001" }
+        }
+    });
+    let resp = mcp
+        .handle_request(serde_json::from_value(get_req).unwrap())
+        .expect("resp");
+    let text = resp.result.unwrap()["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(text.contains("TSK-001"));
+    assert!(text.contains("Investigate Memory Leaks"));
+
+    // 2. Test list_memories tool
+    let list_req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 11,
+        "method": "tools/call",
+        "params": {
+            "name": "list_memories",
+            "arguments": { "status": "active" }
+        }
+    });
+    let resp2 = mcp
+        .handle_request(serde_json::from_value(list_req).unwrap())
+        .expect("resp");
+    let text2 = resp2.result.unwrap()["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(text2.contains("TSK-001"));
+
+    // 3. Test resolve_memory tool
+    let resolve_req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 12,
+        "method": "tools/call",
+        "params": {
+            "name": "resolve_memory",
+            "arguments": {
+                "id": "TSK-001",
+                "note": "Fixed by storing JoinSet and aborting on drop."
+            }
+        }
+    });
+    let resp3 = mcp
+        .handle_request(serde_json::from_value(resolve_req).unwrap())
+        .expect("resp");
+    let text3 = resp3.result.unwrap()["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(text3.contains("Successfully resolved memory [TSK-001]"));
+
+    // 4. Test search_vector tool
+    let vec_req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 13,
+        "method": "tools/call",
+        "params": {
+            "name": "search_vector",
+            "arguments": {
+                "embedding": vec![0.2f32; 384],
+                "limit": 1
+            }
+        }
+    });
+    let resp4 = mcp
+        .handle_request(serde_json::from_value(vec_req).unwrap())
+        .expect("resp");
+    let text4 = resp4.result.unwrap()["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(text4.contains("TSK-001"));
+}
+
+#[test]
+fn test_empty_query_fallback() {
+    let conn = open_in_memory().expect("open db");
+    let mut store = MemoryStore::new(conn);
+
+    store
+        .record_memory(RecordOptions {
+            id: Some("DEC-FALLBACK".to_string()),
+            kind: MemoryKind::Decision,
+            title: "Fallback Test".to_string(),
+            body: "Should be returned when query is empty".to_string(),
+            tags: None,
+            supersedes_id: None,
+            session_id: None,
+            embedding: None,
+        })
+        .expect("rec");
+
+    // Empty query
+    let results = store
+        .search_memory(SearchOptions {
+            query: "".to_string(),
+            kind: None,
+            include_resolved: false,
+            limit: 5,
+        })
+        .expect("search empty");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].memory.id, "DEC-FALLBACK");
 }

@@ -50,7 +50,10 @@ impl FromStr for MemoryKind {
             "invariant" => Ok(MemoryKind::Invariant),
             "blocker" => Ok(MemoryKind::Blocker),
             "ephemeral" => Ok(MemoryKind::Ephemeral),
-            other => Err(format!("Invalid memory kind: {}. Must be one of: decision, task, invariant, blocker, ephemeral", other)),
+            other => Err(format!(
+                "Invalid memory kind: {}. Must be one of: decision, task, invariant, blocker, ephemeral",
+                other
+            )),
         }
     }
 }
@@ -90,7 +93,10 @@ impl FromStr for MemoryStatus {
             "superseded" => Ok(MemoryStatus::Superseded),
             "resolved" => Ok(MemoryStatus::Resolved),
             "ephemeral" => Ok(MemoryStatus::Ephemeral),
-            other => Err(format!("Invalid memory status: {}. Must be one of: active, superseded, resolved, ephemeral", other)),
+            other => Err(format!(
+                "Invalid memory status: {}. Must be one of: active, superseded, resolved, ephemeral",
+                other
+            )),
         }
     }
 }
@@ -113,6 +119,23 @@ impl RelationType {
             RelationType::References => "references",
         }
     }
+
+    pub fn inverse(&self) -> &'static str {
+        match self {
+            RelationType::Supersedes => "superseded_by",
+            RelationType::DependsOn => "depended_on_by",
+            RelationType::Blocks => "blocked_by",
+            RelationType::References => "referenced_by",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeDirection {
+    #[default]
+    Outgoing,
+    Incoming,
 }
 
 impl fmt::Display for RelationType {
@@ -130,7 +153,10 @@ impl FromStr for RelationType {
             "depends_on" | "dependson" | "depends" => Ok(RelationType::DependsOn),
             "blocks" | "block" => Ok(RelationType::Blocks),
             "references" | "reference" => Ok(RelationType::References),
-            other => Err(format!("Invalid relation type: {}. Must be one of: supersedes, depends_on, blocks, references", other)),
+            other => Err(format!(
+                "Invalid relation type: {}. Must be one of: supersedes, depends_on, blocks, references",
+                other
+            )),
         }
     }
 }
@@ -155,6 +181,8 @@ pub struct RelatedEntity {
     pub target_title: Option<String>,
     pub target_kind: Option<MemoryKind>,
     pub target_status: Option<MemoryStatus>,
+    #[serde(default)]
+    pub direction: EdgeDirection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
