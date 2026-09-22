@@ -1,6 +1,6 @@
 # memdag
 
-![memdag logo](docs/branding/memdag-logo-01-dag-node.svg)
+![memdag logo](memdag-logo.svg)
 
 > Local-first relational DAG and FTS5 memory engine for AI coding harnesses.
 
