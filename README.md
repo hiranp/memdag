@@ -1,7 +1,6 @@
 # memdag
 
-> **Local-First Relational DAG & FTS5 Memory Engine for AI Coding Harnesses**
-> Built 100% in Rust with SQLite WAL, BM25 Full-Text Search, DAG supersession, embedded `sqlite-vec` vector support, and standard Model Context Protocol (MCP) over Stdio.
+> Local-first relational DAG and FTS5 memory engine for AI coding harnesses.
 
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](https://www.rust-lang.org/)
 [![SQLite](https://img.shields.io/badge/sqlite-WAL%20%2B%20FTS5-blue.svg)](https://www.sqlite.org/)
@@ -9,68 +8,58 @@
 [![MCP](https://img.shields.io/badge/protocol-MCP%20Stdio-purple.svg)](https://modelcontextprotocol.io/)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 
----
+memdag is a local, durable memory layer for AI coding agents. It stores memories as a directed graph, supports full-text retrieval, keeps decisions and context synchronized, and avoids the operational cost of background daemons and fragile flat-note systems.
 
-## 💡 Why memdag?
+## Why memdag
 
-Modern AI coding harnesses (Antigravity, Claude Code, VSCode, Cursor) struggle with two extremes of agent memory:
+Modern AI coding workflows tend to fail in one of three ways:
 
-1. **Heavy External Daemons (Letta / Mem0 / Zep)**:
-   - Require background services, PostgreSQL, Docker containers, or Python sidecars.
-   - Suffer from orphan processes, port conflicts, cold-start latency, and workspace switch breakage.
-2. **Naive Flat Stores (CLAUDE.md / flat key-value)**:
-   - Suffer from **Zombie Context**: outdated architectural decisions conflict with new ones.
-   - Suffer from token bloat and lack relational dependencies.
-3. **Pure Dense Vector Stores**:
-   - Embeddings often hallucinate or blur semantic lines between exact technical identifiers (e.g. `mistral.rs`, `sqlite-vec`, `E0502`, `usearch`), whereas codebases and bug traces require deterministic recall.
+1. Heavy external memory systems
+   - Require background services, databases, Docker, and extra runtime complexity.
+   - Add startup friction and drift across sessions.
+2. Flat markdown or key-value stores
+   - Cause zombie context and stale decisions to compete with current ones.
+   - Create low-signal retrieval and poor dependency tracking.
+3. Pure vector-only stores
+   - Blur exact technical identifiers and error signatures.
+   - Miss the relational semantics that codebases depend on.
 
-### The memdag Solution:
+memdag combines the useful parts of each approach in a single in-process SQLite-backed system:
 
-- ⚡ **Zero Background Daemons**: Single-file SQLite database configured with `PRAGMA journal_mode = WAL;` and `PRAGMA busy_timeout = 5000;`, giving multiple concurrent agent processes safe, high-speed multi-reader / single-writer access.
-- 🎯 **Deterministic FTS5 BM25 Recall**: Tokenized with `porter unicode61` stemming to match exact compiler errors, crate names, symbols, and architectural phrases instantly.
-- 🕸️ **Tackling Zombie Context via DAG Supersession**: Explicitly tracks directed relationships (`supersedes`, `depends_on`, `blocks`, `references`). When an agent updates a decision, the superseded memory is atomically marked as superseded and pruned from default context retrieval.
-- 🔍 **1-Hop DAG Context Expansion**: Searching retrieves matching active entities plus their immediate dependencies, blockers, and parent decisions in a single relational join.
-- 🧬 **Embedded `sqlite-vec`**: Native in-process vector embeddings support without external C extensions or separate daemon processes.
-- 🧹 **Ephemeral Session Cleanup**: Observations from aborted or scratch sessions are marked `ephemeral` by default and automatically purged or consolidated into permanent invariants during session wrap-up. A background sweep also purges stale `ephemeral` rows on every CLI invocation, so sessions that crash before consolidating don't leak memories forever.
-- 🔒 **Secret Denylist**: `record_memory` and `consolidate_session` refuse to write titles/bodies/tags matching common credential patterns (API keys, PEM blocks, tokens), so a leaked secret can't get baked into long-term memory.
+- WAL-backed SQLite for safe concurrent access without daemons
+- FTS5 BM25 search for deterministic retrieval of symbols, errors, and architectural phrases
+- DAG supersession for explicit memory replacement and deprecation
+- 1-hop relation expansion to surface dependent context with search results
+- Embedded sqlite-vec support for semantic vectors without an external service
+- Ephemeral-session cleanup to keep scratch context from polluting long-term memory
 
----
+## Core architecture
 
-## 🏛️ Architecture & Database Schema
-
-```
-┌────────────────────────────────────────────────────────┐
-│               AI Coding Harness (Claude/Cursor)       │
-└───────────────────────────┬────────────────────────────┘
-                            │ Stdio MCP JSON-RPC
-┌───────────────────────────▼────────────────────────────┐
-│                    memdag (Rust)                       │
-│  ┌──────────────────────────────────────────────────┐  │
-│  │   MCP Tools: record, link, search, consolidate   │  │
-│  └──────────────────────────┬───────────────────────┘  │
-│                             │                          │
-│  ┌──────────────────────────▼───────────────────────┐  │
-│  │   SQLite (WAL + busy_timeout=5000 + FKs ON)      │  │
-│  │                                                  │  │
-│  │   [ memories ] ◄──────► [ memory_relations ]    │  │
-│  │        ▲                 (supersedes, depends,   │  │
-│  │        │                  blocks, references)    │  │
-│  │   Sync Triggers                                  │  │
-│  │        │                                         │  │
-│  │   [ memories_fts ] (FTS5 BM25 + Porter)          │  │
-│  │   [ memories_vec ] (sqlite-vec float[384])       │  │
-│  └──────────────────────────────────────────────────┘  │
-└────────────────────────────────────────────────────────┘
+```text
+AI coding harness
+        │
+        │ Stdio MCP JSON-RPC
+        ▼
+      memdag (Rust)
+        │
+        ├─ MCP tools: record, link, search, consolidate
+        │
+        ▼
+    SQLite + WAL + foreign keys
+        │
+        ├─ memories
+        ├─ memory_relations
+        ├─ memories_fts (BM25)
+        └─ memories_vec (sqlite-vec)
 ```
 
-### SQLite Schema
+### SQLite schema
 
 ```sql
 PRAGMA journal_mode = WAL;
 PRAGMA busy_timeout = 5000;
 PRAGMA foreign_keys = ON;
 
--- Core memory entities (decisions, tasks, bugs, invariant facts)
 CREATE TABLE IF NOT EXISTS memories (
     id TEXT PRIMARY KEY,
     kind TEXT NOT NULL CHECK(kind IN ('decision', 'task', 'invariant', 'blocker', 'ephemeral')),
@@ -83,7 +72,6 @@ CREATE TABLE IF NOT EXISTS memories (
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
--- Relational Directed Graph (Supersession, Dependency, Blocking)
 CREATE TABLE IF NOT EXISTS memory_relations (
     source_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
     target_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
@@ -92,7 +80,6 @@ CREATE TABLE IF NOT EXISTS memory_relations (
     PRIMARY KEY (source_id, target_id, relation_type)
 );
 
--- FTS5 Virtual Table for BM25 Search
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     id UNINDEXED,
     title,
@@ -103,32 +90,26 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     tokenize='porter unicode61'
 );
 
--- Sync Triggers (AFTER INSERT, DELETE, UPDATE)
--- Optional Vector Table with sqlite-vec
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_vec USING vec0(
     id TEXT PRIMARY KEY,
     embedding float[384]
 );
 ```
 
----
+## MCP interface
 
-## 🛠️ MCP Tool Interface
-
-`memdag` implements the standard Model Context Protocol (MCP) over Stdio, providing 4 core endpoints:
+memdag exposes a compact standard MCP surface over stdio:
 
 | Tool | Parameters | Description |
-|---|---|---|
-| `record_memory` | `kind`, `title`, `body`, `tags`, `supersedes_id`, `session_id`, `id` | Inserts a new memory node. If `supersedes_id` is supplied, wraps the write in an atomic transaction: sets `memories.status = 'superseded'` on the previous ID, inserts the new memory as `active`, and creates a `supersedes` relation edge. |
-| `link_entities` | `source_id`, `target_id`, `relation_type` | Inserts a directed edge (`depends_on`, `blocks`, `references`, `supersedes`) into the DAG. |
-| `search_memory` | `query`, `kind` (optional), `include_resolved` (bool), `limit` (int) | Runs BM25 FTS5 search with 1-hop DAG expansion, formatting the output for immediate, high-density LLM context injection. |
-| `consolidate_session` | `session_id`, `learnings`, `purge_ephemeral` (bool) | Atomically registers permanent learnings while purging or archiving ephemeral observations from the session. |
+| --- | --- | --- |
+| `record_memory` | `kind`, `title`, `body`, `tags`, `supersedes_id`, `session_id`, `id` | Inserts a new memory node and can atomically supersede an older one. |
+| `link_entities` | `source_id`, `target_id`, `relation_type` | Inserts a directed edge such as `depends_on`, `blocks`, `references`, or `supersedes`. |
+| `search_memory` | `query`, `kind`, `include_resolved`, `limit` | Runs BM25 search with 1-hop DAG expansion for richer retrieval. |
+| `consolidate_session` | `session_id`, `learnings`, `purge_ephemeral` | Promotes learnings and prunes ephemeral session noise. |
 
----
+## Installation
 
-## 🚀 Installation & Setup
-
-### Build from Source
+### Build from source
 
 ```bash
 git clone https://github.com/hiranp/memdag.git
@@ -136,42 +117,34 @@ cd memdag
 cargo build --release
 ```
 
-The optimized binary will be located at `target/release/memdag`.
+The binary is available at `target/release/memdag`.
 
-### Install the MCP Server (recommended)
+### Install the MCP server
 
-`memdag mcp install` registers itself in a client's `mcpServers` config for you — no manual JSON editing required.
+`memdag mcp install` writes the client config for you so you do not need to hand-edit JSON files.
 
 ```bash
-# Project-local (writes ./.mcp.json, read by Claude Code, Cursor, Windsurf project scope)
+# project-local config
 memdag mcp install
 
-# User-global (writes ~/.claude.json's mcpServers key, merging with existing config)
+# user-global config
 memdag mcp install --global
 
-# Target a specific client's dedicated config file (e.g. Cursor/VS Code)
+# specific config path
 memdag mcp install --path ~/.cursor/mcp.json
 ```
-
-Each call merges an entry pointing at the current `memdag` binary's absolute path and `serve` argument; if `--db` was passed, it's baked in as `MEMDAG_DB` so the installed server always points at the same database regardless of the client's working directory. Existing keys in the target file are preserved.
 
 To remove it again:
 
 ```bash
-memdag mcp uninstall            # project-local
-memdag mcp uninstall --global   # user-global
+memdag mcp uninstall
+memdag mcp uninstall --global
 memdag mcp uninstall --path ~/.cursor/mcp.json
 ```
 
-### Configure Manually
+### Manual configuration
 
-Add `memdag` to your Claude Code MCP configuration (`~/.claude.json` or run `claude mcp add`):
-
-```bash
-claude mcp add memdag -- /path/to/memdag serve
-```
-
-Or configure directly in `claude.json`:
+Add `memdag` to a client config directly:
 
 ```json
 {
@@ -187,28 +160,10 @@ Or configure directly in `claude.json`:
 }
 ```
 
-### Configure with Cursor / VSCode MCP
+## CLI usage
 
-Add to your `mcp.json`:
+### 1. Record a decision
 
-```json
-{
-  "mcpServers": {
-    "memdag": {
-      "command": "memdag",
-      "args": ["serve"]
-    }
-  }
-}
-```
-
----
-
-## 💻 CLI Usage
-
-You can also interact directly with `memdag` from the terminal:
-
-### 1. Record a Decision
 ```bash
 memdag record \
   --kind decision \
@@ -218,7 +173,8 @@ memdag record \
   --id "DEC-2026-001"
 ```
 
-### 2. Supersede an Outdated Decision
+### 2. Supersede an outdated decision
+
 ```bash
 memdag record \
   --kind decision \
@@ -228,60 +184,65 @@ memdag record \
   --supersedes "DEC-2026-001"
 ```
 
-### 3. Link Dependencies & Blockers
+### 3. Link dependencies and blockers
+
 ```bash
 memdag link "TSK-002" "DEC-2026-001" "depends_on"
 memdag link "BLK-001" "TSK-002" "blocks"
 ```
 
-### 4. Search with 1-Hop DAG Expansion
+### 4. Search with 1-hop DAG expansion
+
 ```bash
 memdag search "concurrency wal"
 ```
-**Output:**
+
+Example output:
+
 ```markdown
 Found 1 relevant active memory/DAG entries:
 
 ### 1. [DEC-2026-001] Adopt SQLite WAL + FTS5 (kind: decision, status: active)
-- **Tags**: sqlite wal concurrency architecture
-- **Body**: Using SQLite in WAL mode gives safe concurrent multi-reader access without daemons.
-- **Relations (1-Hop DAG)**:
-  - `depends_on` ➔ [TSK-002] Verify lock handling (active)
+- Tags: sqlite wal concurrency architecture
+- Body: Using SQLite in WAL mode gives safe concurrent multi-reader access without daemons.
+- Relations (1-Hop DAG):
+  - depends_on → [TSK-002] Verify lock handling (active)
 ```
 
-### 5. Check Database Statistics
+### 5. Check database statistics
+
 ```bash
 memdag stats
 ```
 
-### 6. Resolve or Clean Up
+### 6. Resolve or clean up
+
 ```bash
 memdag resolve "TSK-002" --note "Fixed by storing JoinSet and aborting on drop."
 ```
-Ephemeral memories older than 24h are swept automatically on every CLI run (override with `MEMDAG_EPHEMERAL_TTL_SECS`); no manual GC command needed.
 
----
+Ephemeral memories older than 24 hours are automatically swept on CLI runs unless you override `MEMDAG_EPHEMERAL_TTL_SECS`.
 
-## 🧪 Testing
+## Testing
 
-Run the full integration test suite:
+Run the full test suite:
 
 ```bash
 cargo test
 ```
 
-Includes tests for:
-- SQLite WAL pragmas and foreign key constraints
-- Atomic supersession and DAG status propagation
-- FTS5 BM25 search and 1-hop relation joining
-- Session consolidation and ephemeral memory purging
-- `sqlite-vec` extension initialization and vector storage
-- MCP Stdio JSON-RPC request/response protocol
+This includes checks for:
 
----
+- SQLite WAL behavior and foreign key integrity
+- atomic supersession and DAG state propagation
+- FTS5 BM25 search and 1-hop relation joins
+- session consolidation and ephemeral cleanup
+- sqlite-vec initialization and vector storage
+- MCP stdio request and response flows
 
-## 📄 License
+## License
 
 Licensed under either of:
-- MIT License ([LICENSE-MIT](LICENSE) or http://opensource.org/licenses/MIT)
-- Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0)
+
+- MIT License ([LICENSE](LICENSE))
+- Apache License, Version 2.0 ([LICENSE](LICENSE))
