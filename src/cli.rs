@@ -45,7 +45,7 @@ pub enum Commands {
         body: String,
 
         /// Optional tags/synonyms
-        #[arg(short, long)]
+        #[arg(long)]
         tags: Option<String>,
 
         /// Optional ID of an older memory this new memory supersedes
@@ -138,7 +138,7 @@ pub enum Commands {
         kind: String,
 
         /// Tags
-        #[arg(short, long)]
+        #[arg(long)]
         tags: Option<String>,
 
         /// Do not purge ephemeral memories (archive them as resolved instead)
