@@ -132,10 +132,54 @@ pub fn default_db_path() -> PathBuf {
     if let Ok(path) = std::env::var("MEMDAG_DB") {
         return PathBuf::from(path);
     }
+    if let Some(root) = find_project_root(&std::env::current_dir().unwrap_or_default()) {
+        return root.join(".memdag").join("memdag.db");
+    }
     if let Some(proj_dirs) = directories::ProjectDirs::from("com", "memdag", "memdag") {
         let data_dir = proj_dirs.data_dir();
         std::fs::create_dir_all(data_dir).ok();
         return data_dir.join("memdag.db");
     }
     PathBuf::from("memdag.db")
+}
+
+// ponytail: walk up for a repo root (existing .memdag/ wins over .git so nested
+// crates in the same repo share one DB); falls back to the global data dir.
+fn find_project_root(start: &Path) -> Option<PathBuf> {
+    let mut dir = Some(start.to_path_buf());
+    while let Some(d) = dir {
+        if d.join(".memdag").is_dir() || d.join(".git").exists() {
+            return Some(d);
+        }
+        dir = d.parent().map(Path::to_path_buf);
+    }
+    None
+}
+
+#[cfg(test)]
+mod default_db_path_tests {
+    use super::find_project_root;
+    use std::fs;
+
+    #[test]
+    fn finds_git_root_from_nested_dir() {
+        let tmp = std::env::temp_dir().join(format!("memdag-test-git-{}", std::process::id()));
+        let nested = tmp.join("a/b");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(tmp.join(".git")).unwrap();
+
+        assert_eq!(find_project_root(&nested), Some(tmp.clone()));
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn prefers_existing_memdag_dir_over_ancestor_git() {
+        let tmp = std::env::temp_dir().join(format!("memdag-test-nested-{}", std::process::id()));
+        let inner = tmp.join("crate");
+        fs::create_dir_all(tmp.join(".git")).unwrap();
+        fs::create_dir_all(inner.join(".memdag")).unwrap();
+
+        assert_eq!(find_project_root(&inner), Some(inner.clone()));
+        fs::remove_dir_all(&tmp).unwrap();
+    }
 }

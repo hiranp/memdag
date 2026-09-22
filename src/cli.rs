@@ -10,7 +10,8 @@ use std::path::PathBuf;
     long_about = "A zero-daemon, local-first memory engine with SQLite WAL, BM25 FTS5, relational DAG supersession, and stdio Model Context Protocol (MCP) server."
 )]
 pub struct Cli {
-    /// Path to SQLite database file. Defaults to $MEMDAG_DB or standard application data path
+    /// Path to SQLite database file. Defaults to $MEMDAG_DB, or ./.memdag/memdag.db in the
+    /// nearest ancestor with .git/.memdag, or the standard application data path
     #[arg(short, long, global = true, env = "MEMDAG_DB")]
     pub db: Option<PathBuf>,
 

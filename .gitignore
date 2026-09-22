@@ -3,4 +3,5 @@
 *.db
 *.db-wal
 *.db-shm
+.memdag/
 .DS_Store
