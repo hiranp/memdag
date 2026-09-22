@@ -67,6 +67,17 @@ Modern agentic software engineering workflows frequently suffer from severe cont
 
 The MCP controller (`src/mcp.rs`) and CLI parser (`src/cli.rs` + `src/main.rs`) are two thin front ends over one `MemoryStore` (`src/store.rs`); every write path (`record_memory`, `link_entities`, `consolidate_session`, `resolve_memory`) is shared, so the CLI and the MCP server can never drift in behavior.
 
+### 3.1 Database Location & Export
+
+`default_db_path()` (`src/db.rs`) resolves, in order: `$MEMDAG_DB` → `<repo>/.memdag/memdag.db`
+for the nearest ancestor of `cwd` containing `.memdag/` or `.git` → the OS application data
+directory as a global fallback when no repo is found. Scoping to the project root means each
+repo's memories, tasks, and `list_ready` queue never mix with another project's; the walk-up
+check for an existing `.memdag/` before `.git` lets a monorepo pin one shared DB for nested
+crates. `MemoryStore::export_all()` / `memdag export` serializes every memory and relation to
+plain JSON as a read-only sidecar (for committing a snapshot or moving data between machines) —
+it is not a sync mechanism and has no corresponding importer.
+
 ---
 
 ## 4. Data Model & Database Schema

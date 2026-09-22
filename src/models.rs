@@ -207,6 +207,20 @@ fn default_learning_kind() -> MemoryKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryRelation {
+    pub source_id: String,
+    pub target_id: String,
+    pub relation_type: RelationType,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportData {
+    pub memories: Vec<Memory>,
+    pub relations: Vec<MemoryRelation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatabaseStats {
     pub total_memories: i64,
     pub active_memories: i64,

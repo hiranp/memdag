@@ -158,6 +158,12 @@ pub enum Commands {
 
     /// Show database summary statistics
     Stats,
+
+    /// Export all memories and relations as JSON (to a file, or stdout if no path given)
+    Export {
+        /// Output file path. Prints to stdout if omitted.
+        path: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]

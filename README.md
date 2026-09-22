@@ -263,6 +263,37 @@ memdag stats
 
 Ephemeral memories older than 24 hours are swept automatically on CLI runs (customizable via `MEMDAG_EPHEMERAL_TTL_SECS`).
 
+### 6. Export to JSON
+```bash
+memdag export                       # pretty JSON to stdout
+memdag export ./memdag-export.json  # write to a file
+```
+Dumps every memory and relation as plain JSON (`{ "memories": [...], "relations": [...] }`).
+The SQLite file at `default_db_path()` (see [Where memdag stores its database](#where-memdag-stores-its-database)) remains the source of truth; this is a point-in-time sidecar for
+committing a snapshot to git, diffing across sessions, or migrating data to another machine —
+there's no importer, so treat it as read-only output.
+
+---
+
+## Where memdag stores its database
+
+`default_db_path()` resolves, in order:
+
+1. `$MEMDAG_DB`, if set.
+2. `<repo>/.memdag/memdag.db`, where `<repo>` is the nearest ancestor directory (walking up from
+   the current working directory) containing a `.memdag/` or `.git`. This keeps each project's
+   memories, tasks, and `list_ready` queue isolated from every other project on the machine.
+3. The OS-standard application data directory (e.g. `~/.local/share/memdag/memdag.db` on Linux),
+   if no project root is found.
+
+`.memdag/` is gitignored by default — the database itself isn't meant to be committed. If you
+want a project's memory to travel with the repo (code review, cross-machine sync), commit the
+output of `memdag export` instead of the SQLite file.
+
+Existing databases from before this project-scoping change (anywhere under the old global data
+directory) are **not** auto-migrated — copy the file into `<repo>/.memdag/memdag.db` manually if
+you want to keep that history.
+
 ---
 
 ## Task Tracking

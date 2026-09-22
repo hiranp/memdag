@@ -1,6 +1,6 @@
 use crate::models::{
-    DatabaseStats, EdgeDirection, Memory, MemoryKind, MemorySearchResult, MemoryStatus,
-    RelatedEntity, RelationType, SessionLearning,
+    DatabaseStats, EdgeDirection, ExportData, Memory, MemoryKind, MemoryRelation,
+    MemorySearchResult, MemoryStatus, RelatedEntity, RelationType, SessionLearning,
 };
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -535,6 +535,36 @@ impl MemoryStore {
     }
 
     /// Get overall database statistics.
+    /// Dump every memory and relation as a plain struct, for a JSON sidecar export
+    /// (e.g. to commit alongside the DB, or migrate data between machines).
+    pub fn export_all(&self) -> Result<ExportData> {
+        let memories = self
+            .conn
+            .prepare(&format!("SELECT {MEMORY_COLS} FROM memories ORDER BY created_at"))?
+            .query_map([], row_to_memory)?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let relations = self
+            .conn
+            .prepare(
+                "SELECT source_id, target_id, relation_type, created_at \
+                 FROM memory_relations ORDER BY created_at",
+            )?
+            .query_map([], |row| {
+                let relation_type: String = row.get(2)?;
+                Ok(MemoryRelation {
+                    source_id: row.get(0)?,
+                    target_id: row.get(1)?,
+                    relation_type: RelationType::from_str(&relation_type)
+                        .unwrap_or(RelationType::References),
+                    created_at: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(ExportData { memories, relations })
+    }
+
     pub fn stats(&self) -> Result<DatabaseStats> {
         let total_memories: i64 =
             self.conn

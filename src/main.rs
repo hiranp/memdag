@@ -218,6 +218,22 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Some(Commands::Export { path }) => {
+            let data = store.export_all()?;
+            let json = serde_json::to_string_pretty(&data)?;
+            match path {
+                Some(path) => {
+                    std::fs::write(&path, json)?;
+                    println!(
+                        "Exported {} memories, {} relations to {}",
+                        data.memories.len(),
+                        data.relations.len(),
+                        path.display()
+                    );
+                }
+                None => println!("{json}"),
+            }
+        }
         None => {
             // Default behavior: if stdin is not a terminal (e.g. piped or spawned by MCP client), run MCP server.
             // If it is a terminal, print help.
