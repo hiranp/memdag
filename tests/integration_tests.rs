@@ -1,6 +1,7 @@
 use memdag::db::open_in_memory;
 use memdag::models::{MemoryKind, MemoryStatus, RelationType, SessionLearning};
 use memdag::store::{MemoryStore, RecordOptions, SearchOptions};
+use std::process::Command;
 
 #[test]
 fn test_database_initialization_pragmas() {
@@ -554,4 +555,123 @@ fn test_empty_query_fallback() {
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].memory.id, "DEC-FALLBACK");
+}
+
+#[test]
+fn test_record_memory_rejects_secret_patterns() {
+    let conn = open_in_memory().expect("open db");
+    let mut store = MemoryStore::new(conn);
+
+    let err = store
+        .record_memory(RecordOptions {
+            id: Some("DEC-SECRET".to_string()),
+            kind: MemoryKind::Decision,
+            title: "Rotate keys".to_string(),
+            body: "New key is sk-abcdef1234567890".to_string(),
+            tags: None,
+            supersedes_id: None,
+            session_id: None,
+            embedding: None,
+        })
+        .expect_err("should refuse to record a memory containing a secret pattern");
+    assert!(err.to_string().contains("secret pattern"));
+
+    // Nothing should have been written.
+    assert!(
+        store
+            .get_memory("DEC-SECRET")
+            .expect("get")
+            .is_none()
+    );
+}
+
+#[test]
+fn test_purge_expired_ephemeral() {
+    let conn = open_in_memory().expect("open db");
+    let mut store = MemoryStore::new(conn);
+
+    store
+        .record_memory(RecordOptions {
+            id: Some("EPH-OLD".to_string()),
+            kind: MemoryKind::Ephemeral,
+            title: "Stale scratch note".to_string(),
+            body: "Left behind by a crashed session.".to_string(),
+            tags: None,
+            supersedes_id: None,
+            session_id: Some("crashed-session".to_string()),
+            embedding: None,
+        })
+        .expect("record ephemeral");
+
+    // Backdate created_at so it looks older than the TTL.
+    store
+        .connection()
+        .execute(
+            "UPDATE memories SET created_at = datetime('now', '-2 days') WHERE id = 'EPH-OLD'",
+            [],
+        )
+        .expect("backdate");
+
+    // A 1-hour TTL should purge it.
+    let purged = store
+        .purge_expired_ephemeral(60 * 60)
+        .expect("purge expired");
+    assert_eq!(purged, 1);
+    assert!(store.get_memory("EPH-OLD").expect("get").is_none());
+}
+
+#[test]
+fn test_purge_expired_ephemeral_keeps_recent() {
+    let conn = open_in_memory().expect("open db");
+    let mut store = MemoryStore::new(conn);
+
+    store
+        .record_memory(RecordOptions {
+            id: Some("EPH-FRESH".to_string()),
+            kind: MemoryKind::Ephemeral,
+            title: "Fresh scratch note".to_string(),
+            body: "Still within TTL.".to_string(),
+            tags: None,
+            supersedes_id: None,
+            session_id: Some("live-session".to_string()),
+            embedding: None,
+        })
+        .expect("record ephemeral");
+
+    let purged = store
+        .purge_expired_ephemeral(24 * 60 * 60)
+        .expect("purge expired");
+    assert_eq!(purged, 0);
+    assert!(store.get_memory("EPH-FRESH").expect("get").is_some());
+}
+
+#[test]
+fn test_mcp_install_and_uninstall_cli() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg_path = dir.path().join("mcp-config.json");
+
+    let bin = env!("CARGO_BIN_EXE_memdag");
+
+    let install = Command::new(bin)
+        .args(["mcp", "install", "--path"])
+        .arg(&cfg_path)
+        .output()
+        .expect("run install");
+    assert!(install.status.success());
+
+    let raw = std::fs::read_to_string(&cfg_path).expect("read config");
+    let value: serde_json::Value = serde_json::from_str(&raw).expect("parse config");
+    assert_eq!(value["mcpServers"]["memdag"]["args"][0], "serve");
+    assert!(value["mcpServers"]["memdag"]["command"].is_string());
+
+    let uninstall = Command::new(bin)
+        .args(["mcp", "uninstall", "--path"])
+        .arg(&cfg_path)
+        .output()
+        .expect("run uninstall");
+    assert!(uninstall.status.success());
+
+    let raw_after = std::fs::read_to_string(&cfg_path).expect("read config");
+    let value_after: serde_json::Value = serde_json::from_str(&raw_after).expect("parse config");
+    assert!(value_after["mcpServers"].get("memdag").is_none());
 }

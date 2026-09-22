@@ -4,8 +4,11 @@ use crate::models::{
 };
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use std::collections::HashMap;
 use std::str::FromStr;
+
+/// The 9 memory columns, in the order `row_to_memory` expects.
+const MEMORY_COLS: &str =
+    "id, kind, title, body, tags, status, session_id, created_at, updated_at";
 
 #[derive(Debug, Clone)]
 pub struct RecordOptions {
@@ -60,12 +63,10 @@ impl MemoryStore {
         &self.conn
     }
 
-    pub fn connection_mut(&mut self) -> &mut Connection {
-        &mut self.conn
-    }
-
     /// Record a memory entity with atomic supersession handling.
     pub fn record_memory(&mut self, opts: RecordOptions) -> Result<Memory> {
+        check_for_secrets(&opts.title, &opts.body, opts.tags.as_deref())?;
+
         let new_id = opts.id.unwrap_or_else(|| {
             let short_uuid = &uuid::Uuid::new_v4().to_string()[..8];
             format!("{}-{}", opts.kind.prefix(), short_uuid)
@@ -134,42 +135,18 @@ impl MemoryStore {
 
         // If embedding is supplied, insert into sqlite-vec table
         if let Some(emb) = opts.embedding {
-            let emb_str = format!(
-                "[{}]",
-                emb.iter()
-                    .map(|f| f.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
             tx.execute(
                 "INSERT OR REPLACE INTO memories_vec (id, embedding) VALUES (?1, ?2)",
-                params![new_id, emb_str],
+                params![new_id, embedding_to_json(&emb)],
             )
             .context("Failed to insert vector embedding into memories_vec")?;
         }
 
         // Fetch the recorded memory row
         let memory = tx.query_row(
-            r#"
-            SELECT id, kind, title, body, tags, status, session_id, created_at, updated_at
-            FROM memories WHERE id = ?1
-            "#,
+            &format!("SELECT {MEMORY_COLS} FROM memories WHERE id = ?1"),
             params![new_id],
-            |row| {
-                let kind_str: String = row.get(1)?;
-                let status_str: String = row.get(5)?;
-                Ok(Memory {
-                    id: row.get(0)?,
-                    kind: MemoryKind::from_str(&kind_str).unwrap_or(MemoryKind::Decision),
-                    title: row.get(2)?,
-                    body: row.get(3)?,
-                    tags: row.get(4)?,
-                    status: MemoryStatus::from_str(&status_str).unwrap_or(MemoryStatus::Active),
-                    session_id: row.get(6)?,
-                    created_at: row.get(7)?,
-                    updated_at: row.get(8)?,
-                })
-            },
+            row_to_memory,
         )?;
 
         tx.commit()
@@ -229,184 +206,60 @@ impl MemoryStore {
         Ok(())
     }
 
-    /// Search active memories using FTS5 BM25 with 1-hop DAG expansion.
+    /// Search active memories using FTS5 BM25 with bidirectional 1-hop DAG expansion.
+    /// An empty or untokenizable query falls back to the most recently updated memories.
     pub fn search_memory(&self, opts: SearchOptions) -> Result<Vec<MemorySearchResult>> {
         let fts_query = sanitize_fts5_query(&opts.query);
-        if fts_query.trim().is_empty() {
-            // Fallback: return most recent active memories up to limit
-            let list = self.list_memories(
-                if opts.include_resolved {
-                    None
-                } else {
-                    Some(MemoryStatus::Active)
+        let limit = opts.limit.clamp(1, 100);
+        let status = if opts.include_resolved {
+            None
+        } else {
+            Some(MemoryStatus::Active)
+        };
+
+        let ranked: Vec<(Memory, f64)> = if fts_query.is_empty() {
+            self.list_memories(status, opts.kind, limit)?
+                .into_iter()
+                .map(|m| (m, 0.0))
+                .collect()
+        } else {
+            let mut stmt = self.conn.prepare(&format!(
+                r#"
+                SELECT m.{MEMORY_COLS_M}, bm25(memories_fts) AS rank
+                FROM memories_fts f
+                JOIN memories m ON f.rowid = m.rowid
+                WHERE memories_fts MATCH :query
+                  AND (:include_resolved = 1 OR m.status = 'active')
+                  AND (:kind IS NULL OR m.kind = :kind)
+                ORDER BY rank
+                LIMIT :limit
+                "#,
+                MEMORY_COLS_M = MEMORY_COLS.replace(", ", ", m.")
+            ))?;
+
+            stmt.query_map(
+                rusqlite::named_params! {
+                    ":query": fts_query,
+                    ":include_resolved": opts.include_resolved as i64,
+                    ":kind": opts.kind.map(|k| k.as_str()),
+                    ":limit": limit as i64,
                 },
-                opts.kind,
-                opts.limit,
-            )?;
-            let mut results = Vec::new();
-            for mem in list {
-                let relations = self.get_memory_relations(&mem.id)?;
-                results.push(MemorySearchResult {
-                    memory: mem,
-                    rank: 0.0,
-                    relations,
-                });
-            }
-            return Ok(results);
-        }
+                |row| Ok((row_to_memory(row)?, row.get::<_, f64>(9)?)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+        };
 
-        let include_resolved = if opts.include_resolved { 1 } else { 0 };
-        let kind_str = opts.kind.map(|k| k.as_str().to_string());
-        let limit = opts.limit.clamp(1, 100) as i64;
-
-        let query_sql = r#"
-        WITH matched_memories AS (
-            SELECT 
-                m.id, m.kind, m.title, m.body, m.tags, m.status, m.session_id, m.created_at, m.updated_at,
-                bm25(memories_fts) AS rank
-            FROM memories_fts f
-            JOIN memories m ON f.rowid = m.rowid
-            WHERE memories_fts MATCH :query
-              AND (:include_resolved = 1 OR m.status = 'active')
-              AND (:kind IS NULL OR m.kind = :kind)
-            ORDER BY rank
-            LIMIT :limit
-        ),
-        all_relations AS (
-            -- Outgoing edges
-            SELECT 
-                r.source_id AS memory_id,
-                r.relation_type,
-                target.id AS related_id,
-                target.title AS related_title,
-                target.kind AS related_kind,
-                target.status AS related_status,
-                'outgoing' AS direction
-            FROM memory_relations r
-            JOIN memories target ON r.target_id = target.id
-
-            UNION ALL
-
-            -- Incoming edges
-            SELECT 
-                r.target_id AS memory_id,
-                r.relation_type,
-                source.id AS related_id,
-                source.title AS related_title,
-                source.kind AS related_kind,
-                source.status AS related_status,
-                'incoming' AS direction
-            FROM memory_relations r
-            JOIN memories source ON r.source_id = source.id
-        )
-        SELECT 
-            mm.id, mm.kind, mm.title, mm.body, mm.tags, mm.status, mm.session_id, mm.created_at, mm.updated_at, mm.rank,
-            rel.relation_type,
-            rel.related_id,
-            rel.related_title,
-            rel.related_kind,
-            rel.related_status,
-            rel.direction
-        FROM matched_memories mm
-        LEFT JOIN all_relations rel ON mm.id = rel.memory_id
-        ORDER BY mm.rank ASC;
-        "#;
-
-        let mut stmt = self.conn.prepare(query_sql)?;
-        let rows = stmt.query_map(
-            rusqlite::named_params! {
-                ":query": fts_query,
-                ":include_resolved": include_resolved,
-                ":kind": kind_str,
-                ":limit": limit,
-            },
-            |row| {
-                let id: String = row.get(0)?;
-                let kind_str: String = row.get(1)?;
-                let title: String = row.get(2)?;
-                let body: String = row.get(3)?;
-                let tags: Option<String> = row.get(4)?;
-                let status_str: String = row.get(5)?;
-                let session_id: Option<String> = row.get(6)?;
-                let created_at: String = row.get(7)?;
-                let updated_at: String = row.get(8)?;
-                let rank: f64 = row.get(9)?;
-
-                let relation_type_str: Option<String> = row.get(10)?;
-                let related_id: Option<String> = row.get(11)?;
-                let related_title: Option<String> = row.get(12)?;
-                let related_kind_str: Option<String> = row.get(13)?;
-                let related_status_str: Option<String> = row.get(14)?;
-                let dir_str: Option<String> = row.get(15)?;
-
-                let relation = match (relation_type_str, related_id) {
-                    (Some(rel_str), Some(rel_id)) => {
-                        let direction = if dir_str.as_deref() == Some("incoming") {
-                            EdgeDirection::Incoming
-                        } else {
-                            EdgeDirection::Outgoing
-                        };
-                        Some(RelatedEntity {
-                            relation_type: RelationType::from_str(&rel_str)
-                                .unwrap_or(RelationType::References),
-                            target_id: rel_id,
-                            target_title: related_title,
-                            target_kind: related_kind_str
-                                .and_then(|k| MemoryKind::from_str(&k).ok()),
-                            target_status: related_status_str
-                                .and_then(|s| MemoryStatus::from_str(&s).ok()),
-                            direction,
-                        })
-                    }
-                    _ => None,
-                };
-
-                let memory = Memory {
-                    id,
-                    kind: MemoryKind::from_str(&kind_str).unwrap_or(MemoryKind::Decision),
-                    title,
-                    body,
-                    tags,
-                    status: MemoryStatus::from_str(&status_str).unwrap_or(MemoryStatus::Active),
-                    session_id,
-                    created_at,
-                    updated_at,
-                };
-
-                Ok((memory, rank, relation))
-            },
-        )?;
-
-        // Aggregate rows into MemorySearchResult with grouped relations
-        let mut results_map: HashMap<String, (Memory, f64, Vec<RelatedEntity>)> = HashMap::new();
-        let mut ordered_ids: Vec<String> = Vec::new();
-
-        for row_result in rows {
-            let (memory, rank, relation) = row_result?;
-            let mem_id = memory.id.clone();
-
-            if !results_map.contains_key(&mem_id) {
-                ordered_ids.push(mem_id.clone());
-                results_map.insert(mem_id.clone(), (memory, rank, Vec::new()));
-            }
-
-            if let (Some(rel), Some(entry)) = (relation, results_map.get_mut(&mem_id)) {
-                entry.2.push(rel);
-            }
-        }
-
-        let mut results = Vec::new();
-        for id in ordered_ids {
-            if let Some((memory, rank, relations)) = results_map.remove(&id) {
-                results.push(MemorySearchResult {
+        // ponytail: one relations query per hit (<=100). Single JOIN if that ever shows up in a profile.
+        ranked
+            .into_iter()
+            .map(|(memory, rank)| {
+                Ok(MemorySearchResult {
+                    relations: self.get_memory_relations(&memory.id)?,
                     memory,
                     rank,
-                    relations,
-                });
-            }
-        }
-
-        Ok(results)
+                })
+            })
+            .collect()
     }
 
     /// Consolidate session insights: insert permanent learnings and purge or archive ephemeral entries.
@@ -423,6 +276,8 @@ impl MemoryStore {
 
         let mut recorded_ids = Vec::new();
         for learning in &learnings {
+            check_for_secrets(&learning.title, &learning.body, learning.tags.as_deref())?;
+
             let short_uuid = &uuid::Uuid::new_v4().to_string()[..8];
             let new_id = format!("{}-{}", learning.kind.prefix(), short_uuid);
 
@@ -482,6 +337,19 @@ impl MemoryStore {
         })
     }
 
+    /// Delete ephemeral memories older than `max_age_secs`, regardless of session.
+    /// Covers sessions that crashed or exited without calling `consolidate_session`.
+    pub fn purge_expired_ephemeral(&mut self, max_age_secs: i64) -> Result<usize> {
+        self.conn
+            .execute(
+                "DELETE FROM memories \
+                 WHERE (status = 'ephemeral' OR kind = 'ephemeral') \
+                   AND created_at < datetime('now', ?1)",
+                params![format!("-{} seconds", max_age_secs)],
+            )
+            .context("Failed to purge expired ephemeral memories")
+    }
+
     /// Get all 1-hop relations (outgoing and incoming) for a memory ID.
     pub fn get_memory_relations(&self, id: &str) -> Result<Vec<RelatedEntity>> {
         let mut stmt = self.conn.prepare(
@@ -532,31 +400,14 @@ impl MemoryStore {
         Ok(relations)
     }
 
-    /// Get a single memory by ID along with its immediate relations.
+    /// Get a single memory by ID along with its bidirectional 1-hop relations.
     pub fn get_memory(&self, id: &str) -> Result<Option<(Memory, Vec<RelatedEntity>)>> {
-        let memory: Option<Memory> = self
+        let memory = self
             .conn
             .query_row(
-                r#"
-                SELECT id, kind, title, body, tags, status, session_id, created_at, updated_at
-                FROM memories WHERE id = ?1
-                "#,
+                &format!("SELECT {MEMORY_COLS} FROM memories WHERE id = ?1"),
                 params![id],
-                |row| {
-                    let kind_str: String = row.get(1)?;
-                    let status_str: String = row.get(5)?;
-                    Ok(Memory {
-                        id: row.get(0)?,
-                        kind: MemoryKind::from_str(&kind_str).unwrap_or(MemoryKind::Decision),
-                        title: row.get(2)?,
-                        body: row.get(3)?,
-                        tags: row.get(4)?,
-                        status: MemoryStatus::from_str(&status_str).unwrap_or(MemoryStatus::Active),
-                        session_id: row.get(6)?,
-                        created_at: row.get(7)?,
-                        updated_at: row.get(8)?,
-                    })
-                },
+                row_to_memory,
             )
             .optional()?;
 
@@ -568,111 +419,54 @@ impl MemoryStore {
         Ok(Some((memory, relations)))
     }
 
-    /// Mark an active memory as resolved and optionally append a resolution note.
+    /// Mark a memory as resolved, appending an optional resolution note to the body.
     pub fn resolve_memory(&mut self, id: &str, note: Option<&str>) -> Result<Memory> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .context("Failed to begin immediate transaction for resolve_memory")?;
-
-        let memory = tx
+        let suffix = note.map(|n| format!("\n\n[Resolved]: {n}")).unwrap_or_default();
+        self.conn
             .query_row(
-                "SELECT id, body FROM memories WHERE id = ?1",
-                params![id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                &format!(
+                    "UPDATE memories SET status = 'resolved', body = body || ?2,
+                     updated_at = CURRENT_TIMESTAMP WHERE id = ?1
+                     RETURNING {MEMORY_COLS}"
+                ),
+                params![id, suffix],
+                row_to_memory,
             )
-            .optional()?;
-
-        let Some((_, existing_body)) = memory else {
-            bail!("Memory '{}' not found", id);
-        };
-
-        let new_body = if let Some(n) = note {
-            format!(
-                "{}
-
-[Resolved]: {}",
-                existing_body, n
-            )
-        } else {
-            existing_body
-        };
-
-        tx.execute(
-            "UPDATE memories SET status = 'resolved', body = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
-            params![id, new_body],
-        )?;
-
-        tx.commit()?;
-        self.get_memory(id)?
-            .map(|(m, _)| m)
-            .ok_or_else(|| anyhow::anyhow!("Memory not found after resolution"))
+            .optional()
+            .context("Failed to resolve memory")?
+            .ok_or_else(|| anyhow::anyhow!("Memory '{}' not found", id))
     }
 
     /// Search memories by dense vector embedding using sqlite-vec KNN.
-    pub fn search_vector(
-        &self,
-        embedding: &[f32],
-        limit: usize,
-    ) -> Result<Vec<(Memory, f64, Vec<RelatedEntity>)>> {
-        let limit = limit.clamp(1, 100) as i64;
-        let emb_str = format!(
-            "[{}]",
-            embedding
-                .iter()
-                .map(|f| f.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-
-        let mut stmt = self.conn.prepare(
+    /// The `rank` field of each result carries the vector distance (lower is closer).
+    pub fn search_vector(&self, embedding: &[f32], limit: usize) -> Result<Vec<MemorySearchResult>> {
+        let mut stmt = self.conn.prepare(&format!(
             r#"
-            SELECT 
-                m.id, m.kind, m.title, m.body, m.tags, m.status, m.session_id, m.created_at, m.updated_at,
-                v.distance
+            SELECT m.{MEMORY_COLS_M}, v.distance
             FROM memories_vec v
             JOIN memories m ON v.id = m.id
             WHERE v.embedding MATCH ?1 AND v.k = ?2
             ORDER BY v.distance ASC
             "#,
-        )?;
+            MEMORY_COLS_M = MEMORY_COLS.replace(", ", ", m.")
+        ))?;
 
-        let rows = stmt.query_map(params![emb_str, limit], |row| {
-            let id: String = row.get(0)?;
-            let kind_str: String = row.get(1)?;
-            let title: String = row.get(2)?;
-            let body: String = row.get(3)?;
-            let tags: Option<String> = row.get(4)?;
-            let status_str: String = row.get(5)?;
-            let session_id: Option<String> = row.get(6)?;
-            let created_at: String = row.get(7)?;
-            let updated_at: String = row.get(8)?;
-            let distance: f64 = row.get(9)?;
+        let hits = stmt
+            .query_map(
+                params![embedding_to_json(embedding), limit.clamp(1, 100) as i64],
+                |row| Ok((row_to_memory(row)?, row.get::<_, f64>(9)?)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
 
-            Ok((
-                Memory {
-                    id,
-                    kind: MemoryKind::from_str(&kind_str).unwrap_or(MemoryKind::Decision),
-                    title,
-                    body,
-                    tags,
-                    status: MemoryStatus::from_str(&status_str).unwrap_or(MemoryStatus::Active),
-                    session_id,
-                    created_at,
-                    updated_at,
-                },
-                distance,
-            ))
-        })?;
-
-        let mut results = Vec::new();
-        for r in rows {
-            let (mem, dist) = r?;
-            let relations = self.get_memory_relations(&mem.id).unwrap_or_default();
-            results.push((mem, dist, relations));
-        }
-
-        Ok(results)
+        hits.into_iter()
+            .map(|(memory, rank)| {
+                Ok(MemorySearchResult {
+                    relations: self.get_memory_relations(&memory.id)?,
+                    memory,
+                    rank,
+                })
+            })
+            .collect()
     }
 
     /// List memories with optional filtering.
@@ -682,47 +476,26 @@ impl MemoryStore {
         kind: Option<MemoryKind>,
         limit: usize,
     ) -> Result<Vec<Memory>> {
-        let status_str = status.map(|s| s.as_str().to_string());
-        let kind_str = kind.map(|k| k.as_str().to_string());
-
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             r#"
-            SELECT id, kind, title, body, tags, status, session_id, created_at, updated_at
-            FROM memories
+            SELECT {MEMORY_COLS} FROM memories
             WHERE (:status IS NULL OR status = :status)
               AND (:kind IS NULL OR kind = :kind)
             ORDER BY updated_at DESC
             LIMIT :limit
-            "#,
-        )?;
+            "#
+        ))?;
 
-        let rows = stmt.query_map(
-            rusqlite::named_params! {
-                ":status": status_str,
-                ":kind": kind_str,
-                ":limit": limit as i64,
-            },
-            |row| {
-                let kind_str: String = row.get(1)?;
-                let status_str: String = row.get(5)?;
-                Ok(Memory {
-                    id: row.get(0)?,
-                    kind: MemoryKind::from_str(&kind_str).unwrap_or(MemoryKind::Decision),
-                    title: row.get(2)?,
-                    body: row.get(3)?,
-                    tags: row.get(4)?,
-                    status: MemoryStatus::from_str(&status_str).unwrap_or(MemoryStatus::Active),
-                    session_id: row.get(6)?,
-                    created_at: row.get(7)?,
-                    updated_at: row.get(8)?,
-                })
-            },
-        )?;
-
-        let mut list = Vec::new();
-        for r in rows {
-            list.push(r?);
-        }
+        let list = stmt
+            .query_map(
+                rusqlite::named_params! {
+                    ":status": status.map(|s| s.as_str()),
+                    ":kind": kind.map(|k| k.as_str()),
+                    ":limit": limit as i64,
+                },
+                row_to_memory,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(list)
     }
 
@@ -774,88 +547,125 @@ impl MemoryStore {
     }
 }
 
+/// Case-insensitive substrings that flag likely secrets/credentials before they get written
+/// into a memory. Not exhaustive, catches common API key/token prefixes and PEM blocks.
+/// ponytail: hardcoded denylist; move to a config file if false positives pile up.
+const SECRET_PATTERNS: &[&str] = &[
+    "-----begin ",  // PEM private keys/certs
+    "sk-",          // OpenAI-style secret keys
+    "ghp_", "gho_", "github_pat_", // GitHub tokens
+    "xoxb-", "xoxp-", // Slack tokens
+    "aws_secret_access_key",
+    "akia",         // AWS access key id prefix
+    "aiza",         // Google API key prefix
+    "api_key=", "apikey=", "api-key:",
+    "authorization: bearer",
+];
+
+/// Reject recording a memory whose title/body/tags contain an obvious secret pattern.
+fn check_for_secrets(title: &str, body: &str, tags: Option<&str>) -> Result<()> {
+    let haystack = format!("{title}\n{body}\n{}", tags.unwrap_or("")).to_lowercase();
+    if let Some(pat) = SECRET_PATTERNS.iter().find(|p| haystack.contains(*p)) {
+        bail!(
+            "Refusing to record memory: content matches secret pattern '{}'. Redact it before retrying.",
+            pat.trim()
+        );
+    }
+    Ok(())
+}
+
+/// Map a row of `MEMORY_COLS` (optionally prefixed) into a `Memory`.
+fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
+    Ok(Memory {
+        id: row.get(0)?,
+        kind: MemoryKind::from_str(&row.get::<_, String>(1)?).unwrap_or(MemoryKind::Decision),
+        title: row.get(2)?,
+        body: row.get(3)?,
+        tags: row.get(4)?,
+        status: MemoryStatus::from_str(&row.get::<_, String>(5)?).unwrap_or(MemoryStatus::Active),
+        session_id: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
+/// sqlite-vec takes vectors as a JSON array string.
+fn embedding_to_json(embedding: &[f32]) -> String {
+    format!(
+        "[{}]",
+        embedding
+            .iter()
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
 /// Sanitize search string into valid FTS5 tokens
 pub fn sanitize_fts5_query(input: &str) -> String {
-    let tokens: Vec<String> = input
+    input
         .split_whitespace()
         .filter_map(|word| {
             let clean: String = word
                 .chars()
                 .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
                 .collect();
-            if clean.is_empty() {
-                None
-            } else {
-                Some(format!("\"{}\"*", clean))
-            }
+            (!clean.is_empty()).then(|| format!("\"{clean}\"*"))
         })
-        .collect();
-
-    if tokens.is_empty() {
-        "".to_string()
-    } else {
-        tokens.join(" ")
-    }
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
-/// Format search results into a clean markdown document for LLM context windows
+/// Render 1-hop DAG relations as direction-aware markdown bullets.
+pub fn format_relations(relations: &[RelatedEntity]) -> String {
+    relations
+        .iter()
+        .map(|rel| {
+            let (label, arrow) = match rel.direction {
+                EdgeDirection::Outgoing => (rel.relation_type.as_str(), "\u{2794}"),
+                EdgeDirection::Incoming => (rel.relation_type.inverse(), "\u{25c4}"),
+            };
+            format!(
+                "  - `{}` {} [{}] {} ({})\n",
+                label,
+                arrow,
+                rel.target_id,
+                rel.target_title.as_deref().unwrap_or("Unknown"),
+                rel.target_status
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+            )
+        })
+        .collect()
+}
+
+/// Format search results (FTS or vector) as markdown for LLM context windows.
 pub fn format_search_results_for_llm(results: &[MemorySearchResult]) -> String {
     if results.is_empty() {
         return "No relevant memories found matching the query.".to_string();
     }
 
-    let mut out = String::new();
-    out.push_str(&format!(
-        "Found {} relevant active memory/DAG entries:\n\n",
-        results.len()
-    ));
-
+    let mut out = format!("Found {} relevant memory/DAG entries:\n\n", results.len());
     for (i, res) in results.iter().enumerate() {
         let mem = &res.memory;
         out.push_str(&format!(
-            "### {}. [{}] {} (kind: {}, status: {})\n",
+            "### {}. [{}] {} (kind: {}, status: {}, score: {:.4})\n",
             i + 1,
             mem.id,
             mem.title,
             mem.kind,
-            mem.status
+            mem.status,
+            res.rank
         ));
-
         if let Some(tags) = mem.tags.as_deref().filter(|t| !t.trim().is_empty()) {
-            out.push_str(&format!("- **Tags**: {}\n", tags));
+            out.push_str(&format!("- **Tags**: {tags}\n"));
         }
-
         out.push_str(&format!("- **Body**: {}\n", mem.body.trim()));
-
         if !res.relations.is_empty() {
             out.push_str("- **Relations (1-Hop DAG)**:\n");
-            for rel in &res.relations {
-                let target_title = rel.target_title.as_deref().unwrap_or("Unknown");
-                let target_status = rel
-                    .target_status
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "unknown".to_string());
-                match rel.direction {
-                    EdgeDirection::Outgoing => {
-                        out.push_str(&format!(
-                            "  - `{}` ➔ [{}] {} ({})\n",
-                            rel.relation_type, rel.target_id, target_title, target_status
-                        ));
-                    }
-                    EdgeDirection::Incoming => {
-                        out.push_str(&format!(
-                            "  - `{}` ◄ [{}] {} ({})\n",
-                            rel.relation_type.inverse(),
-                            rel.target_id,
-                            target_title,
-                            target_status
-                        ));
-                    }
-                }
-            }
+            out.push_str(&format_relations(&res.relations));
         }
         out.push('\n');
     }
-
     out
 }

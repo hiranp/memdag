@@ -31,7 +31,8 @@ Modern AI coding harnesses (Antigravity, Claude Code, VSCode, Cursor) struggle w
 - 🕸️ **Tackling Zombie Context via DAG Supersession**: Explicitly tracks directed relationships (`supersedes`, `depends_on`, `blocks`, `references`). When an agent updates a decision, the superseded memory is atomically marked as superseded and pruned from default context retrieval.
 - 🔍 **1-Hop DAG Context Expansion**: Searching retrieves matching active entities plus their immediate dependencies, blockers, and parent decisions in a single relational join.
 - 🧬 **Embedded `sqlite-vec`**: Native in-process vector embeddings support without external C extensions or separate daemon processes.
-- 🧹 **Ephemeral Session Cleanup**: Observations from aborted or scratch sessions are marked `ephemeral` by default and automatically purged or consolidated into permanent invariants during session wrap-up.
+- 🧹 **Ephemeral Session Cleanup**: Observations from aborted or scratch sessions are marked `ephemeral` by default and automatically purged or consolidated into permanent invariants during session wrap-up. A background sweep also purges stale `ephemeral` rows on every CLI invocation, so sessions that crash before consolidating don't leak memories forever.
+- 🔒 **Secret Denylist**: `record_memory` and `consolidate_session` refuse to write titles/bodies/tags matching common credential patterns (API keys, PEM blocks, tokens), so a leaked secret can't get baked into long-term memory.
 
 ---
 
@@ -137,7 +138,32 @@ cargo build --release
 
 The optimized binary will be located at `target/release/memdag`.
 
-### Configure with Claude Code
+### Install the MCP Server (recommended)
+
+`memdag mcp install` registers itself in a client's `mcpServers` config for you — no manual JSON editing required.
+
+```bash
+# Project-local (writes ./.mcp.json, read by Claude Code, Cursor, Windsurf project scope)
+memdag mcp install
+
+# User-global (writes ~/.claude.json's mcpServers key, merging with existing config)
+memdag mcp install --global
+
+# Target a specific client's dedicated config file (e.g. Cursor/VS Code)
+memdag mcp install --path ~/.cursor/mcp.json
+```
+
+Each call merges an entry pointing at the current `memdag` binary's absolute path and `serve` argument; if `--db` was passed, it's baked in as `MEMDAG_DB` so the installed server always points at the same database regardless of the client's working directory. Existing keys in the target file are preserved.
+
+To remove it again:
+
+```bash
+memdag mcp uninstall            # project-local
+memdag mcp uninstall --global   # user-global
+memdag mcp uninstall --path ~/.cursor/mcp.json
+```
+
+### Configure Manually
 
 Add `memdag` to your Claude Code MCP configuration (`~/.claude.json` or run `claude mcp add`):
 
@@ -227,6 +253,12 @@ Found 1 relevant active memory/DAG entries:
 ```bash
 memdag stats
 ```
+
+### 6. Resolve or Clean Up
+```bash
+memdag resolve "TSK-002" --note "Fixed by storing JoinSet and aborting on drop."
+```
+Ephemeral memories older than 24h are swept automatically on every CLI run (override with `MEMDAG_EPHEMERAL_TTL_SECS`); no manual GC command needed.
 
 ---
 

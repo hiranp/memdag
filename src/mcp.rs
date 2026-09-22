@@ -1,11 +1,13 @@
-use crate::models::{MemoryKind, RelationType, SessionLearning};
-use crate::store::{MemoryStore, RecordOptions, SearchOptions, format_search_results_for_llm};
+use crate::models::{MemoryKind, MemoryStatus, RelationType, SessionLearning};
+use crate::store::{
+    MemoryStore, RecordOptions, SearchOptions, format_relations, format_search_results_for_llm,
+};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::cell::RefCell;
 use std::io::{BufRead, Write};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
@@ -35,13 +37,13 @@ pub struct JsonRpcError {
 }
 
 pub struct McpServer {
-    store: Arc<Mutex<MemoryStore>>,
+    store: RefCell<MemoryStore>,
 }
 
 impl McpServer {
     pub fn new(store: MemoryStore) -> Self {
         Self {
-            store: Arc::new(Mutex::new(store)),
+            store: RefCell::new(store),
         }
     }
 
@@ -126,13 +128,6 @@ impl McpServer {
                     error: None,
                 })
             }
-            "notifications/initialized"
-            | "initialized"
-            | "notifications/cancelled"
-            | "$/cancelRequest" => {
-                // MCP notifications, no response required per JSON-RPC 2.0
-                None
-            }
             "ping" => Some(JsonRpcResponse {
                 jsonrpc: "2.0",
                 id: req_id,
@@ -191,7 +186,7 @@ impl McpServer {
                 }
             }
             unknown => {
-                // Per JSON-RPC 2.0: If req_id is None, this is a notification, MUST NOT reply.
+                // Per JSON-RPC 2.0: no id means notification, MUST NOT reply (incl. unknown ones).
                 req_id.as_ref()?;
                 Some(JsonRpcResponse {
                     jsonrpc: "2.0",
@@ -208,7 +203,7 @@ impl McpServer {
     }
 
     fn execute_tool(&self, name: &str, args: Value) -> Result<String> {
-        let mut store = self.store.lock().unwrap();
+        let mut store = self.store.borrow_mut();
 
         match name {
             "record_memory" => {
@@ -373,9 +368,7 @@ impl McpServer {
                 match store.get_memory(id)? {
                     Some((mem, rels)) => {
                         let mut out = format!(
-                            "### [{}] {} (kind: {}, status: {})
-- **Body**: {}
-",
+                            "### [{}] {} (kind: {}, status: {})\n- **Body**: {}\n",
                             mem.id,
                             mem.title,
                             mem.kind,
@@ -383,80 +376,43 @@ impl McpServer {
                             mem.body.trim()
                         );
                         if let Some(tags) = mem.tags.as_deref().filter(|t| !t.trim().is_empty()) {
-                            out.push_str(&format!("- **Tags**: {}\n", tags));
+                            out.push_str(&format!("- **Tags**: {tags}\n"));
                         }
                         if !rels.is_empty() {
-                            out.push_str(
-                                "- **Relations (1-Hop DAG)**:
-",
-                            );
-                            for r in &rels {
-                                let title = r.target_title.as_deref().unwrap_or("Unknown");
-                                let status = r
-                                    .target_status
-                                    .map(|s| s.to_string())
-                                    .unwrap_or_else(|| "unknown".to_string());
-                                match r.direction {
-                                    crate::models::EdgeDirection::Outgoing => {
-                                        out.push_str(&format!(
-                                            "  - `{}` ➔ [{}] {} ({})
-",
-                                            r.relation_type, r.target_id, title, status
-                                        ));
-                                    }
-                                    crate::models::EdgeDirection::Incoming => {
-                                        out.push_str(&format!(
-                                            "  - `{}` ◄ [{}] {} ({})
-",
-                                            r.relation_type.inverse(),
-                                            r.target_id,
-                                            title,
-                                            status
-                                        ));
-                                    }
-                                }
-                            }
+                            out.push_str("- **Relations (1-Hop DAG)**:\n");
+                            out.push_str(&format_relations(&rels));
                         }
                         Ok(out)
                     }
-                    None => Ok(format!("Memory with ID '{}' not found.", id)),
+                    None => Ok(format!("Memory with ID '{id}' not found.")),
                 }
             }
             "list_memories" => {
-                let status_filter = args.get("status").and_then(|v| v.as_str()).and_then(|s| {
-                    if s == "all" {
-                        None
-                    } else {
-                        crate::models::MemoryStatus::from_str(s).ok()
-                    }
-                });
+                let status_filter = args
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| *s != "all")
+                    .and_then(|s| MemoryStatus::from_str(s).ok());
 
                 let kind_filter = args
                     .get("kind")
                     .and_then(|v| v.as_str())
-                    .and_then(|k| crate::models::MemoryKind::from_str(k).ok());
+                    .and_then(|k| MemoryKind::from_str(k).ok());
 
                 let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
 
                 let list = store.list_memories(status_filter, kind_filter, limit)?;
                 if list.is_empty() {
-                    Ok("No memories found matching criteria.".to_string())
-                } else {
-                    let mut out = format!(
-                        "Found {} memories:
-
-",
-                        list.len()
-                    );
-                    for m in list {
-                        out.push_str(&format!(
-                            "- `[{}]` ({}) **{}**: {}
-",
-                            m.id, m.status, m.title, m.kind
-                        ));
-                    }
-                    Ok(out)
+                    return Ok("No memories found matching criteria.".to_string());
                 }
+                let mut out = format!("Found {} memories:\n\n", list.len());
+                for m in list {
+                    out.push_str(&format!(
+                        "- `[{}]` ({}) **{}**: {}\n",
+                        m.id, m.status, m.title, m.kind
+                    ));
+                }
+                Ok(out)
             }
             "resolve_memory" => {
                 let id = args
@@ -485,44 +441,7 @@ impl McpServer {
                 let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
 
                 let results = store.search_vector(&embedding, limit)?;
-                if results.is_empty() {
-                    Ok("No vector matches found.".to_string())
-                } else {
-                    let mut out = format!(
-                        "Found {} vector nearest neighbors:
-
-",
-                        results.len()
-                    );
-                    for (i, (mem, dist, rels)) in results.iter().enumerate() {
-                        out.push_str(&format!(
-                            "### {}. [{}] {} (distance: {:.4}, kind: {})
-- **Body**: {}
-",
-                            i + 1,
-                            mem.id,
-                            mem.title,
-                            dist,
-                            mem.kind,
-                            mem.body.trim()
-                        ));
-                        if !rels.is_empty() {
-                            out.push_str(
-                                "- **Relations**:
-",
-                            );
-                            for r in rels {
-                                let title = r.target_title.as_deref().unwrap_or("Unknown");
-                                out.push_str(&format!(
-                                    "  - `{}` [{}] {}
-",
-                                    r.relation_type, r.target_id, title
-                                ));
-                            }
-                        }
-                    }
-                    Ok(out)
-                }
+                Ok(format_search_results_for_llm(&results))
             }
             unknown => anyhow::bail!("Unknown tool: '{}'", unknown),
         }

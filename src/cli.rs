@@ -23,6 +23,12 @@ pub enum Commands {
     /// Start the Model Context Protocol (MCP) server over stdio
     Serve,
 
+    /// Install or remove memdag as an MCP server in a client config (project or global scope)
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+    },
+
     /// Record a memory (decision, task, invariant, blocker, ephemeral)
     Record {
         /// Memory kind: decision, task, invariant, blocker, ephemeral
@@ -144,4 +150,29 @@ pub enum Commands {
 
     /// Show database summary statistics
     Stats,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum McpAction {
+    /// Register memdag as an MCP server (writes/merges an `mcpServers` entry)
+    Install {
+        /// Install into the user-global config instead of the project-local one
+        #[arg(long)]
+        global: bool,
+
+        /// Explicit config file to merge into (overrides --global's default path)
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+
+    /// Remove memdag's MCP server entry from a client config
+    Uninstall {
+        /// Remove from the user-global config instead of the project-local one
+        #[arg(long)]
+        global: bool,
+
+        /// Explicit config file to remove from (overrides --global's default path)
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
 }
