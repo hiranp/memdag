@@ -282,6 +282,32 @@ fn test_sqlite_vec_extension_operations() {
 }
 
 #[test]
+fn test_mcp_initialize_includes_agent_instructions() {
+    let conn = open_in_memory().expect("open db");
+    let store = MemoryStore::new(conn);
+    let mcp = memdag::McpServer::new(store);
+
+    let req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {}
+    });
+    let resp = mcp
+        .handle_request(serde_json::from_value(req).unwrap())
+        .expect("response");
+    let instructions = resp.result.unwrap()["instructions"]
+        .as_str()
+        .expect("instructions field present")
+        .to_string();
+
+    // Guides the agent to call our tools proactively, not just on explicit request.
+    assert!(instructions.contains("search_memory"));
+    assert!(instructions.contains("record_memory"));
+    assert!(instructions.contains("consolidate_session"));
+}
+
+#[test]
 fn test_mcp_tool_execution() {
     let conn = open_in_memory().expect("open db");
     let store = MemoryStore::new(conn);

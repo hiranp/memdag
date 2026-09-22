@@ -73,6 +73,12 @@ memdag exposes a standard Model Context Protocol (MCP) surface over stdio:
 
 ## Installation
 
+### Download a prebuilt binary
+
+Each tagged release (`vX.Y.Z`) publishes binaries for Linux, macOS (Intel + Apple Silicon),
+and Windows via [GitHub Actions](.github/workflows/release.yml) — see the
+[Releases](https://github.com/hiranp/memdag/releases) page.
+
 ### Build from source
 
 ```bash
@@ -88,21 +94,36 @@ The optimized binary is built at `target/release/memdag`.
 `memdag mcp install` automatically registers the server in your client configuration:
 
 ```bash
-# Project-local (.mcp.json for Claude Code, Cursor, Windsurf)
+# Project-local (writes ./.mcp.json, read by Claude Code project scope)
 memdag mcp install
 
-# User-global (~/.claude.json)
+# User-global (writes ~/.claude.json's mcpServers key, merging with existing config)
 memdag mcp install --global
 
-# Custom path (e.g., Antigravity, VSCode)
-memdag mcp install --path ~/.gemini/config/mcp_config.json
+# Any other client with its own config file/shape (Cursor, VS Code, Antigravity, Windsurf)
+memdag mcp install --path ~/.cursor/mcp.json
 ```
+
+Only Claude Code reads `.mcp.json` / `~/.claude.json` directly; other clients keep their own
+config file and location (e.g. Cursor: `.cursor/mcp.json` or `~/.cursor/mcp.json`, VS Code:
+`.vscode/mcp.json` under a `servers` key instead of `mcpServers`). Use `--path` to target
+those directly — `install`/`uninstall` only ever touch the `mcpServers` key in whatever file
+you point at, so it's safe on a shared config.
 
 To uninstall:
 
 ```bash
 memdag mcp uninstall --global
 ```
+
+### Will agents actually call these tools?
+
+The `initialize` response includes an `instructions` field telling the agent to call
+`search_memory` before starting a task, `record_memory`/`link_entities` at decision points,
+and `consolidate_session` before ending a session. Clients that surface MCP server
+instructions to the model (Claude Code, Claude Desktop) pick this up automatically — no
+project hooks or extra setup required. For clients that don't (or for extra reliability),
+copy the same guidance into your project's `AGENTS.md`/`CLAUDE.md`.
 
 ### Manual Configuration
 

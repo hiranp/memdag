@@ -36,6 +36,15 @@ pub struct JsonRpcError {
     pub data: Option<Value>,
 }
 
+/// Surfaced via the MCP `initialize` response's `instructions` field. Clients that honor it
+/// (Claude Code, Claude Desktop) inject this into the model's context, so the agent knows to
+/// use these tools proactively instead of only reacting to explicit user requests.
+const AGENT_INSTRUCTIONS: &str = "memdag is your durable project memory. Use it proactively, without waiting to be asked:\n\
+- At the start of a task, call search_memory with the task's key terms to recall relevant past decisions, invariants, and open blockers.\n\
+- When you make an architectural decision, discover an invariant, or hit a blocker worth remembering, call record_memory (use supersedes_id when replacing an earlier decision).\n\
+- When one memory depends on, blocks, or references another, call link_entities to keep the DAG connected.\n\
+- Before ending a session, call consolidate_session to promote durable learnings and purge scratch/ephemeral notes.";
+
 pub struct McpServer {
     store: RefCell<MemoryStore>,
 }
@@ -119,7 +128,8 @@ impl McpServer {
                     "serverInfo": {
                         "name": "memdag",
                         "version": env!("CARGO_PKG_VERSION")
-                    }
+                    },
+                    "instructions": AGENT_INSTRUCTIONS
                 });
                 Some(JsonRpcResponse {
                     jsonrpc: "2.0",

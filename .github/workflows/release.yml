@@ -1,0 +1,64 @@
+name: Release
+
+# Builds memdag for macOS (Intel + Apple Silicon), Linux, and Windows, then
+# attaches the binaries to the GitHub Release for the pushed tag.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            ext: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            ext: zip
+          - target: x86_64-apple-darwin
+            os: macos-13
+            ext: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-14
+            ext: tar.gz
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: matrix.ext == 'tar.gz'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../memdag-${{ matrix.target }}.tar.gz memdag
+
+      - name: Package (windows)
+        if: matrix.ext == 'zip'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/${{ matrix.target }}/release/memdag.exe `
+            -DestinationPath memdag-${{ matrix.target }}.zip
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: memdag-${{ matrix.target }}.${{ matrix.ext }}
