@@ -110,26 +110,38 @@ above) before running `memdag mcp install`, rather than registering it straight 
 
 ### Install MCP Client Configuration
 
-`memdag mcp install` automatically registers the server in your client configuration:
+`memdag mcp install` automatically registers the server in your client configuration. Only
+Claude Code reads `.mcp.json` / `~/.claude.json` directly, so that's the zero-flag default;
+every other client keeps its own file, location, and (for VS Code) top-level JSON key —
+`install`/`uninstall` only ever touch one key in whatever file you point `--path` at via
+`--key`, so it's safe on a config shared with other servers.
 
-```bash
-# Project-local (writes ./.mcp.json, read by Claude Code project scope)
-memdag mcp install
+| Client | Command | Notes |
+|---|---|---|
+| **Claude Code** (project) | `memdag mcp install` | writes `./.mcp.json`, key `mcpServers` |
+| **Claude Code** (user) / **Claude Desktop** | `memdag mcp install --global` | macOS/Linux: `~/.claude.json`; Windows: `%APPDATA%\Claude\claude_desktop_config.json` for Desktop |
+| **Codex CLI** | manual — see below | `~/.codex/config.toml`, TOML table `[mcp_servers.memdag]`, not JSON |
+| **Cursor** (project) | `memdag mcp install --path .cursor/mcp.json` | key `mcpServers` |
+| **Cursor** (user) | `memdag mcp install --path ~/.cursor/mcp.json` | key `mcpServers` |
+| **VS Code** (workspace) | `memdag mcp install --path .vscode/mcp.json --key servers` | VS Code uses `servers`, not `mcpServers` — `--key` is required here |
+| **VS Code** (user profile) | `memdag mcp install --path <user-mcp.json> --key servers` | Linux: `~/.config/Code/User/mcp.json`; macOS: `~/Library/Application Support/Code/User/mcp.json`; Windows: `%APPDATA%\Code\User\mcp.json`. Easiest: run **MCP: Open User Configuration** in VS Code once (creates the file), note the path it opens, then run the command above |
+| **Windsurf** | `memdag mcp install --path ~/.codeium/windsurf/mcp_config.json` | key `mcpServers` |
+| **Antigravity** (global, works today) | `memdag mcp install --path ~/.gemini/config/mcp_config.json` | key `mcpServers`; the project-local `.antigravitycli/mcp_config.json` file uses the same shape but [isn't actually loaded yet](https://github.com/google-antigravity/antigravity-cli/issues/60) as of Antigravity CLI v1.0.0 |
 
-# User-global (writes ~/.claude.json's mcpServers key, merging with existing config)
-memdag mcp install --global
+pi has no MCP client at all, by design (see [pi's README](https://github.com/earendil-works/pi-coding-agent) for the
+rationale) — use the Skill below instead.
 
-# Any other client with its own config file/shape (Cursor, VS Code, Antigravity, Windsurf)
-memdag mcp install --path ~/.cursor/mcp.json
+Codex stores config as TOML, not JSON, so `mcp install`'s JSON merge doesn't apply. Either
+run `codex mcp add memdag -- /path/to/memdag serve`, or add by hand:
+
+```toml
+# ~/.codex/config.toml
+[mcp_servers.memdag]
+command = "/path/to/memdag"
+args = ["serve"]
 ```
 
-Only Claude Code reads `.mcp.json` / `~/.claude.json` directly; other clients keep their own
-config file and location (e.g. Cursor: `.cursor/mcp.json` or `~/.cursor/mcp.json`, VS Code:
-`.vscode/mcp.json` under a `servers` key instead of `mcpServers`). Use `--path` to target
-those directly — `install`/`uninstall` only ever touch the `mcpServers` key in whatever file
-you point at, so it's safe on a shared config.
-
-To uninstall:
+To uninstall (same `--path`/`--key` flags as install):
 
 ```bash
 memdag mcp uninstall --global
@@ -163,18 +175,21 @@ This project uses memdag (MCP) for durable memory and task tracking.
   purge scratch/ephemeral notes.
 ```
 
-**Or install it as a Skill** (Claude Code, pi, Codex, and other harnesses implementing the
-[Agent Skills standard](https://agentskills.io/specification) all discover these
-independent of whether they render MCP's `instructions` field): copy or symlink
-[`skills/memdag/`](skills/memdag/SKILL.md) into your harness's skills directory, e.g.
+**Or install it as a Skill.** [`.agents/skills/memdag/`](.agents/skills/memdag/SKILL.md) is the
+canonical location for the shared [Agent Skills standard](https://agentskills.io/specification):
+**pi**, **Codex CLI**, and **VS Code Copilot** all discover `.agents/skills/` in your repo
+automatically — no setup needed, nothing to symlink. **Claude Code** looks in `.claude/skills/`
+instead, so that's a symlink (already committed in this repo, `.claude/skills/memdag ->
+../../.agents/skills/memdag`; do the same in your own project):
 
 ```bash
-# Claude Code (project-local)
-ln -s "$(pwd)/skills/memdag" .claude/skills/memdag
-
-# pi (project-local)
-ln -s "$(pwd)/skills/memdag" .pi/skills/memdag
+mkdir -p .claude/skills
+ln -s "$(pwd)/.agents/skills/memdag" .claude/skills/memdag
 ```
+
+Antigravity supports `SKILL.md` too, but its exact discovery directory wasn't confirmed at
+the time of writing — check its `/skills` panel for the workspace/global paths it's actually
+scanning and symlink `.agents/skills/memdag` there if needed.
 
 ### Manual Configuration
 

@@ -161,7 +161,7 @@ pub enum Commands {
 
 #[derive(Subcommand, Debug)]
 pub enum McpAction {
-    /// Register memdag as an MCP server (writes/merges an `mcpServers` entry)
+    /// Register memdag as an MCP server (writes/merges an `mcpServers` entry by default)
     Install {
         /// Install into the user-global config instead of the project-local one
         #[arg(long)]
@@ -170,6 +170,11 @@ pub enum McpAction {
         /// Explicit config file to merge into (overrides --global's default path)
         #[arg(long)]
         path: Option<PathBuf>,
+
+        /// Top-level JSON key servers are nested under. Most clients (Claude Code, Cursor,
+        /// Windsurf) use "mcpServers"; VS Code uses "servers" (e.g. for .vscode/mcp.json).
+        #[arg(long, default_value = "mcpServers")]
+        key: String,
     },
 
     /// Remove memdag's MCP server entry from a client config
@@ -181,5 +186,9 @@ pub enum McpAction {
         /// Explicit config file to remove from (overrides --global's default path)
         #[arg(long)]
         path: Option<PathBuf>,
+
+        /// Top-level JSON key servers are nested under (see `install --key`).
+        #[arg(long, default_value = "mcpServers")]
+        key: String,
     },
 }

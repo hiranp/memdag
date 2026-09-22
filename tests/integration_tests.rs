@@ -699,6 +699,39 @@ fn test_mcp_install_and_uninstall_cli() {
 }
 
 #[test]
+fn test_mcp_install_with_custom_key_for_vscode() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg_path = dir.path().join("mcp.json");
+    let bin = env!("CARGO_BIN_EXE_memdag");
+
+    let install = Command::new(bin)
+        .args(["mcp", "install", "--path"])
+        .arg(&cfg_path)
+        .args(["--key", "servers"])
+        .output()
+        .expect("run install");
+    assert!(install.status.success());
+
+    let raw = std::fs::read_to_string(&cfg_path).expect("read config");
+    let value: serde_json::Value = serde_json::from_str(&raw).expect("parse config");
+    // VS Code expects "servers", not "mcpServers" - and nothing should leak into mcpServers.
+    assert_eq!(value["servers"]["memdag"]["args"][0], "serve");
+    assert!(value.get("mcpServers").is_none());
+
+    let uninstall = Command::new(bin)
+        .args(["mcp", "uninstall", "--path"])
+        .arg(&cfg_path)
+        .args(["--key", "servers"])
+        .output()
+        .expect("run uninstall");
+    assert!(uninstall.status.success());
+
+    let raw_after = std::fs::read_to_string(&cfg_path).expect("read config");
+    let value_after: serde_json::Value = serde_json::from_str(&raw_after).expect("parse config");
+    assert!(value_after["servers"].get("memdag").is_none());
+}
+
+#[test]
 fn test_list_ready_excludes_blocked_tasks() {
     let conn = open_in_memory().expect("open db");
     let mut store = MemoryStore::new(conn);

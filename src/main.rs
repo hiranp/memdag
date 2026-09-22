@@ -321,7 +321,7 @@ fn unstable_binary_reason(exe: &Path, path_dirs: &[PathBuf]) -> Option<&'static 
 
 fn handle_mcp_action(action: &McpAction, cli_db: Option<PathBuf>) -> anyhow::Result<()> {
     match action {
-        McpAction::Install { global, path } => {
+        McpAction::Install { global, path, key } => {
             let cfg_path = mcp_config_path(*global, path.clone())?;
             let mut root = load_json_object(&cfg_path)?;
 
@@ -337,11 +337,11 @@ fn handle_mcp_action(action: &McpAction, cli_db: Option<PathBuf>) -> anyhow::Res
 
             root.as_object_mut()
                 .unwrap()
-                .entry("mcpServers")
+                .entry(key.as_str())
                 .or_insert_with(|| serde_json::json!({}))
                 .as_object_mut()
                 .ok_or_else(|| {
-                    anyhow::anyhow!("'mcpServers' in {} is not an object", cfg_path.display())
+                    anyhow::anyhow!("'{key}' in {} is not an object", cfg_path.display())
                 })?
                 .insert("memdag".to_string(), entry);
 
@@ -349,14 +349,17 @@ fn handle_mcp_action(action: &McpAction, cli_db: Option<PathBuf>) -> anyhow::Res
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(&cfg_path, serde_json::to_string_pretty(&root)?)?;
-            println!("Installed memdag MCP server into {}", cfg_path.display());
+            println!(
+                "Installed memdag MCP server into {} (key: '{key}')",
+                cfg_path.display()
+            );
         }
-        McpAction::Uninstall { global, path } => {
+        McpAction::Uninstall { global, path, key } => {
             let cfg_path = mcp_config_path(*global, path.clone())?;
             let mut root = load_json_object(&cfg_path)?;
 
             let removed = root
-                .get_mut("mcpServers")
+                .get_mut(key.as_str())
                 .and_then(|s| s.as_object_mut())
                 .and_then(|m| m.remove("memdag"))
                 .is_some();
