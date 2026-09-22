@@ -1,0 +1,26 @@
+[package]
+name = "memdag"
+version = "0.1.0"
+edition = "2024"
+authors = ["Hiran Patel"]
+description = "Local-first relational DAG and FTS5 memory engine with sqlite-vec for AI coding harnesses"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/hiranp/memdag"
+keywords = ["memory", "dag", "sqlite", "fts5", "mcp"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+rusqlite = { version = "0.40.2", features = ["bundled", "vtab"] }
+sqlite-vec = "=0.1.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.43", features = ["full"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.13", features = ["v4", "serde"] }
+anyhow = "1.0"
+thiserror = "2.0"
+directories = "5.0"
+
+[dev-dependencies]
+tempfile = "3.17"
