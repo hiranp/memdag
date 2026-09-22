@@ -2,7 +2,7 @@
 
 > **Status**: Approved & Implemented  
 > **Target**: Rust 2024 / SQLite WAL + FTS5 + sqlite-vec  
-> **Author**: Antigravity Engineering  
+> **Author**: HSP 
 > **Revision**: 1.0.0 (2026-09-21)
 
 ---
