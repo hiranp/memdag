@@ -275,6 +275,50 @@ fn load_json_object(path: &Path) -> anyhow::Result<serde_json::Value> {
     Ok(value)
 }
 
+/// Warn (not block) if the binary being registered lives somewhere likely to disappear or
+/// move: not on PATH, or inside a Downloads/tmp/cargo-build directory. The MCP config will
+/// keep pointing at this exact file path, so if it's deleted or moved, the server stops
+/// launching until `memdag mcp install` is rerun from a stable location.
+fn warn_if_unstable_binary_path(exe: &Path) {
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    let path_dirs: Vec<PathBuf> = std::env::split_paths(&path_var).collect();
+    if let Some(reason) = unstable_binary_reason(exe, &path_dirs) {
+        eprintln!(
+            "Warning: registering memdag from {}, which is {reason}. \
+             If this file is moved or deleted, the MCP server entry will stop working.\n\
+             Move the binary to a stable location on PATH (e.g. ~/.local/bin on Linux/macOS) \
+             and rerun `memdag mcp install` from there to avoid this.",
+            exe.display(),
+        );
+    }
+}
+
+/// Pure check behind `warn_if_unstable_binary_path`, taking PATH dirs explicitly so it's
+/// testable without mutating the process-global PATH env var.
+fn unstable_binary_reason(exe: &Path, path_dirs: &[PathBuf]) -> Option<&'static str> {
+    let on_path = exe
+        .parent()
+        .is_some_and(|dir| path_dirs.iter().any(|p| p == dir));
+    if !on_path {
+        return Some("not on PATH");
+    }
+
+    let path_str = exe.to_string_lossy().to_lowercase();
+    let looks_ephemeral = [
+        "/downloads/",
+        "/tmp/",
+        "\\temp\\",
+        "/target/debug/",
+        "/target/release/",
+    ]
+    .iter()
+    .any(|marker| path_str.contains(marker));
+    if looks_ephemeral {
+        return Some("a temp/build/downloads directory");
+    }
+    None
+}
+
 fn handle_mcp_action(action: &McpAction, cli_db: Option<PathBuf>) -> anyhow::Result<()> {
     match action {
         McpAction::Install { global, path } => {
@@ -282,6 +326,7 @@ fn handle_mcp_action(action: &McpAction, cli_db: Option<PathBuf>) -> anyhow::Res
             let mut root = load_json_object(&cfg_path)?;
 
             let exe = std::env::current_exe()?;
+            warn_if_unstable_binary_path(&exe);
             let mut entry = serde_json::json!({
                 "command": exe.to_string_lossy(),
                 "args": ["serve"],
@@ -328,4 +373,36 @@ fn handle_mcp_action(action: &McpAction, cli_db: Option<PathBuf>) -> anyhow::Res
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod unstable_path_tests {
+    use super::unstable_binary_reason;
+    use std::path::PathBuf;
+
+    #[test]
+    fn on_path_and_stable_dir_is_fine() {
+        let stable_dir = PathBuf::from("/home/user/.local/bin");
+        let exe = stable_dir.join("memdag");
+        assert_eq!(unstable_binary_reason(&exe, &[stable_dir]), None);
+    }
+
+    #[test]
+    fn off_path_is_flagged() {
+        let exe = PathBuf::from("/home/user/.local/bin/memdag");
+        assert_eq!(
+            unstable_binary_reason(&exe, &[PathBuf::from("/usr/bin")]),
+            Some("not on PATH")
+        );
+    }
+
+    #[test]
+    fn downloads_dir_is_flagged_even_if_on_path() {
+        let downloads = PathBuf::from("/home/user/Downloads");
+        let exe = downloads.join("memdag");
+        assert_eq!(
+            unstable_binary_reason(&exe, &[downloads]),
+            Some("a temp/build/downloads directory")
+        );
+    }
 }

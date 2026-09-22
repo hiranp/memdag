@@ -81,6 +81,21 @@ Each tagged release (`vX.Y.Z`) publishes binaries for Linux, macOS (Intel + Appl
 and Windows via [GitHub Actions](.github/workflows/release.yml) — see the
 [Releases](https://github.com/hiranp/memdag/releases) page.
 
+Extract it somewhere stable and on `PATH`, not left in `~/Downloads` or a temp directory —
+both the CLI and the MCP config `memdag mcp install` writes reference this exact file path:
+
+```bash
+# Linux / macOS
+mkdir -p ~/.local/bin
+mv memdag ~/.local/bin/
+chmod +x ~/.local/bin/memdag
+# ensure ~/.local/bin is on PATH (add to ~/.bashrc / ~/.zshrc if not):
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+`memdag mcp install` warns if it's run from a Downloads/tmp/build directory or a path that
+isn't on `PATH`, since moving or deleting that file later breaks the registered MCP entry.
+
 ### Build from source
 
 ```bash
@@ -89,7 +104,9 @@ cd memdag
 cargo build --release
 ```
 
-The optimized binary is built at `target/release/memdag`.
+The optimized binary is built at `target/release/memdag` — move it to `~/.local/bin` (see
+above) before running `memdag mcp install`, rather than registering it straight out of
+`target/release/`.
 
 ### Install MCP Client Configuration
 
@@ -144,6 +161,19 @@ This project uses memdag (MCP) for durable memory and task tracking.
 - Call `resolve_memory` when a task or blocker is done.
 - Call `consolidate_session` before ending a session to promote durable learnings and
   purge scratch/ephemeral notes.
+```
+
+**Or install it as a Skill** (Claude Code, pi, Codex, and other harnesses implementing the
+[Agent Skills standard](https://agentskills.io/specification) all discover these
+independent of whether they render MCP's `instructions` field): copy or symlink
+[`skills/memdag/`](skills/memdag/SKILL.md) into your harness's skills directory, e.g.
+
+```bash
+# Claude Code (project-local)
+ln -s "$(pwd)/skills/memdag" .claude/skills/memdag
+
+# pi (project-local)
+ln -s "$(pwd)/skills/memdag" .pi/skills/memdag
 ```
 
 ### Manual Configuration
