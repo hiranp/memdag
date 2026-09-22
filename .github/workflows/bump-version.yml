@@ -1,0 +1,37 @@
+name: Bump Version
+
+# Manually triggered: bumps Cargo.toml's version, commits, and pushes a tag.
+# Pushing the tag kicks off .github/workflows/release.yml to build binaries.
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump: patch, minor, major, or an explicit X.Y.Z"
+        required: false
+        default: patch
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump version, commit, and tag
+        run: ./scripts/bump-version.sh "${{ inputs.bump }}"
+
+      - name: Push commit and tag
+        run: |
+          git push origin HEAD
+          git push origin "$(git describe --tags --abbrev=0)"
