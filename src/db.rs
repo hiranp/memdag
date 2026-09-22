@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{Connection, ffi};
+use rusqlite::{Connection, OptionalExtension, ffi};
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 
@@ -14,12 +14,14 @@ pub fn ensure_sqlite_vec_registered() {
     });
 }
 
-pub const SCHEMA_SQL: &str = r#"
+pub const PRAGMA_SQL: &str = r#"
 PRAGMA journal_mode = WAL;
 PRAGMA busy_timeout = 5000;
 PRAGMA foreign_keys = ON;
 PRAGMA synchronous = NORMAL;
+"#;
 
+pub const DDL_SQL: &str = r#"
 -- Core memory entities (decisions, tasks, bugs, invariant facts)
 CREATE TABLE IF NOT EXISTS memories (
     id TEXT PRIMARY KEY,
@@ -101,8 +103,28 @@ pub fn open_in_memory() -> Result<Connection> {
 }
 
 fn init_pragmas_and_schema(conn: &Connection) -> Result<()> {
-    conn.execute_batch(SCHEMA_SQL)
-        .context("Failed to initialize memdag schema")?;
+    // Pragmas are per-connection state, always cheap to reapply.
+    conn.execute_batch(PRAGMA_SQL)
+        .context("Failed to set memdag connection pragmas")?;
+
+    // The DDL batch (CREATE TABLE/INDEX/TRIGGER/VIRTUAL TABLE) is idempotent but each
+    // statement still takes a schema lock to check "IF NOT EXISTS". Re-running the full
+    // batch on every process start creates needless write contention when many short-lived
+    // CLI processes (e.g. concurrent subagents) open the same database at once. Skip it once
+    // the schema is known to exist.
+    let schema_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memories'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+
+    if !schema_exists {
+        conn.execute_batch(DDL_SQL)
+            .context("Failed to initialize memdag schema")?;
+    }
     Ok(())
 }
 

@@ -39,10 +39,12 @@ pub struct JsonRpcError {
 /// Surfaced via the MCP `initialize` response's `instructions` field. Clients that honor it
 /// (Claude Code, Claude Desktop) inject this into the model's context, so the agent knows to
 /// use these tools proactively instead of only reacting to explicit user requests.
-const AGENT_INSTRUCTIONS: &str = "memdag is your durable project memory. Use it proactively, without waiting to be asked:\n\
+const AGENT_INSTRUCTIONS: &str = "memdag is your durable project memory and lightweight task tracker. Use it proactively, without waiting to be asked:\n\
 - At the start of a task, call search_memory with the task's key terms to recall relevant past decisions, invariants, and open blockers.\n\
 - When you make an architectural decision, discover an invariant, or hit a blocker worth remembering, call record_memory (use supersedes_id when replacing an earlier decision).\n\
+- Track work items as kind='task'. When something blocks a task, record it as kind='blocker' and call link_entities(blocker_id, task_id, 'blocks'); call list_ready to find claimable, unblocked work before starting on something, especially when other agents may be working on the same project.\n\
 - When one memory depends on, blocks, or references another, call link_entities to keep the DAG connected.\n\
+- Call resolve_memory when a task or blocker is done, with a short note on how it was resolved.\n\
 - Before ending a session, call consolidate_session to promote durable learnings and purge scratch/ephemeral notes.";
 
 pub struct McpServer {
@@ -424,6 +426,21 @@ impl McpServer {
                 }
                 Ok(out)
             }
+            "list_ready" => {
+                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+                let list = store.list_ready(limit)?;
+                if list.is_empty() {
+                    return Ok("No claimable tasks/blockers right now.".to_string());
+                }
+                let mut out = format!("Found {} claimable task(s)/blocker(s):\n\n", list.len());
+                for m in list {
+                    out.push_str(&format!(
+                        "- `[{}]` ({}) **{}**: {}\n",
+                        m.id, m.status, m.title, m.kind
+                    ));
+                }
+                Ok(out)
+            }
             "resolve_memory" => {
                 let id = args
                     .get("id")
@@ -617,6 +634,19 @@ impl McpServer {
                         "limit": {
                             "type": "integer",
                             "description": "Maximum number of memories to return (default: 20)."
+                        }
+                    }
+                }
+            }),
+            json!({
+                "name": "list_ready",
+                "description": "List claimable tasks/blockers: status='active' with no incoming active 'blocks' edge. Use this instead of list_memories + get_memory-per-row to find unblocked work, especially when coordinating multiple agents on the same project.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum number of results to return (default: 20)."
                         }
                     }
                 }

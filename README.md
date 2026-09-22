@@ -28,6 +28,7 @@ memdag combines the strengths of each approach into a single in-process, SQLite-
 - **Bidirectional 1-hop expansion**: Automatically retrieves related incoming (`◄`) and outgoing (`➔`) graph edges with search results.
 - **Embedded vector similarity**: Native `sqlite-vec` KNN embeddings without an external vector database.
 - **Ephemeral session lifecycle**: Automatic TTL sweeping keeps scratch context from polluting long-term memory.
+- **Dependency-aware task tracking, for free**: `task`/`blocker` kinds plus `depends_on`/`blocks` edges and `resolve_memory` give you lightweight, DAG-aware task tracking on the same schema — no separate issue tracker for agent-scoped work. See [Task Tracking](#task-tracking) below, and [Scope & Limitations](#scope--limitations) for where this stops being enough.
 
 ---
 
@@ -66,6 +67,7 @@ memdag exposes a standard Model Context Protocol (MCP) surface over stdio:
 | `search_vector` | `embedding`, `limit` | Dense vector KNN similarity search with 1-hop DAG expansion. |
 | `get_memory` | `id` | Fetches a specific memory node with all incoming and outgoing relations. |
 | `list_memories` | `kind`, `status`, `limit` | Lists active, superseded, or resolved memories. |
+| `list_ready` | `limit` | Lists claimable tasks/blockers: active, with no incoming active `blocks` edge. |
 | `resolve_memory` | `id`, `note` | Marks tasks or blockers as resolved with a completion note. |
 | `consolidate_session` | `session_id`, `learnings`, `purge_ephemeral` | Promotes session learnings and prunes ephemeral scratchpads. |
 
@@ -196,6 +198,55 @@ memdag stats
 ```
 
 Ephemeral memories older than 24 hours are swept automatically on CLI runs (customizable via `MEMDAG_EPHEMERAL_TTL_SECS`).
+
+---
+
+## Task Tracking
+
+`task` and `blocker` are memory kinds like any other, so `depends_on`/`blocks` edges plus
+`resolve_memory` give you a small dependency-aware task tracker on the same schema — no
+separate issue tracker for agent-scoped work:
+
+```bash
+# Create a task and a blocker, and link them
+memdag record --kind task --title "Ship v0.2 release automation" --id "TSK-100"
+memdag record --kind blocker --title "CI lacks Windows runner" --id "BLK-100"
+memdag link "BLK-100" "TSK-100" "blocks"
+
+# See what's still open
+memdag list --kind task --status active
+
+# Resolve the blocker, then the task
+memdag resolve "BLK-100" --note "Added windows-latest to the release matrix."
+memdag resolve "TSK-100" --note "Shipped in v0.2.0."
+
+# Find claimable work: active tasks/blockers with no incoming active `blocks` edge
+memdag ready
+```
+
+`get`/`get_memory` on `TSK-100` shows the blocker as an incoming `blocked_by` relation until it's
+resolved. `memdag ready` (MCP: `list_ready`) computes the unblocked subset directly in SQL, so
+multiple agents/subagents working the same project can each call it instead of listing every
+task and checking `blocked_by` one by one — note it's not an atomic claim, so two agents can
+still both pick the same ready item; resolve/coordinate out of band if that matters for your
+workflow.
+
+### Scope & Limitations
+
+memdag is a **single-machine, single-writer** SQLite store. It is not a replacement for a
+distributed, multi-agent task tracker like [beads](https://github.com/steveyegge/beads):
+
+| | memdag | beads |
+| --- | --- | --- |
+| Storage | Local SQLite file | Dolt (versioned SQL, git-synced) |
+| Cross-machine sync | None (copy/sync the file yourself) | `bd dolt push`/`pull` across git remotes |
+| Concurrent agents | Safe reads/writes on one machine (WAL) | Atomic `--claim` (assignee + in_progress) prevents two agents grabbing the same task |
+| Ready queue | `memdag ready` / `list_ready` (not atomic — no claim) | `bd ready` + atomic `--claim` |
+| Priority / epics / sub-tasks | Not modeled (encode in `tags` if needed) | First-class fields and hierarchical IDs |
+
+If you need agents on different machines or git branches claiming and syncing work without
+colliding, use beads. If you want one lightweight, zero-daemon store for a single agent's
+decisions, invariants, and tasks on one machine, memdag covers it.
 
 ---
 

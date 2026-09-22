@@ -1,9 +1,9 @@
 # memdag Technical Design Document
 
-> **Status**: Approved & Implemented  
-> **Target**: Rust 2024 / SQLite WAL + FTS5 + sqlite-vec  
-> **Author**: HSP 
-> **Revision**: 1.0.0 (2026-09-21)
+> **Status**: Approved & Implemented
+> **Target**: Rust 2024 / SQLite WAL + FTS5 + sqlite-vec
+> **Author**: HP
+> **Revision**: 1.1.0 (2026-11-24)
 
 ---
 
@@ -27,6 +27,7 @@ Modern agentic software engineering workflows frequently suffer from severe cont
 - **Bidirectional 1-Hop Expansion**: Memory search does not merely return disconnected text snippets; it expands 1-hop outgoing (`➔`) and incoming (`◄`) graph edges to provide immediate relational context.
 - **Hybrid Retrieval**: Combines BM25 porter-stemmed full-text search with embedded `sqlite-vec` KNN dense embeddings.
 - **Clean Protocol Compliance**: Fully compliant with Model Context Protocol (MCP) JSON-RPC 2.0 specifications, including proper handling of client notifications and cancellation frames.
+- **Self-Cleaning & Self-Guiding**: Ephemeral memories expire on a TTL sweep even if a session crashes, obvious secrets are rejected at write time, and the MCP `initialize` response tells the calling agent when to use each tool — no external cron, git hook, or prompt-engineering scaffolding required.
 
 ---
 
@@ -44,7 +45,8 @@ Modern agentic software engineering workflows frequently suffer from severe cont
        │                      memdag Engine                      │
        │                                                         │
        │  ┌────────────────┐ ┌────────────────┐ ┌──────────────┐  │
-       │  │ MCP Controller │ │  CLI Parser    │ │ Graph Logic  │  │
+       │  │ MCP Controller │ │  CLI Parser    │ │ Store/Graph  │  │
+       │  │   (mcp.rs)     │ │   (cli.rs)     │ │  (store.rs)  │  │
        │  └────────┬───────┘ └────────┬───────┘ └──────┬───────┘  │
        └───────────┼──────────────────┼────────────────┼─────────┘
                    │                  │                │
@@ -58,16 +60,20 @@ Modern agentic software engineering workflows frequently suffer from severe cont
        │  │   (Core DAG)   │ │ (Edges/Cascade)│ │ (FTS5 BM25)  │  │
        │  └────────────────┘ └────────────────┘ └──────────────┘  │
        │  ┌───────────────────────────────────────────────────┐  │
-       │  │            vec_memories (sqlite-vec)              │  │
+       │  │              memories_vec (sqlite-vec)             │  │
        │  └───────────────────────────────────────────────────┘  │
        └─────────────────────────────────────────────────────────┘
 ```
+
+The MCP controller (`src/mcp.rs`) and CLI parser (`src/cli.rs` + `src/main.rs`) are two thin front ends over one `MemoryStore` (`src/store.rs`); every write path (`record_memory`, `link_entities`, `consolidate_session`, `resolve_memory`) is shared, so the CLI and the MCP server can never drift in behavior.
 
 ---
 
 ## 4. Data Model & Database Schema
 
 ### 4.1 Schema Definition
+
+Source of truth: `src/db.rs::SCHEMA_SQL`, applied via `execute_batch` on every connection open (idempotent `IF NOT EXISTS`).
 
 ```sql
 PRAGMA journal_mode = WAL;
@@ -78,11 +84,11 @@ PRAGMA synchronous = NORMAL;
 -- Core memory entities (decisions, tasks, bugs, invariant facts)
 CREATE TABLE IF NOT EXISTS memories (
     id TEXT PRIMARY KEY,
-    kind TEXT NOT NULL CHECK(kind IN (decision, task, invariant, blocker, ephemeral)),
+    kind TEXT NOT NULL CHECK(kind IN ('decision', 'task', 'invariant', 'blocker', 'ephemeral')),
     title TEXT NOT NULL,
     body TEXT NOT NULL,
     tags TEXT,
-    status TEXT NOT NULL DEFAULT active CHECK(status IN (active, superseded, resolved, ephemeral)),
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'superseded', 'resolved', 'ephemeral')),
     session_id TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -92,14 +98,16 @@ CREATE TABLE IF NOT EXISTS memories (
 CREATE TABLE IF NOT EXISTS memory_relations (
     source_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
     target_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-    relation_type TEXT NOT NULL CHECK(relation_type IN (supersedes, depends_on, blocks, references)),
+    relation_type TEXT NOT NULL CHECK(relation_type IN ('supersedes', 'depends_on', 'blocks', 'references')),
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (source_id, target_id, relation_type)
 );
 
-CREATE INDEX IF NOT EXISTS idx_memories_status_kind ON memories(status, kind);
-CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);
+CREATE INDEX IF NOT EXISTS idx_memory_relations_source ON memory_relations(source_id);
 CREATE INDEX IF NOT EXISTS idx_memory_relations_target ON memory_relations(target_id);
+CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status);
+CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories(kind);
+CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);
 
 -- FTS5 Full-Text Search Virtual Table
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -107,9 +115,9 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     title,
     body,
     tags,
-    content="memories",
-    content_rowid="rowid",
-    tokenize="porter unicode61"
+    content='memories',
+    content_rowid='rowid',
+    tokenize='porter unicode61'
 );
 
 -- Automatic FTS5 Synchronization Triggers
@@ -130,21 +138,29 @@ CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
     VALUES (new.rowid, new.id, new.title, new.body, new.tags);
 END;
 
--- sqlite-vec Virtual Table for Dense Embeddings
-CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(
-    embedding float[384] distance_metric=cosine
+-- sqlite-vec Virtual Table for Dense Embeddings (default L2/Euclidean distance;
+-- no distance_metric override configured)
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_vec USING vec0(
+    id TEXT PRIMARY KEY,
+    embedding float[384]
 );
 ```
+
+> **Note**: there is no index on `memories.created_at`. The ephemeral TTL sweep (§6.4) does a
+> full scan filtered by the existing `idx_memories_status`/`idx_memories_kind` index, then a
+> `created_at` comparison. Fine at personal/small-project scale; add a composite
+> `(status, created_at)` index if a single memdag database ever grows past tens of thousands
+> of ephemeral rows.
 
 ### 4.2 Memory Kinds & Lifecycle States
 
 | Kind | Description | Default Status | Eviction Policy |
 | --- | --- | --- | --- |
 | `decision` | Architectural or technical decision | `active` | Superseded by newer decisions |
-| `task` | Executable work item or milestone | `active` | Transitions to `resolved` on completion |
+| `task` | Executable work item or milestone | `active` | Transitions to `resolved` via `resolve_memory` |
 | `invariant` | Core repository rule, axiom, or standard | `active` | Permanent unless explicitly superseded |
-| `blocker` | Blocker issue preventing task progression | `active` | Transitions to `resolved` |
-| `ephemeral` | Scratchpad notes, session debug observations | `ephemeral` | Swept after 24h TTL or session consolidation |
+| `blocker` | Blocker issue preventing task progression | `active` | Transitions to `resolved` via `resolve_memory` |
+| `ephemeral` | Scratchpad notes, session debug observations | `ephemeral` | Purged/archived by `consolidate_session`, or swept by TTL (§6.4) if the session never consolidates |
 
 ### 4.3 Relation Types & Directionality
 
@@ -158,42 +174,33 @@ Edges in `memory_relations` represent directed causal or structural relationship
 
 ## 5. Bidirectional 1-Hop Graph Traversal
 
-When an entity is retrieved (via search or ID lookup), presenting isolated text leads to incomplete decisions. `memdag` executes a 1-hop bidirectional graph expansion:
+When an entity is retrieved (via search or ID lookup), presenting isolated text leads to incomplete decisions. `memdag` executes a 1-hop bidirectional graph expansion via `MemoryStore::get_memory_relations` (`src/store.rs`), the single relation-fetching path shared by `get_memory`, `search_memory`, and `search_vector`:
 
 ```sql
-SELECT 
-    r.relation_type,
-    r.target_id,
-    m.title,
-    m.kind,
-    m.status,
-    'outgoing' AS direction
+SELECT r.relation_type, target.id, target.title, target.kind, target.status, 'outgoing' AS direction
 FROM memory_relations r
-JOIN memories m ON r.target_id = m.id
+JOIN memories target ON r.target_id = target.id
 WHERE r.source_id = ?1
 
 UNION ALL
 
-SELECT 
-    r.relation_type,
-    r.source_id AS target_id,
-    m.title,
-    m.kind,
-    m.status,
-    'incoming' AS direction
+SELECT r.relation_type, source.id, source.title, source.kind, source.status, 'incoming' AS direction
 FROM memory_relations r
-JOIN memories m ON r.source_id = m.id
+JOIN memories source ON r.source_id = source.id
 WHERE r.target_id = ?1;
 ```
 
+`search_memory`/`search_vector` rank the top matches first (BM25 or KNN distance, capped at `limit`, default `100`), then fetch relations per hit — one indexed query per result rather than one large multi-way join, since result sets are small (≤ 100 rows) by construction.
+
 ### Inverse Relation Presentation
-Incoming relations are presented to the LLM with semantic inverse names:
+Incoming relations are presented to the LLM with semantic inverse names (`RelationType::inverse`):
 - Outgoing `depends_on` ➔ Incoming `depended_on_by`
 - Outgoing `blocks` ➔ Incoming `blocked_by`
 - Outgoing `supersedes` ➔ Incoming `superseded_by`
 - Outgoing `references` ➔ Incoming `referenced_by`
 
-Visual formatting example:
+All markdown rendering of relations (CLI `get`, MCP `get_memory`, and search result formatting) goes through one shared helper, `store::format_relations`, so the arrow/label logic exists exactly once:
+
 ```markdown
 ### [TSK-002] Verify lock handling (kind: task, status: active)
 - **Body**: Run concurrent read/write test under load.
@@ -209,54 +216,72 @@ Visual formatting example:
 `memdag` employs a multi-strategy retrieval pipeline:
 
 ### 6.1 FTS5 BM25 Keyword Search
-Uses SQLite's native BM25 ranking over `title`, `body`, and `tags`. Punctuation and identifiers are normalized using the `porter unicode61` tokenizer.
+Uses SQLite's native BM25 ranking over `title`, `body`, and `tags`. Punctuation and identifiers are normalized using the `porter unicode61` tokenizer. `sanitize_fts5_query` strips each whitespace-delimited token down to `[A-Za-z0-9_-]` and appends a `*` prefix-match suffix before it reaches SQLite.
 
 ```sql
-SELECT m.id, m.kind, m.title, m.body, m.tags, m.status, bm25(memories_fts) as rank
+SELECT m.id, m.kind, m.title, m.body, m.tags, m.status, m.session_id, m.created_at, m.updated_at,
+       bm25(memories_fts) AS rank
 FROM memories_fts f
-JOIN memories m ON f.id = m.id
-WHERE memories_fts MATCH ?1
-ORDER BY rank ASC
-LIMIT ?2;
+JOIN memories m ON f.rowid = m.rowid
+WHERE memories_fts MATCH :query
+  AND (:include_resolved = 1 OR m.status = 'active')
+  AND (:kind IS NULL OR m.kind = :kind)
+ORDER BY rank
+LIMIT :limit;
 ```
 
 ### 6.2 Empty Query Fallback
-If the user or agent passes an empty query (`""`), rather than failing or returning zero items, `memdag` returns the latest active items ordered by `updated_at DESC`, functioning as an immediate session starter.
+If the query sanitizes down to nothing (empty string, or only punctuation/whitespace), rather than failing or returning zero items, `memdag` falls back to `list_memories`, returning the most recently updated items (`ORDER BY updated_at DESC`) — an immediate session starter with `rank = 0.0`.
 
 ### 6.3 Dense Vector Search (`sqlite-vec`)
-For semantic similarity, `memdag` loads the native `sqlite-vec` extension and queries the `vec_memories` virtual table using KNN matching:
+For semantic similarity, `memdag` loads the native `sqlite-vec` extension and queries the `memories_vec` virtual table using KNN matching, then attaches the same 1-hop relations as keyword search:
 
 ```sql
-SELECT m.id, m.title, m.kind, m.status, v.distance
-FROM vec_memories v
-JOIN memories m ON m.rowid = v.rowid
+SELECT m.id, m.kind, m.title, m.body, m.tags, m.status, m.session_id, m.created_at, m.updated_at,
+       v.distance
+FROM memories_vec v
+JOIN memories m ON v.id = m.id
 WHERE v.embedding MATCH ?1 AND v.k = ?2
 ORDER BY v.distance ASC;
 ```
+
+`search_vector` and `search_memory` both return `Vec<MemorySearchResult>` (`{ memory, rank, relations }`), so the CLI/MCP formatter (`format_search_results_for_llm`) renders either result set identically; `rank` is BM25 score for keyword search and raw vector distance (lower = closer) for KNN search.
+
+### 6.4 Ephemeral TTL Sweep
+`MemoryStore::purge_expired_ephemeral(max_age_secs)` deletes rows where `status = 'ephemeral' OR kind = 'ephemeral'` and `created_at` is older than `max_age_secs`. It runs once at the start of every CLI invocation (`main.rs`, before dispatching a subcommand) with a default of 24h, overridable via `MEMDAG_EPHEMERAL_TTL_SECS`. This exists specifically to cover sessions that crash or are killed before calling `consolidate_session`, which is the normal (purge/archive) ephemeral cleanup path.
+
+### 6.5 Secret Denylist
+`check_for_secrets` (`src/store.rs`) runs on `title`/`body`/`tags` inside `record_memory` and `consolidate_session`, before any row is inserted. It's a case-insensitive substring match against a fixed list of common credential markers (`sk-`, `ghp_`/`gho_`/`github_pat_`, `xoxb-`/`xoxp-`, `AKIA`, `AIza`, `-----BEGIN `, `api_key=`, `Authorization: Bearer`, etc.). A match aborts the write with an error naming the matched pattern (never the matched secret itself). This is a denylist, not a scanner — it catches obvious accidental paste-ins, not deliberately obfuscated secrets; extend `SECRET_PATTERNS` if a new credential shape shows up in the wild.
 
 ---
 
 ## 7. Model Context Protocol (MCP) Interface
 
-`memdag` implements the Model Context Protocol (MCP) over Stdio using JSON-RPC 2.0:
+`memdag` implements the Model Context Protocol (MCP) over Stdio using JSON-RPC 2.0 (`src/mcp.rs`).
 
 ### 7.1 Protocol Lifecycle & Silent Notification Rule
 Per JSON-RPC 2.0 §4.1:
 - Requests with an `id` receive a structured `JsonRpcResponse` (`result` or `error`).
-- Client notifications (`id: None` or `null`) such as `notifications/initialized`, `initialized`, `$/cancelRequest`, and custom telemetry **MUST NOT receive a response frame**. Replying to notifications violates the protocol and causes client disconnections.
+- Client notifications (no `id` field) **MUST NOT receive a response frame**, including unrecognized ones. `handle_request`'s catch-all arm checks `req_id.as_ref()?` before building an error response, so any notification — known or not — is silently dropped instead of triggering a `-32601 Method not found` reply that would violate the spec.
 
-### 7.2 MCP Tool Surface
+### 7.2 Agent-Facing Instructions
+The `initialize` response includes an `instructions` string (`AGENT_INSTRUCTIONS` in `mcp.rs`) telling the calling model to call `search_memory` before starting a task, `record_memory`/`link_entities` at decision points, and `consolidate_session` before ending a session. Clients that surface MCP server instructions to the model (Claude Code, Claude Desktop) inject this automatically — no project-level hooks or prompt scaffolding required. Clients that don't honor the field can get the same guidance by copying it into `AGENTS.md`/`CLAUDE.md` (see README).
+
+### 7.3 MCP Tool Surface
 
 | Tool Name | Key Parameters | Return Format | Purpose |
 | --- | --- | --- | --- |
-| `record_memory` | `kind`, `title`, `body`, `tags`, `supersedes_id` | Markdown string | Inserts node & handles atomic supersession |
+| `record_memory` | `kind`, `title`, `body`, `tags`, `supersedes_id`, `session_id`, `id` | Markdown string | Inserts node & handles atomic supersession; rejected if content matches the secret denylist |
 | `link_entities` | `source_id`, `target_id`, `relation_type` | Markdown string | Creates directed DAG edge |
-| `search_memory` | `query`, `kind`, `include_resolved`, `limit` | Markdown list + DAG | BM25 search with 1-hop expansion |
+| `search_memory` | `query`, `kind`, `include_resolved`, `limit` | Markdown list + DAG | BM25 search with 1-hop expansion, empty-query fallback |
 | `search_vector` | `embedding`, `limit` | Markdown list + DAG | KNN vector search with 1-hop expansion |
-| `get_memory` | `id` | Markdown detail + DAG | Direct entity lookup with all edges |
+| `get_memory` | `id` | Markdown detail + DAG | Direct entity lookup with all incoming/outgoing edges |
 | `list_memories` | `kind`, `status`, `limit` | Markdown list | Filtered list of memory nodes |
-| `resolve_memory` | `id`, `note` | Markdown confirmation | Transitions tasks/blockers to resolved |
-| `consolidate_session` | `session_id`, `learnings`, `purge_ephemeral` | Markdown summary | Sweeps ephemeral nodes & records learnings |
+| `resolve_memory` | `id`, `note` | Markdown confirmation | Transitions a memory to `resolved`, appending an optional note to its body |
+| `consolidate_session` | `session_id`, `learnings`, `purge_ephemeral` | Markdown summary | Records durable learnings; purges or archives the session's ephemeral nodes |
+
+### 7.4 Client Registration
+The CLI's `mcp install`/`mcp uninstall` subcommands (`src/main.rs`) merge or remove a `mcpServers.memdag` entry in a target JSON file — project-local `./.mcp.json` by default, `~/.claude.json` with `--global`, or any file via `--path` (only the `mcpServers` key is touched, so this is safe on a client's shared config file). This only targets Claude Code's known config locations directly; other clients (Cursor, VS Code, Windsurf) use their own file path and, in VS Code's case, a different top-level key (`servers` instead of `mcpServers`) — use `--path` to point at those.
 
 ---
 
@@ -268,16 +293,17 @@ Per JSON-RPC 2.0 §4.1:
 - `PRAGMA synchronous = NORMAL`: Guarantees durability across application crashes while minimizing disk sync overhead.
 
 ### 8.2 Execution Latency
-- In-memory database test suite (10 integration tests): **0.03s** total execution time.
-- FTS5 query + 1-hop DAG expansion on disk: **< 1.2ms**.
-- Atomic supersession transaction: **< 0.8ms**.
+- Full in-memory integration test suite (15 tests across 4 binaries): **< 0.1s** total execution time.
+- FTS5 query + 1-hop DAG expansion and atomic supersession transactions both complete in low-single-digit milliseconds against an in-memory database; no dedicated on-disk benchmark harness exists yet — treat these as order-of-magnitude, not measured SLAs.
 
 ---
 
 ## 9. Verification & Quality Gates
 
-Every release and commit to `memdag` must pass:
-1. `cargo fmt --all -- --check`
-2. `cargo clippy --all-targets --all-features -- -D warnings` (Zero warnings)
-3. `cargo test` (All integration and unit tests passing)
-4. `cargo build --release`
+Every commit to `memdag` should pass:
+1. `cargo build`
+2. `cargo test` (all unit + integration tests, currently 15)
+3. `cargo clippy --all-targets` (zero warnings)
+4. `cargo fmt --all -- --check`
+
+CI (`.github/workflows/release.yml`) builds release binaries for Linux (x86_64-gnu), Windows (x86_64-msvc), and macOS (Intel + Apple Silicon) on every `vX.Y.Z` tag push. `.github/workflows/bump-version.yml` + `scripts/bump-version.sh` automate the version bump, commit, and tag that trigger it.

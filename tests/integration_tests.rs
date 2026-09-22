@@ -305,6 +305,7 @@ fn test_mcp_initialize_includes_agent_instructions() {
     assert!(instructions.contains("search_memory"));
     assert!(instructions.contains("record_memory"));
     assert!(instructions.contains("consolidate_session"));
+    assert!(instructions.contains("blocks"));
 }
 
 #[test]
@@ -603,12 +604,7 @@ fn test_record_memory_rejects_secret_patterns() {
     assert!(err.to_string().contains("secret pattern"));
 
     // Nothing should have been written.
-    assert!(
-        store
-            .get_memory("DEC-SECRET")
-            .expect("get")
-            .is_none()
-    );
+    assert!(store.get_memory("DEC-SECRET").expect("get").is_none());
 }
 
 #[test]
@@ -700,4 +696,58 @@ fn test_mcp_install_and_uninstall_cli() {
     let raw_after = std::fs::read_to_string(&cfg_path).expect("read config");
     let value_after: serde_json::Value = serde_json::from_str(&raw_after).expect("parse config");
     assert!(value_after["mcpServers"].get("memdag").is_none());
+}
+
+#[test]
+fn test_list_ready_excludes_blocked_tasks() {
+    let conn = open_in_memory().expect("open db");
+    let mut store = MemoryStore::new(conn);
+
+    let mk = |store: &mut MemoryStore, id: &str, kind: MemoryKind, title: &str| {
+        store
+            .record_memory(RecordOptions {
+                id: Some(id.to_string()),
+                kind,
+                title: title.to_string(),
+                body: "body".to_string(),
+                tags: None,
+                supersedes_id: None,
+                session_id: None,
+                embedding: None,
+            })
+            .expect("record")
+    };
+
+    mk(&mut store, "TSK-READY", MemoryKind::Task, "Unblocked task");
+    mk(&mut store, "TSK-BLOCKED", MemoryKind::Task, "Blocked task");
+    mk(&mut store, "BLK-OPEN", MemoryKind::Blocker, "Open blocker");
+    mk(
+        &mut store,
+        "DEC-IGNORED",
+        MemoryKind::Decision,
+        "Not a task/blocker",
+    );
+
+    store
+        .link_entities("BLK-OPEN", "TSK-BLOCKED", RelationType::Blocks)
+        .expect("link blocks");
+
+    let ready = store.list_ready(20).expect("list_ready");
+    let ready_ids: Vec<&str> = ready.iter().map(|m| m.id.as_str()).collect();
+
+    // TSK-READY and BLK-OPEN are unblocked tasks/blockers; TSK-BLOCKED has an active
+    // incoming `blocks` edge so it's excluded; DEC-IGNORED isn't a task/blocker kind.
+    assert_eq!(ready_ids.len(), 2);
+    assert!(ready_ids.contains(&"TSK-READY"));
+    assert!(ready_ids.contains(&"BLK-OPEN"));
+    assert!(!ready_ids.contains(&"TSK-BLOCKED"));
+    assert!(!ready_ids.contains(&"DEC-IGNORED"));
+
+    // Resolving the blocker should make the previously-blocked task ready.
+    store
+        .resolve_memory("BLK-OPEN", Some("done"))
+        .expect("resolve blocker");
+    let ready_after = store.list_ready(20).expect("list_ready after resolve");
+    let ready_ids_after: Vec<&str> = ready_after.iter().map(|m| m.id.as_str()).collect();
+    assert!(ready_ids_after.contains(&"TSK-BLOCKED"));
 }

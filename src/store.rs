@@ -7,8 +7,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::str::FromStr;
 
 /// The 9 memory columns, in the order `row_to_memory` expects.
-const MEMORY_COLS: &str =
-    "id, kind, title, body, tags, status, session_id, created_at, updated_at";
+const MEMORY_COLS: &str = "id, kind, title, body, tags, status, session_id, created_at, updated_at";
 
 #[derive(Debug, Clone)]
 pub struct RecordOptions {
@@ -421,7 +420,9 @@ impl MemoryStore {
 
     /// Mark a memory as resolved, appending an optional resolution note to the body.
     pub fn resolve_memory(&mut self, id: &str, note: Option<&str>) -> Result<Memory> {
-        let suffix = note.map(|n| format!("\n\n[Resolved]: {n}")).unwrap_or_default();
+        let suffix = note
+            .map(|n| format!("\n\n[Resolved]: {n}"))
+            .unwrap_or_default();
         self.conn
             .query_row(
                 &format!(
@@ -439,7 +440,11 @@ impl MemoryStore {
 
     /// Search memories by dense vector embedding using sqlite-vec KNN.
     /// The `rank` field of each result carries the vector distance (lower is closer).
-    pub fn search_vector(&self, embedding: &[f32], limit: usize) -> Result<Vec<MemorySearchResult>> {
+    pub fn search_vector(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<MemorySearchResult>> {
         let mut stmt = self.conn.prepare(&format!(
             r#"
             SELECT m.{MEMORY_COLS_M}, v.distance
@@ -499,6 +504,36 @@ impl MemoryStore {
         Ok(list)
     }
 
+    /// Active tasks/blockers with no incoming active `blocks` edge — the multi-agent "ready
+    /// queue": one indexed query instead of list_memories + get_memory-per-row to check
+    /// blocked_by relations.
+    pub fn list_ready(&self, limit: usize) -> Result<Vec<Memory>> {
+        let mut stmt = self.conn.prepare(&format!(
+            r#"
+            SELECT {MEMORY_COLS} FROM memories m
+            WHERE m.status = 'active'
+              AND m.kind IN ('task', 'blocker')
+              AND NOT EXISTS (
+                  SELECT 1 FROM memory_relations r
+                  JOIN memories b ON r.source_id = b.id
+                  WHERE r.target_id = m.id
+                    AND r.relation_type = 'blocks'
+                    AND b.status = 'active'
+              )
+            ORDER BY m.created_at ASC
+            LIMIT :limit
+            "#
+        ))?;
+
+        let list = stmt
+            .query_map(
+                rusqlite::named_params! { ":limit": limit as i64 },
+                row_to_memory,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(list)
+    }
+
     /// Get overall database statistics.
     pub fn stats(&self) -> Result<DatabaseStats> {
         let total_memories: i64 =
@@ -551,14 +586,19 @@ impl MemoryStore {
 /// into a memory. Not exhaustive, catches common API key/token prefixes and PEM blocks.
 /// ponytail: hardcoded denylist; move to a config file if false positives pile up.
 const SECRET_PATTERNS: &[&str] = &[
-    "-----begin ",  // PEM private keys/certs
-    "sk-",          // OpenAI-style secret keys
-    "ghp_", "gho_", "github_pat_", // GitHub tokens
-    "xoxb-", "xoxp-", // Slack tokens
+    "-----begin ", // PEM private keys/certs
+    "sk-",         // OpenAI-style secret keys
+    "ghp_",
+    "gho_",
+    "github_pat_", // GitHub tokens
+    "xoxb-",
+    "xoxp-", // Slack tokens
     "aws_secret_access_key",
-    "akia",         // AWS access key id prefix
-    "aiza",         // Google API key prefix
-    "api_key=", "apikey=", "api-key:",
+    "akia", // AWS access key id prefix
+    "aiza", // Google API key prefix
+    "api_key=",
+    "apikey=",
+    "api-key:",
     "authorization: bearer",
 ];
 

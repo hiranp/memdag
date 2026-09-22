@@ -155,6 +155,22 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Some(Commands::Ready { limit }) => {
+            let list = store.list_ready(limit)?;
+            if list.is_empty() {
+                println!("No claimable tasks/blockers right now.");
+            } else {
+                for mem in list {
+                    println!(
+                        "[{}] {:<9} {:<10} {}",
+                        mem.id,
+                        format!("({})", mem.kind),
+                        mem.status,
+                        mem.title
+                    );
+                }
+            }
+        }
         Some(Commands::Consolidate {
             session,
             title,
@@ -247,10 +263,14 @@ fn load_json_object(path: &Path) -> anyhow::Result<serde_json::Value> {
         return Ok(serde_json::json!({}));
     }
     let raw = std::fs::read_to_string(path)?;
-    let value: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| anyhow::anyhow!("Failed to parse existing JSON at {}: {}", path.display(), e))?;
+    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        anyhow::anyhow!("Failed to parse existing JSON at {}: {}", path.display(), e)
+    })?;
     if !value.is_object() {
-        anyhow::bail!("{} does not contain a JSON object at its root", path.display());
+        anyhow::bail!(
+            "{} does not contain a JSON object at its root",
+            path.display()
+        );
     }
     Ok(value)
 }
@@ -275,7 +295,9 @@ fn handle_mcp_action(action: &McpAction, cli_db: Option<PathBuf>) -> anyhow::Res
                 .entry("mcpServers")
                 .or_insert_with(|| serde_json::json!({}))
                 .as_object_mut()
-                .ok_or_else(|| anyhow::anyhow!("'mcpServers' in {} is not an object", cfg_path.display()))?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("'mcpServers' in {} is not an object", cfg_path.display())
+                })?
                 .insert("memdag".to_string(), entry);
 
             if let Some(parent) = cfg_path.parent() {
@@ -296,7 +318,10 @@ fn handle_mcp_action(action: &McpAction, cli_db: Option<PathBuf>) -> anyhow::Res
 
             if removed {
                 std::fs::write(&cfg_path, serde_json::to_string_pretty(&root)?)?;
-                println!("Removed memdag MCP server entry from {}", cfg_path.display());
+                println!(
+                    "Removed memdag MCP server entry from {}",
+                    cfg_path.display()
+                );
             } else {
                 println!("No memdag MCP server entry found in {}", cfg_path.display());
             }

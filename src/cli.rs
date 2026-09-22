@@ -111,6 +111,13 @@ pub enum Commands {
         limit: usize,
     },
 
+    /// List claimable tasks/blockers: active, with no incoming active `blocks` edge
+    Ready {
+        /// Max results
+        #[arg(short, long, default_value_t = 20)]
+        limit: usize,
+    },
+
     /// Consolidate session learnings and clean up ephemeral memories
     Consolidate {
         /// Session ID
