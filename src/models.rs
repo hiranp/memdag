@@ -176,6 +176,12 @@ pub struct Memory {
     pub session_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Repo-relative files or directories this memory is about (provenance).
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// Git commit the memory was recorded at; staleness is measured against it.
+    #[serde(default)]
+    pub commit: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,6 +200,9 @@ pub struct MemorySearchResult {
     pub memory: Memory,
     pub rank: f64,
     pub relations: Vec<RelatedEntity>,
+    /// Cited paths that changed since the memory's commit (empty = fresh or unknown).
+    #[serde(default)]
+    pub stale_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,6 +213,10 @@ pub struct SessionLearning {
     pub tags: Option<String>,
     #[serde(default = "default_learning_kind")]
     pub kind: MemoryKind,
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub commit: Option<String>,
 }
 
 fn default_learning_kind() -> MemoryKind {

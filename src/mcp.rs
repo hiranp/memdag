@@ -1,6 +1,7 @@
 use crate::models::{MemoryKind, MemoryStatus, RelationType, SessionLearning};
 use crate::store::{
-    MemoryStore, RecordOptions, SearchOptions, format_relations, format_search_results_for_llm,
+    DEFAULT_MAX_TOKENS, MemoryStore, RecordOptions, SearchOptions, format_provenance,
+    format_relations, format_search_results_for_llm, format_search_results_with_budget,
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -40,12 +41,30 @@ pub struct JsonRpcError {
 /// (Claude Code, Claude Desktop) inject this into the model's context, so the agent knows to
 /// use these tools proactively instead of only reacting to explicit user requests.
 const AGENT_INSTRUCTIONS: &str = "memdag is your durable project memory and lightweight task tracker. Use it proactively, without waiting to be asked:\n\
-- At the start of a task, call search_memory with the task's key terms to recall relevant past decisions, invariants, and open blockers.\n\
-- When you make an architectural decision, discover an invariant, or hit a blocker worth remembering, call record_memory (use supersedes_id when replacing an earlier decision).\n\
+- At the start of a task, call search_memory with the task's key terms to recall relevant past decisions, invariants, and open blockers. Output is token-budgeted (max_tokens); if results were omitted, narrow the query or fetch one with get_memory.\n\
+- When you make an architectural decision, discover an invariant, or hit a blocker worth remembering, call record_memory (use supersedes_id when replacing an earlier decision). Pass paths (repo-relative files the memory is about): memdag then marks it STALE in search results once those files change, so verify STALE memories against the code before relying on them.\n\
 - Track work items as kind='task'. When something blocks a task, record it as kind='blocker' and call link_entities(blocker_id, task_id, 'blocks'); call list_ready to find claimable, unblocked work before starting on something, especially when other agents may be working on the same project.\n\
 - When one memory depends on, blocks, or references another, call link_entities to keep the DAG connected.\n\
 - Call resolve_memory when a task or blocker is done, with a short note on how it was resolved.\n\
 - Before ending a session, call consolidate_session to promote durable learnings and purge scratch/ephemeral notes.";
+
+/// A JSON array of strings, or a single comma/newline separated string.
+fn string_list(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Some(Value::String(s)) => s
+            .split([',', '\n'])
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
 
 pub struct McpServer {
     store: RefCell<MemoryStore>,
@@ -250,6 +269,11 @@ impl McpServer {
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
                 let id = args.get("id").and_then(|v| v.as_str()).map(str::to_string);
+                let paths = string_list(args.get("paths"));
+                let commit = args
+                    .get("commit")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
 
                 let memory = store.record_memory(RecordOptions {
                     id,
@@ -260,12 +284,25 @@ impl McpServer {
                     supersedes_id,
                     session_id,
                     embedding: None,
+                    paths,
+                    commit,
                 })?;
 
-                Ok(format!(
+                let mut msg = format!(
                     "Successfully recorded memory [{}] (kind: {}, status: {})\nTitle: {}",
                     memory.id, memory.kind, memory.status, memory.title
-                ))
+                );
+                if !memory.paths.is_empty() {
+                    msg.push_str(&format!(
+                        "\nCites: {} (as of {})",
+                        memory.paths.join(", "),
+                        memory
+                            .commit
+                            .as_deref()
+                            .map_or("unknown commit", |c| &c[..c.len().min(7)])
+                    ));
+                }
+                Ok(msg)
             }
             "link_entities" => {
                 let source_id = args
@@ -304,6 +341,12 @@ impl McpServer {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+                // 0 means unlimited; absent means the default budget.
+                let max_tokens = match args.get("max_tokens").and_then(|v| v.as_u64()) {
+                    Some(0) => None,
+                    Some(n) => Some(n as usize),
+                    None => Some(DEFAULT_MAX_TOKENS),
+                };
 
                 let results = store.search_memory(SearchOptions {
                     query,
@@ -312,7 +355,7 @@ impl McpServer {
                     limit,
                 })?;
 
-                Ok(format_search_results_for_llm(&results))
+                Ok(format_search_results_with_budget(&results, max_tokens))
             }
             "consolidate_session" => {
                 let session_id = args
@@ -352,6 +395,11 @@ impl McpServer {
                         body,
                         tags,
                         kind,
+                        paths: string_list(item.get("paths")),
+                        commit: item
+                            .get("commit")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
                     });
                 }
 
@@ -390,6 +438,7 @@ impl McpServer {
                         if let Some(tags) = mem.tags.as_deref().filter(|t| !t.trim().is_empty()) {
                             out.push_str(&format!("- **Tags**: {tags}\n"));
                         }
+                        out.push_str(&format_provenance(&mem, &store.stale_paths(&mem)));
                         if !rels.is_empty() {
                             out.push_str("- **Relations (1-Hop DAG)**:\n");
                             out.push_str(&format_relations(&rels));
@@ -455,17 +504,25 @@ impl McpServer {
                 ))
             }
             "search_vector" => {
-                let emb_vals = args
-                    .get("embedding")
-                    .and_then(|v| v.as_array())
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'embedding' float array"))?;
-
-                let embedding: Vec<f32> = emb_vals
-                    .iter()
-                    .filter_map(|v| v.as_f64().map(|f| f as f32))
-                    .collect();
-
                 let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+                let embedding: Vec<f32> = match (args.get("embedding"), args.get("query")) {
+                    (Some(Value::Array(vals)), _) => {
+                        vals.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect()
+                    }
+                    (_, Some(Value::String(q))) if !q.trim().is_empty() => {
+                        store.embed_text(q).map_err(|e| {
+                            anyhow::anyhow!("'query' needs an embedder (set {}, see README) or a 384-float 'embedding': {e}", crate::embed::EMBED_CMD_ENV)
+                        })?
+                    }
+                    _ => anyhow::bail!("Provide 'query' (text) or 'embedding' (384 floats)"),
+                };
+                if embedding.len() != crate::embed::DIM {
+                    anyhow::bail!(
+                        "embedding has {} dimensions; expected {}",
+                        embedding.len(),
+                        crate::embed::DIM
+                    );
+                }
 
                 let results = store.search_vector(&embedding, limit)?;
                 Ok(format_search_results_for_llm(&results))
@@ -475,7 +532,7 @@ impl McpServer {
     }
 
     fn get_tool_definitions(&self) -> Vec<Value> {
-        vec![
+        let mut tools = vec![
             json!({
                 "name": "record_memory",
                 "description": "Record a new memory node (decision, task, invariant, blocker, learning, ephemeral) with optional atomic DAG supersession. When supersedes_id is provided, automatically marks the target memory as 'superseded' and records a 'supersedes' DAG relation in an atomic transaction. Use kind='task' for work items and kind='blocker' for anything blocking one; link them with link_entities(blocker_id, task_id, 'blocks') and use list_ready to find unblocked work.",
@@ -510,6 +567,15 @@ impl McpServer {
                         "id": {
                             "type": "string",
                             "description": "Optional custom ID (e.g. 'DEC-2026-001'). Generated automatically if omitted."
+                        },
+                        "paths": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Repo-relative files or directories this memory is about. memdag stamps the current git HEAD and later flags the memory STALE in search results when these paths change."
+                        },
+                        "commit": {
+                            "type": "string",
+                            "description": "Optional commit (hex) the memory is true as of. Defaults to HEAD when paths are given."
                         }
                     },
                     "required": ["kind", "title", "body"]
@@ -540,7 +606,7 @@ impl McpServer {
             }),
             json!({
                 "name": "search_memory",
-                "description": "Search memories using FTS5 BM25 keyword matching with automatic 1-hop DAG expansion for dependencies, blockers, and superseded items.",
+                "description": "Search memories using FTS5 BM25 keyword matching (fused with vector similarity when an embedder is configured) with automatic 1-hop DAG expansion for dependencies, blockers, and superseded items. Results whose cited files changed since they were recorded are marked STALE.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -560,6 +626,10 @@ impl McpServer {
                         "limit": {
                             "type": "integer",
                             "description": "Maximum number of matched nodes to return (default: 10)."
+                        },
+                        "max_tokens": {
+                            "type": "integer",
+                            "description": "Output budget in estimated tokens (default: 2000; 0 = unlimited). Results are packed in rank order and the reply says how many were omitted."
                         }
                     },
                     "required": ["query"]
@@ -584,6 +654,11 @@ impl McpServer {
                                     "title": { "type": "string" },
                                     "body": { "type": "string" },
                                     "tags": { "type": "string" },
+                                    "paths": {
+                                        "type": "array",
+                                        "items": { "type": "string" },
+                                        "description": "Repo-relative files this learning is about (enables STALE flagging)."
+                                    },
                                     "kind": {
                                         "type": "string",
                                         "enum": ["decision", "task", "invariant", "blocker", "learning"],
@@ -669,25 +744,33 @@ impl McpServer {
                     "required": ["id"]
                 }
             }),
-            json!({
+        ];
+        // Only advertise vector search when it can work: a model cannot produce a 384-float
+        // embedding itself, so without an embedder the tool would be unusable.
+        if self.store.borrow().has_embedder() {
+            tools.push(            json!({
                 "name": "search_vector",
-                "description": "Search memories by semantic similarity using sqlite-vec KNN on float[384] embeddings.",
+                "description": "Search memories by semantic similarity (sqlite-vec KNN). Pass natural-language 'query' text; memdag embeds it with the configured embedder.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Text to find semantically similar memories for."
+                        },
                         "embedding": {
                             "type": "array",
                             "items": { "type": "number" },
-                            "description": "Dense vector float array of dimension 384."
+                            "description": "Alternative to 'query': a precomputed 384-float vector."
                         },
                         "limit": {
                             "type": "integer",
                             "description": "Number of nearest neighbors to return (default: 5)."
                         }
-                    },
-                    "required": ["embedding"]
+                    }
                 }
-            }),
-        ]
+            }));
+        }
+        tools
     }
 }

@@ -9,6 +9,8 @@
 //! tags: [sync, sqlite]
 //! supersedes: <id or empty>
 //! refs: ["#719", "ADR-0003"]
+//! paths: ["src/store.rs"]   (optional: files the note is about)
+//! commit: 1a2b3c4           (optional: HEAD when the note was recorded)
 //! ---
 //! # Title
 //!
@@ -33,6 +35,10 @@ pub struct Note {
     pub tags: Vec<String>,
     pub supersedes: Option<String>,
     pub refs: Vec<String>,
+    /// Repo-relative files/dirs this note is about; see [`is_valid_repo_path`].
+    pub paths: Vec<String>,
+    /// Git commit the note was recorded at (hex), the baseline for staleness checks.
+    pub commit: Option<String>,
 }
 
 impl Note {
@@ -50,8 +56,23 @@ impl Note {
             .map(|r| render_list_item(r, true))
             .collect::<Vec<_>>()
             .join(", ");
+        // Provenance keys are emitted only when set, so notes without them render exactly
+        // as they did before these fields existed.
+        let mut provenance = String::new();
+        if !self.paths.is_empty() {
+            let paths = self
+                .paths
+                .iter()
+                .map(|p| render_list_item(p, true))
+                .collect::<Vec<_>>()
+                .join(", ");
+            provenance.push_str(&format!("paths: [{paths}]\n"));
+        }
+        if let Some(c) = &self.commit {
+            provenance.push_str(&format!("commit: {c}\n"));
+        }
         let mut out = format!(
-            "---\nid: {}\nkind: {}\ntags: [{tags}]\nsupersedes: {}\nrefs: [{refs}]\n---\n# {}\n",
+            "---\nid: {}\nkind: {}\ntags: [{tags}]\nsupersedes: {}\nrefs: [{refs}]\n{provenance}---\n# {}\n",
             self.id,
             self.kind,
             self.supersedes.as_deref().unwrap_or(""),
@@ -88,6 +109,8 @@ pub fn parse_note(text: &str, fallback_id: &str) -> Result<Note> {
     let mut tags = Vec::new();
     let mut supersedes = None;
     let mut refs = Vec::new();
+    let mut paths = Vec::new();
+    let mut commit = None;
 
     let mut lines = front.lines().peekable();
     while let Some(line) = lines.next() {
@@ -130,6 +153,8 @@ pub fn parse_note(text: &str, fallback_id: &str) -> Result<Note> {
             "tags" => tags = parse_list(&value),
             "supersedes" => supersedes = Some(unquote(&value)).filter(|s| !s.is_empty()),
             "refs" => refs = parse_list(&value),
+            "paths" => paths = parse_list(&value),
+            "commit" => commit = Some(unquote(&value)).filter(|s| !s.is_empty()),
             _ => {}
         }
     }
@@ -147,6 +172,8 @@ pub fn parse_note(text: &str, fallback_id: &str) -> Result<Note> {
         tags,
         supersedes,
         refs,
+        paths,
+        commit,
     })
 }
 
@@ -255,6 +282,71 @@ pub fn join_tags(tags: &[String]) -> Option<String> {
         }
     }
     (!seen.is_empty()).then(|| seen.join(" "))
+}
+
+/// Join repo paths into the newline-separated form stored in `memories.paths`.
+pub fn join_paths(paths: &[String]) -> Option<String> {
+    let mut seen: Vec<&str> = Vec::new();
+    for p in paths {
+        let p = p.trim();
+        if !p.is_empty() && !seen.contains(&p) {
+            seen.push(p);
+        }
+    }
+    (!seen.is_empty()).then(|| seen.join("\n"))
+}
+
+/// Inverse of [`join_paths`].
+pub fn split_paths(stored: Option<&str>) -> Vec<String> {
+    stored
+        .map(|s| {
+            s.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Cited paths must stay inside the repo and can't be mistaken for a git option:
+/// relative, no `..` component, not starting with `-`, no NUL/newline.
+pub fn is_valid_repo_path(p: &str) -> bool {
+    let p = p.trim();
+    !p.is_empty()
+        && !p.starts_with(['/', '\\', '-'])
+        && !p.contains(['\0', '\n', '\r'])
+        && !p.split(['/', '\\']).any(|c| c == "..")
+        && !(p.len() >= 2 && p.as_bytes()[1] == b':') // Windows drive letter
+}
+
+/// A git revision recorded as provenance must be a plain hex object name.
+pub fn is_valid_commit(c: &str) -> bool {
+    (7..=64).contains(&c.len()) && c.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+/// Validate and normalise user-supplied provenance (`/` separators, no leading `./`).
+pub fn clean_provenance(
+    paths: &[String],
+    commit: Option<&str>,
+) -> Result<(Vec<String>, Option<String>)> {
+    let mut out = Vec::new();
+    for p in paths {
+        if !is_valid_repo_path(p) {
+            bail!("Invalid path '{p}': must be repo-relative, without '..' or a leading '-'");
+        }
+        let norm = p.trim().replace('\\', "/");
+        let norm = norm.trim_start_matches("./").to_string();
+        if !norm.is_empty() && !out.contains(&norm) {
+            out.push(norm);
+        }
+    }
+    let commit = match commit.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(c) if is_valid_commit(c) => Some(c.to_ascii_lowercase()),
+        Some(c) => bail!("Invalid commit '{c}': expected a 7-64 character hex object name"),
+        None => None,
+    };
+    Ok((out, commit))
 }
 
 /// A memory id is used as a file name, so keep it portable (Windows included).
@@ -377,6 +469,8 @@ mod tests {
             tags: vec!["sqlite".into(), "c++".into()],
             supersedes: Some("DEC-old".into()),
             refs: vec!["#719".into(), "ADR-0003".into()],
+            paths: Vec::new(),
+            commit: None,
         }
     }
 
@@ -387,6 +481,40 @@ mod tests {
         assert!(text.contains("refs: [\"#719\", \"ADR-0003\"]"));
         assert!(text.contains("tags: [sqlite, \"c++\"]"));
         assert_eq!(parse_note(&text, "x").unwrap(), n);
+    }
+
+    #[test]
+    fn provenance_round_trips_and_is_omitted_when_empty() {
+        let plain = sample().render();
+        assert!(!plain.contains("paths:") && !plain.contains("commit:"));
+
+        let mut n = sample();
+        n.paths = vec!["src/store.rs".into(), "docs/a b.md".into()];
+        n.commit = Some("1a2b3c4d".into());
+        let text = n.render();
+        assert!(text.contains("paths: [\"src/store.rs\", \"docs/a b.md\"]"));
+        assert!(text.contains("commit: 1a2b3c4d\n---\n# Use WAL"));
+        assert_eq!(parse_note(&text, "x").unwrap(), n);
+    }
+
+    #[test]
+    fn provenance_validation() {
+        assert!(is_valid_repo_path("src/store.rs"));
+        assert!(!is_valid_repo_path("../etc/passwd"));
+        assert!(!is_valid_repo_path("a/../../b"));
+        assert!(!is_valid_repo_path("/abs"));
+        assert!(!is_valid_repo_path("--output=x"));
+        assert!(!is_valid_repo_path("C:\\x"));
+        assert!(is_valid_commit("1a2b3c4"));
+        assert!(!is_valid_commit("HEAD"));
+        assert!(!is_valid_commit("--all"));
+        let (p, c) =
+            clean_provenance(&["./src\\a.rs".into(), "src/a.rs".into()], Some("ABCDEF1")).unwrap();
+        assert_eq!(p, vec!["src/a.rs"]);
+        assert_eq!(c.as_deref(), Some("abcdef1"));
+        assert!(clean_provenance(&["../x".into()], None).is_err());
+        assert!(clean_provenance(&[], Some("main")).is_err());
+        assert_eq!(split_paths(join_paths(&p).as_deref()), p);
     }
 
     #[test]

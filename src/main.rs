@@ -4,10 +4,10 @@ use clap::Parser;
 use cli::{Cli, Commands, McpAction, McpClient};
 use memdag::db::{default_db_path, open_connection};
 use memdag::import::{GhCli, ImportOptions, ImportReport, find_repo_root, import_repo};
-use memdag::notes::RepoConfig;
 use memdag::mcp::McpServer;
 use memdag::models::{MemoryKind, MemoryStatus, RelationType, SessionLearning};
-use memdag::store::{MemoryStore, RecordOptions, SearchOptions, format_search_results_for_llm};
+use memdag::notes::RepoConfig;
+use memdag::store::{MemoryStore, RecordOptions, SearchOptions, format_search_results_with_budget};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -46,6 +46,9 @@ fn main() -> anyhow::Result<()> {
     if let (Some(root), Some(dir)) = (&repo, &config.write_through_dir) {
         store.set_write_through(Some(root.join(dir)));
     }
+    store.set_repo_root(repo.clone());
+    // Environment only: a cloned repo's memdag.toml must not be able to run a command.
+    store.set_embed_command(memdag::embed::command_from_env());
 
     match args.command {
         Some(Commands::Mcp { .. }) => unreachable!("handled above"),
@@ -62,6 +65,8 @@ fn main() -> anyhow::Result<()> {
             supersedes,
             session,
             id,
+            paths,
+            commit,
         }) => {
             let memory_kind = MemoryKind::from_str(&kind).map_err(|e| anyhow::anyhow!(e))?;
 
@@ -74,6 +79,8 @@ fn main() -> anyhow::Result<()> {
                 supersedes_id: supersedes,
                 session_id: session,
                 embedding: None,
+                paths,
+                commit,
             })?;
 
             println!("Recorded memory: [{}] {}", record.id, record.title);
@@ -81,6 +88,16 @@ fn main() -> anyhow::Result<()> {
             println!("  Status: {}", record.status);
             if let Some(tags) = record.tags {
                 println!("  Tags:   {}", tags);
+            }
+            if !record.paths.is_empty() {
+                println!(
+                    "  Cites:  {} (as of {})",
+                    record.paths.join(", "),
+                    record
+                        .commit
+                        .as_deref()
+                        .map_or("unknown commit", |c| &c[..c.len().min(7)])
+                );
             }
         }
         Some(Commands::Link {
@@ -101,6 +118,7 @@ fn main() -> anyhow::Result<()> {
             kind,
             include_resolved,
             limit,
+            max_tokens,
         }) => {
             let kind_filter = match kind {
                 Some(k) => Some(MemoryKind::from_str(&k).map_err(|e| anyhow::anyhow!(e))?),
@@ -115,7 +133,8 @@ fn main() -> anyhow::Result<()> {
                 limit,
             })?;
 
-            println!("{}", format_search_results_for_llm(&results));
+            let budget = (max_tokens > 0).then_some(max_tokens);
+            println!("{}", format_search_results_with_budget(&results, budget));
         }
         Some(Commands::Get { id }) => match store.get_memory(&id)? {
             Some((mem, rels)) => {
@@ -123,11 +142,24 @@ fn main() -> anyhow::Result<()> {
                 println!("Title:       {}", mem.title);
                 println!("Kind:        {}", mem.kind);
                 println!("Status:      {}", mem.status);
-                if let Some(tags) = mem.tags {
+                if let Some(tags) = &mem.tags {
                     println!("Tags:        {}", tags);
                 }
-                if let Some(sess) = mem.session_id {
+                if let Some(sess) = &mem.session_id {
                     println!("Session:     {}", sess);
+                }
+                if !mem.paths.is_empty() {
+                    println!("Cites:       {}", mem.paths.join(", "));
+                }
+                if let Some(c) = &mem.commit {
+                    println!("As of:       {c}");
+                }
+                let stale = store.stale_paths(&mem);
+                if !stale.is_empty() {
+                    println!(
+                        "STALE:       cited paths changed since: {}",
+                        stale.join(", ")
+                    );
                 }
                 println!("Created At:  {}", mem.created_at);
                 println!("Updated At:  {}", mem.updated_at);
@@ -201,6 +233,8 @@ fn main() -> anyhow::Result<()> {
                 body,
                 tags,
                 kind: learning_kind,
+                paths: Vec::new(),
+                commit: None,
             }];
 
             let summary = store.consolidate_session(&session, learnings, !no_purge)?;
@@ -230,6 +264,28 @@ fn main() -> anyhow::Result<()> {
                 println!("  Relations Breakdown:");
                 for (rel, count) in stats.relations_by_type {
                     println!("    - {:<15} {}", rel, count);
+                }
+            }
+        }
+        Some(Commands::Embed) => {
+            let n = store.embed_missing()?;
+            println!("Embedded {n} memories.");
+        }
+        Some(Commands::Stale) => {
+            let stale = store.list_stale()?;
+            if stale.is_empty() {
+                println!("No stale memories: no cited path changed since it was recorded.");
+            } else {
+                for (mem, paths) in stale {
+                    println!(
+                        "[{}] {} (as of {})",
+                        mem.id,
+                        mem.title,
+                        mem.commit.as_deref().map_or("?", |c| &c[..c.len().min(7)])
+                    );
+                    for p in paths {
+                        println!("    changed: {p}");
+                    }
                 }
             }
         }

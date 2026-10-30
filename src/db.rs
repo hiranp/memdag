@@ -22,7 +22,7 @@ PRAGMA synchronous = NORMAL;
 "#;
 
 /// Bump when the schema changes; `init_pragmas_and_schema` migrates older databases up to it.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// `CREATE TABLE` for the core memories table, parameterised on its name so the v1
 /// migration can build a replacement table before swapping it in.
@@ -116,10 +116,17 @@ CREATE TABLE IF NOT EXISTS pending_relations (
 );
 "#;
 
+/// Columns added in schema v2: provenance for staleness checks. Nullable, so existing rows
+/// and `INSERT`s that omit them stay valid; no table rebuild needed.
+const V2_DDL_SQL: &str = r#"
+ALTER TABLE memories ADD COLUMN paths TEXT;
+ALTER TABLE memories ADD COLUMN commit_sha TEXT;
+"#;
+
 /// The full schema for a fresh database.
 pub fn ddl_sql() -> String {
     format!(
-        "{}{REST_DDL_SQL}{MEMORIES_DEPENDENTS_SQL}{V1_DDL_SQL}",
+        "{}{REST_DDL_SQL}{MEMORIES_DEPENDENTS_SQL}{V1_DDL_SQL}{V2_DDL_SQL}",
         memories_table_sql("memories")
     )
 }
@@ -170,6 +177,31 @@ fn init_pragmas_and_schema(conn: &Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version < 1 {
         migrate_to_v1(conn).context("Failed to migrate memdag schema to v1")?;
+    }
+    if version < 2 {
+        migrate_to_v2(conn).context("Failed to migrate memdag schema to v2")?;
+    }
+    Ok(())
+}
+
+/// v1 -> v2: add the provenance columns. Re-checks the version under the write lock
+/// because another process may have migrated while we waited.
+fn migrate_to_v2(conn: &Connection) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let step = (|| -> Result<()> {
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < 2 {
+            conn.execute_batch(V2_DDL_SQL)?;
+            conn.execute_batch("PRAGMA user_version = 2;")?;
+        }
+        Ok(())
+    })();
+    match step {
+        Ok(()) => conn.execute_batch("COMMIT;")?,
+        Err(e) => {
+            conn.execute_batch("ROLLBACK;").ok();
+            return Err(e);
+        }
     }
     Ok(())
 }

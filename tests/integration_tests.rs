@@ -34,6 +34,8 @@ fn test_record_and_atomic_supersession() {
             supersedes_id: None,
             session_id: Some("sess-1".to_string()),
             embedding: None,
+            paths: Vec::new(),
+            commit: None,
         })
         .expect("record dec1");
 
@@ -53,6 +55,8 @@ fn test_record_and_atomic_supersession() {
             supersedes_id: Some("DEC-001".to_string()),
             session_id: Some("sess-2".to_string()),
             embedding: None,
+            paths: Vec::new(),
+            commit: None,
         })
         .expect("record dec2");
 
@@ -95,6 +99,8 @@ fn test_fts5_search_and_1_hop_dag_expansion() {
             supersedes_id: None,
             session_id: None,
             embedding: None,
+            paths: Vec::new(),
+            commit: None,
         })
         .expect("inv");
 
@@ -108,6 +114,8 @@ fn test_fts5_search_and_1_hop_dag_expansion() {
             supersedes_id: None,
             session_id: None,
             embedding: None,
+            paths: Vec::new(),
+            commit: None,
         })
         .expect("dec");
 
@@ -123,6 +131,8 @@ fn test_fts5_search_and_1_hop_dag_expansion() {
             supersedes_id: None,
             session_id: None,
             embedding: None,
+            paths: Vec::new(),
+            commit: None,
         })
         .expect("tsk");
 
@@ -182,6 +192,8 @@ fn test_session_consolidation_and_ephemeral_purge() {
             supersedes_id: None,
             session_id: Some("session-abc".to_string()),
             embedding: None,
+            paths: Vec::new(),
+            commit: None,
         })
         .expect("record ephemeral");
 
@@ -198,6 +210,8 @@ fn test_session_consolidation_and_ephemeral_purge() {
                 body: "Hardcoded ports cause flaky parallel test runs.".to_string(),
                 tags: Some("testing port flakiness".to_string()),
                 kind: MemoryKind::Invariant,
+                paths: Vec::new(),
+                commit: None,
             }],
             true, // purge ephemeral
         )
@@ -243,6 +257,8 @@ fn test_sqlite_vec_extension_operations() {
             supersedes_id: None,
             session_id: None,
             embedding: Some(embedding.clone()),
+            paths: Vec::new(),
+            commit: None,
         })
         .expect("record with embedding");
 
@@ -409,6 +425,8 @@ fn test_bidirectional_dag_relations() {
             supersedes_id: None,
             session_id: None,
             embedding: None,
+            paths: Vec::new(),
+            commit: None,
         })
         .expect("rec A");
 
@@ -422,6 +440,8 @@ fn test_bidirectional_dag_relations() {
             supersedes_id: None,
             session_id: None,
             embedding: None,
+            paths: Vec::new(),
+            commit: None,
         })
         .expect("rec B");
 
@@ -463,6 +483,8 @@ fn test_mcp_expanded_tools() {
             supersedes_id: None,
             session_id: None,
             embedding: Some(vec![0.2f32; 384]),
+            paths: Vec::new(),
+            commit: None,
         })
         .expect("rec");
 
@@ -567,6 +589,8 @@ fn test_empty_query_fallback() {
             supersedes_id: None,
             session_id: None,
             embedding: None,
+            paths: Vec::new(),
+            commit: None,
         })
         .expect("rec");
 
@@ -599,6 +623,8 @@ fn test_record_memory_rejects_secret_patterns() {
             supersedes_id: None,
             session_id: None,
             embedding: None,
+            paths: Vec::new(),
+            commit: None,
         })
         .expect_err("should refuse to record a memory containing a secret pattern");
     assert!(err.to_string().contains("secret pattern"));
@@ -622,6 +648,8 @@ fn test_purge_expired_ephemeral() {
             supersedes_id: None,
             session_id: Some("crashed-session".to_string()),
             embedding: None,
+            paths: Vec::new(),
+            commit: None,
         })
         .expect("record ephemeral");
 
@@ -657,6 +685,8 @@ fn test_purge_expired_ephemeral_keeps_recent() {
             supersedes_id: None,
             session_id: Some("live-session".to_string()),
             embedding: None,
+            paths: Vec::new(),
+            commit: None,
         })
         .expect("record ephemeral");
 
@@ -747,6 +777,8 @@ fn test_list_ready_excludes_blocked_tasks() {
                 supersedes_id: None,
                 session_id: None,
                 embedding: None,
+                paths: Vec::new(),
+                commit: None,
             })
             .expect("record")
     };

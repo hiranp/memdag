@@ -1,4 +1,5 @@
 pub mod db;
+pub mod embed;
 pub mod import;
 pub mod mcp;
 pub mod models;

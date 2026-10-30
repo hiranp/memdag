@@ -168,6 +168,20 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memories_vec USING vec0(
 > `(status, created_at)` index if a single memdag database ever grows past tens of thousands
 > of ephemeral rows.
 
+### 4.1.1 Schema v2: provenance
+
+`memories` gained two nullable columns in schema v2 (`PRAGMA user_version = 2`), added with
+`ALTER TABLE ... ADD COLUMN` (no rebuild; v0 and v1 databases step up on open):
+
+| Column | Meaning |
+| --- | --- |
+| `paths` | Newline-joined repo-relative files/dirs the memory is about |
+| `commit_sha` | Git commit (hex) the memory was recorded at; defaults to `HEAD` when `paths` is set |
+
+`MemoryStore::stale_paths` runs `git --literal-pathspecs diff --name-only --no-renames <commit> -- <paths>`
+(working tree included, so uncommitted edits and deletions count). Paths and commit are validated
+on write and again on import, because note files come from the repo. See ADR 0001.
+
 ### 4.2 Memory Kinds & Lifecycle States
 
 | Kind | Description | Default Status | Eviction Policy |
@@ -262,6 +276,20 @@ ORDER BY v.distance ASC;
 ```
 
 `search_vector` and `search_memory` both return `Vec<MemorySearchResult>` (`{ memory, rank, relations }`), so the CLI/MCP formatter (`format_search_results_for_llm`) renders either result set identically; `rank` is BM25 score for keyword search and raw vector distance (lower = closer) for KNN search.
+
+### 6.3.1 Hybrid retrieval and token budget
+
+If `MEMDAG_EMBED_CMD` is set (environment only), `search_memory` embeds the query, runs BM25 and
+KNN each over-fetching `min(3 x limit, 300)`, and fuses them with Reciprocal Rank Fusion,
+`score = sum(1 / (60 + rank))`. Rank-based fusion needs no score calibration between BM25 and
+vector distance. sqlite-vec returns the `k` nearest first and the status/kind filters apply
+afterwards, so a filtered KNN can return fewer than `k` rows; the over-fetch absorbs that. An
+embedder that is missing or failing degrades to BM25 only.
+
+Output is packed into an estimated token budget (about 4 characters per token, default 2000) in
+rank order. The top result is always kept (body truncated if it alone exceeds the budget);
+remaining results are dropped whole and counted in the footer; relations are capped at six per
+result.
 
 ### 6.4 Ephemeral TTL Sweep
 `MemoryStore::purge_expired_ephemeral(max_age_secs)` deletes rows where `status = 'ephemeral' OR kind = 'ephemeral'` and `created_at` is older than `max_age_secs`. It runs once at the start of every CLI invocation (`main.rs`, before dispatching a subcommand) with a default of 24h, overridable via `MEMDAG_EPHEMERAL_TTL_SECS`. This exists specifically to cover sessions that crash or are killed before calling `consolidate_session`, which is the normal (purge/archive) ephemeral cleanup path.

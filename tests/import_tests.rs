@@ -167,7 +167,10 @@ fn import_all_sources_is_idempotent() {
     assert_eq!(store.stats().unwrap().total_memories, 7);
 
     // Git decision commit.
-    let id = format!("GIT-{}", &git(&repo, &["log", "--format=%H", "--grep=Decision:"])[..7]);
+    let id = format!(
+        "GIT-{}",
+        &git(&repo, &["log", "--format=%H", "--grep=Decision:"])[..7]
+    );
     let (m, rels) = store.get_memory(&id).unwrap().unwrap();
     assert_eq!(m.kind, MemoryKind::Decision);
     assert_eq!(m.title, "SQLite runs in WAL mode");
@@ -236,6 +239,8 @@ fn rebuild_from_scratch_reproduces_db_including_write_through() {
             supersedes_id: sup.map(str::to_string),
             session_id: Some("s".into()),
             embedding: None,
+            paths: Vec::new(),
+            commit: None,
         };
         let d = store
             .record_memory(rec(MemoryKind::Decision, "Written through", None))
@@ -302,7 +307,11 @@ fn refresh_runs_only_when_head_moves_and_is_incremental() {
         last_imported_head(&store, &repo).unwrap().as_deref(),
         Some(head.as_str())
     );
-    assert!(refresh_if_stale(&mut store, &repo, notes).unwrap().is_none());
+    assert!(
+        refresh_if_stale(&mut store, &repo, notes)
+            .unwrap()
+            .is_none()
+    );
 
     // A new decision commit that references a note added in the same commit.
     write(
@@ -318,7 +327,11 @@ fn refresh_runs_only_when_head_moves_and_is_incremental() {
     assert_eq!(r.git, 1, "only the new commit is scanned");
     assert_eq!(r.edges, 1);
     assert_eq!(r.changed, 2);
-    assert!(refresh_if_stale(&mut store, &repo, notes).unwrap().is_none());
+    assert!(
+        refresh_if_stale(&mut store, &repo, notes)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -359,7 +372,11 @@ fn cli_write_through_via_memdag_toml_and_search_auto_refresh() {
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     seed_repo(&repo);
-    write(&repo, "memdag.toml", "[write_through]\ndir = \"docs/memory\"\n");
+    write(
+        &repo,
+        "memdag.toml",
+        "[write_through]\ndir = \"docs/memory\"\n",
+    );
     let db = tmp.path().join("cli.db");
     let bin = env!("CARGO_BIN_EXE_memdag");
     let run = |args: &[&str]| {
@@ -395,7 +412,13 @@ fn cli_write_through_via_memdag_toml_and_search_auto_refresh() {
     ]);
     assert!(repo.join("docs/memory/DEC-cli.md").exists());
     run(&[
-        "record", "--kind", "ephemeral", "--title", "scratch", "--body", "b",
+        "record",
+        "--kind",
+        "ephemeral",
+        "--title",
+        "scratch",
+        "--body",
+        "b",
     ]);
     let notes = std::fs::read_dir(repo.join("docs/memory")).unwrap().count();
     assert_eq!(notes, 5, "README + 3 seeded + DEC-cli");

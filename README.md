@@ -61,10 +61,10 @@ memdag exposes a standard Model Context Protocol (MCP) surface over stdio:
 
 | Tool | Parameters | Description |
 | --- | --- | --- |
-| `record_memory` | `kind`, `title`, `body`, `tags`, `supersedes_id`, `session_id`, `id` | Inserts a new memory node and atomically supersedes outdated decisions. |
+| `record_memory` | `kind`, `title`, `body`, `tags`, `supersedes_id`, `session_id`, `id`, `paths`, `commit` | Inserts a new memory node and atomically supersedes outdated decisions. `paths` ties it to files so it can be flagged STALE later. |
 | `link_entities` | `source_id`, `target_id`, `relation_type` | Inserts a directed edge (`depends_on`, `blocks`, `references`, `supersedes`). |
-| `search_memory` | `query`, `kind`, `include_resolved`, `limit` | BM25 full-text search with 1-hop bidirectional DAG expansion. |
-| `search_vector` | `embedding`, `limit` | Dense vector KNN similarity search with 1-hop DAG expansion. |
+| `search_memory` | `query`, `kind`, `include_resolved`, `limit`, `max_tokens` | BM25 full-text search (fused with vector search when an embedder is set) with 1-hop bidirectional DAG expansion, packed into a token budget. |
+| `search_vector` | `query` or `embedding`, `limit` | Dense vector KNN similarity search with 1-hop DAG expansion. Only listed when an embedder is configured. |
 | `get_memory` | `id` | Fetches a specific memory node with all incoming and outgoing relations. |
 | `list_memories` | `kind`, `status`, `limit` | Lists active, superseded, or resolved memories. |
 | `list_ready` | `limit` | Lists claimable tasks/blockers: active, with no incoming active `blocks` edge. |
@@ -325,6 +325,44 @@ multiple agents/subagents working the same project can each call it instead of l
 task and checking `blocked_by` one by one — note it's not an atomic claim, so two agents can
 still both pick the same ready item; resolve/coordinate out of band if that matters for your
 workflow.
+
+### Provenance and stale memories
+
+A decision about `src/store.rs` stops being trustworthy when `src/store.rs` changes. Record the
+files a memory is about and memdag does the bookkeeping:
+
+```bash
+memdag record -k decision -t "Search packs results by token budget" -b "..." --paths src/store.rs
+```
+
+The memory is stamped with the current git `HEAD` (and, with write-through, the note file gets
+`paths:` and `commit:` front matter so a rebuilt index is identical). On every search and `get`,
+memdag runs `git diff --name-only <commit> -- <paths>`; if a cited file changed (committed or
+not), the result carries a `STALE` warning. `memdag stale` lists every active memory in that
+state. Memories without `paths` cost nothing. An unknown commit (shallow clone, rewritten
+history) yields no signal rather than a false alarm.
+
+### Token-budgeted recall
+
+`search_memory` / `memdag search` pack results in rank order into an estimated token budget
+(default 2000, about 4 characters per token; `max_tokens: 0` / `--max-tokens 0` disables it). The
+top result is always returned (its body shortened if it alone is too big), at most six relations
+are shown per result, and the reply says how many lower-ranked results were left out.
+
+### Hybrid search (optional embedder)
+
+memdag ships no embedding model. Point `MEMDAG_EMBED_CMD` at any command that reads text on
+stdin and prints a 384-float JSON array (or `{"embedding": [...]}`) and search becomes
+BM25 + vector, fused with Reciprocal Rank Fusion:
+
+```bash
+export MEMDAG_EMBED_CMD='my-embedder --dim 384'   # environment only, never memdag.toml
+memdag embed                                      # backfill vectors for existing memories
+```
+
+New memories are embedded on write (best effort: an embedder outage never blocks recording).
+If the command is missing or failing, search falls back to BM25. The command is read from the
+environment only, so a cloned repository can't make memdag run anything.
 
 ### Scope & Limitations
 

@@ -13,6 +13,8 @@ fn opts(kind: MemoryKind, title: &str, body: &str) -> RecordOptions {
         supersedes_id: None,
         session_id: None,
         embedding: None,
+        paths: Vec::new(),
+        commit: None,
     }
 }
 
@@ -168,6 +170,8 @@ fn generated_ids_do_not_collide_and_consolidate_writes_through() {
                 body: "b".into(),
                 tags: None,
                 kind: MemoryKind::Learning,
+                paths: Vec::new(),
+                commit: None,
             }],
             true,
         )

@@ -59,6 +59,15 @@ pub enum Commands {
         /// Optional explicit ID
         #[arg(long)]
         id: Option<String>,
+
+        /// Repo-relative files this memory is about, comma-separated. The memory is stamped
+        /// with the current git HEAD and flagged STALE in search once these paths change.
+        #[arg(long, value_delimiter = ',')]
+        paths: Vec<String>,
+
+        /// Commit the memory is true as of (hex). Defaults to HEAD when --paths is given.
+        #[arg(long)]
+        commit: Option<String>,
     },
 
     /// Link two memories in the DAG
@@ -89,6 +98,10 @@ pub enum Commands {
         /// Limit number of results
         #[arg(short, long, default_value_t = 10)]
         limit: usize,
+
+        /// Output budget in estimated tokens (~4 chars each); 0 = unlimited
+        #[arg(long, default_value_t = memdag::store::DEFAULT_MAX_TOKENS)]
+        max_tokens: usize,
     },
 
     /// Get a specific memory and its immediate DAG relations
@@ -158,6 +171,13 @@ pub enum Commands {
 
     /// Show database summary statistics
     Stats,
+
+    /// Embed memories that have no vector yet, using $MEMDAG_EMBED_CMD (stdin text -> JSON
+    /// array of 384 floats). Enables hybrid BM25 + vector search.
+    Embed,
+
+    /// List active memories whose cited paths changed since they were recorded
+    Stale,
 
     /// Export all memories and relations as JSON (to a file, or stdout if no path given)
     Export {

@@ -6,7 +6,10 @@
 //! reproduces it.
 
 use crate::models::{MemoryKind, RelationType};
-use crate::notes::{join_tags, parse_note, split_front_matter, split_title};
+use crate::notes::{
+    is_valid_commit, is_valid_repo_path, join_paths, join_tags, parse_note, split_front_matter,
+    split_title,
+};
 use crate::store::MemoryStore;
 use anyhow::{Context, Result, bail};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -156,6 +159,9 @@ struct Item {
     created_at: Option<String>,
     /// The source itself says it's superseded (e.g. an ADR's Status line).
     superseded: bool,
+    /// Provenance (notes only): files the item cites, and the commit it was recorded at.
+    paths: Vec<String>,
+    commit: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -177,7 +183,7 @@ pub fn find_repo_root(start: &Path) -> Option<PathBuf> {
     None
 }
 
-fn git(repo: &Path, args: &[&str]) -> Result<std::process::Output> {
+pub(crate) fn git(repo: &Path, args: &[&str]) -> Result<std::process::Output> {
     Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -341,6 +347,8 @@ fn collect_git(
             tags,
             created_at: Some(f[1].trim().to_string()),
             superseded: false,
+            paths: Vec::new(),
+            commit: None,
         });
         report.git += 1;
     }
@@ -390,11 +398,9 @@ fn parse_adr(num: &str, text: &str, batch: &mut Batch) {
                     .take_while(|c| c.is_ascii_digit())
                     .collect();
                 if let Ok(n) = digits.parse::<u32>() {
-                    batch.edges.push((
-                        format!("ADR-{n:04}"),
-                        id.clone(),
-                        RelationType::Supersedes,
-                    ));
+                    batch
+                        .edges
+                        .push((format!("ADR-{n:04}"), id.clone(), RelationType::Supersedes));
                 }
             }
         }
@@ -416,6 +422,8 @@ fn parse_adr(num: &str, text: &str, batch: &mut Batch) {
         tags,
         created_at: adr_field(text, "Date").map(str::to_string),
         superseded,
+        paths: Vec::new(),
+        commit: None,
     });
 }
 
@@ -484,6 +492,13 @@ fn collect_notes(dir: &Path, batch: &mut Batch, report: &mut ImportReport) {
             tags,
             created_at: None,
             superseded: false,
+            // Note files come from the repo, so re-validate before trusting them.
+            paths: note
+                .paths
+                .into_iter()
+                .filter(|p| is_valid_repo_path(p))
+                .collect(),
+            commit: note.commit.filter(|c| is_valid_commit(c)),
         });
         report.notes += 1;
     }
@@ -524,6 +539,8 @@ fn collect_gh(comments: Vec<GhComment>, batch: &mut Batch, report: &mut ImportRe
             tags,
             created_at: c.created_at,
             superseded: false,
+            paths: Vec::new(),
+            commit: None,
         });
         report.gh += 1;
     }
@@ -582,21 +599,25 @@ fn apply(store: &mut MemoryStore, batch: &Batch, report: &mut ImportReport) -> R
         } else {
             "active"
         };
-        report.changed += tx.execute(
+        let changed = tx.execute(
             r#"
-            INSERT INTO memories (id, kind, title, body, tags, status, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, COALESCE(datetime(?7), CURRENT_TIMESTAMP), CURRENT_TIMESTAMP)
+            INSERT INTO memories (id, kind, title, body, tags, status, created_at, updated_at, paths, commit_sha)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, COALESCE(datetime(?7), CURRENT_TIMESTAMP), CURRENT_TIMESTAMP, ?9, ?10)
             ON CONFLICT(id) DO UPDATE SET
                 kind = excluded.kind,
                 title = excluded.title,
                 body = excluded.body,
                 tags = excluded.tags,
+                paths = excluded.paths,
+                commit_sha = excluded.commit_sha,
                 status = CASE WHEN ?8 THEN 'superseded' ELSE memories.status END,
                 updated_at = CURRENT_TIMESTAMP
             WHERE memories.kind IS NOT excluded.kind
                OR memories.title IS NOT excluded.title
                OR memories.body IS NOT excluded.body
                OR memories.tags IS NOT excluded.tags
+               OR memories.paths IS NOT excluded.paths
+               OR memories.commit_sha IS NOT excluded.commit_sha
                OR (?8 AND memories.status IS NOT 'superseded')
             "#,
             params![
@@ -608,8 +629,16 @@ fn apply(store: &mut MemoryStore, batch: &Batch, report: &mut ImportReport) -> R
                 status,
                 item.created_at,
                 item.superseded,
+                join_paths(&item.paths),
+                item.commit,
             ],
         )?;
+        report.changed += changed;
+        if changed > 0 {
+            // The text may have changed, so any stored vector is stale; `memdag embed`
+            // recomputes missing ones. Harmless when the row is new (nothing to delete).
+            tx.execute("DELETE FROM memories_vec WHERE id = ?1", params![item.id])?;
+        }
     }
 
     for (source, target, rel) in &batch.edges {
@@ -707,7 +736,10 @@ mod tests {
             strip_trailers("Why.\n\nRefs: #1\nDecision: x\nAssisted-by: opencode\n"),
             "Why."
         );
-        assert_eq!(strip_trailers("Why.\n\nMore prose here."), "Why.\n\nMore prose here.");
+        assert_eq!(
+            strip_trailers("Why.\n\nMore prose here."),
+            "Why.\n\nMore prose here."
+        );
         assert_eq!(strip_trailers("Refs: #1"), "");
     }
 
