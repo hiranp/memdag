@@ -21,3 +21,15 @@ directories = "5.0"
 
 [dev-dependencies]
 tempfile = "3.17"
+
+# Build speed/size (numbers in docs/adr/0002-build-profile-and-low-load-builds.md).
+# Line tables keep backtraces and panics readable; full variable debuginfo is rarely used
+# here and dominates link time and target/ size. Dependencies carry none.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+strip = true
