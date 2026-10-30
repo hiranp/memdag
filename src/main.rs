@@ -1,8 +1,10 @@
 mod cli;
 
 use clap::Parser;
-use cli::{Cli, Commands, McpAction};
+use cli::{Cli, Commands, McpAction, McpClient};
 use memdag::db::{default_db_path, open_connection};
+use memdag::import::{GhCli, ImportOptions, ImportReport, find_repo_root, import_repo};
+use memdag::notes::RepoConfig;
 use memdag::mcp::McpServer;
 use memdag::models::{MemoryKind, MemoryStatus, RelationType, SessionLearning};
 use memdag::store::{MemoryStore, RecordOptions, SearchOptions, format_search_results_for_llm};
@@ -34,9 +36,21 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or(24 * 60 * 60);
     store.purge_expired_ephemeral(ttl_secs)?;
 
+    // Git-backed sources: the repo containing the cwd, and its memdag.toml.
+    let cwd = std::env::current_dir()?;
+    let repo = find_repo_root(&cwd);
+    let config = match &repo {
+        Some(root) => RepoConfig::load(root)?,
+        None => RepoConfig::default(),
+    };
+    if let (Some(root), Some(dir)) = (&repo, &config.write_through_dir) {
+        store.set_write_through(Some(root.join(dir)));
+    }
+
     match args.command {
         Some(Commands::Mcp { .. }) => unreachable!("handled above"),
         Some(Commands::Serve) => {
+            auto_refresh(&mut store, repo.as_deref(), &config);
             let mcp = McpServer::new(store);
             mcp.run_stdio()?;
         }
@@ -93,6 +107,7 @@ fn main() -> anyhow::Result<()> {
                 None => None,
             };
 
+            auto_refresh(&mut store, repo.as_deref(), &config);
             let results = store.search_memory(SearchOptions {
                 query,
                 kind: kind_filter,
@@ -234,10 +249,39 @@ fn main() -> anyhow::Result<()> {
                 None => println!("{json}"),
             }
         }
+        Some(Commands::Import {
+            repo: repo_arg,
+            git,
+            adr,
+            notes,
+            gh,
+            since,
+        }) => {
+            let root = match repo_arg {
+                Some(r) => r,
+                None => repo.clone().ok_or_else(|| {
+                    anyhow::anyhow!("Not inside a git repository; pass --repo PATH")
+                })?,
+            };
+            let config = RepoConfig::load(&root)?;
+            let all = !(git || adr || notes || gh);
+            let opts = ImportOptions {
+                git: all || git,
+                adr: all || adr,
+                notes: all || notes,
+                gh: all || gh,
+                since,
+                notes_dir: config.notes_dir(),
+                ..ImportOptions::all()
+            };
+            let report = import_repo(&mut store, &root, &opts, &GhCli)?;
+            print_report(&report);
+        }
         None => {
             // Default behavior: if stdin is not a terminal (e.g. piped or spawned by MCP client), run MCP server.
             // If it is a terminal, print help.
             if !std::io::stdin().is_terminal() {
+                auto_refresh(&mut store, repo.as_deref(), &config);
                 let mcp = McpServer::new(store);
                 mcp.run_stdio()?;
             } else {
@@ -255,40 +299,235 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Default location for a client's MCP config: project-local `.mcp.json` (cwd) or the
-/// user-global `~/.claude.json`, which Claude Code and most MCP clients read the same
-/// `{"mcpServers": {...}}` shape from. Cursor/Windsurf/VS Code use dedicated files with the
-/// same shape; pass `--path` to target those directly.
-fn mcp_config_path(global: bool, path: Option<PathBuf>) -> anyhow::Result<PathBuf> {
-    if let Some(p) = path {
-        return Ok(p);
-    }
-    if global {
-        let home = directories::BaseDirs::new()
-            .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
-            .home_dir()
-            .to_path_buf();
-        Ok(home.join(".claude.json"))
-    } else {
-        Ok(std::env::current_dir()?.join(".mcp.json"))
+fn print_report(r: &ImportReport) {
+    println!(
+        "Imported git: {}, adr: {}, notes: {}, gh: {} ({} changed, {} new edges, {} pending)",
+        r.git, r.adr, r.notes, r.gh, r.changed, r.edges, r.pending
+    );
+    for w in &r.warnings {
+        eprintln!("warning: {w}");
     }
 }
 
-fn load_json_object(path: &Path) -> anyhow::Result<serde_json::Value> {
+/// Re-import local git sources if HEAD moved since the last import. Never fatal: a broken
+/// import must not stop search or the MCP server, so failures are only logged to stderr.
+fn auto_refresh(store: &mut MemoryStore, repo: Option<&Path>, config: &RepoConfig) {
+    let Some(repo) = repo else { return };
+    match memdag::import::refresh_if_stale(store, repo, &config.notes_dir()) {
+        Ok(Some(r)) => {
+            for w in &r.warnings {
+                eprintln!("[memdag] auto-import warning: {w}");
+            }
+            if r.changed > 0 {
+                eprintln!(
+                    "[memdag] auto-imported {} changed memories from {}",
+                    r.changed,
+                    repo.display()
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!("[memdag] auto-import failed (continuing): {e:#}"),
+    }
+}
+
+fn home_dir() -> anyhow::Result<PathBuf> {
+    Ok(directories::BaseDirs::new()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
+        .home_dir()
+        .to_path_buf())
+}
+
+/// `opencode.jsonc` if it exists in `dir`, else `opencode.json`.
+fn opencode_file(dir: &Path) -> PathBuf {
+    let jsonc = dir.join("opencode.jsonc");
+    if jsonc.exists() {
+        jsonc
+    } else {
+        dir.join("opencode.json")
+    }
+}
+
+/// Default config file for a client preset. Claude Code: project-local `.mcp.json` (cwd) or
+/// user-global `~/.claude.json`. OpenCode: `./opencode.json[c]` or
+/// `$XDG_CONFIG_HOME/opencode/opencode.json[c]` (default `~/.config/opencode`, on every OS).
+/// Antigravity only loads `~/.gemini/config/mcp_config.json`, so it ignores `--global`.
+/// Cursor/Windsurf/VS Code use the Claude Code shape in their own files; pass `--path`.
+fn mcp_config_path(
+    client: McpClient,
+    global: bool,
+    path: Option<PathBuf>,
+) -> anyhow::Result<PathBuf> {
+    if let Some(p) = path {
+        return Ok(p);
+    }
+    Ok(match (client, global) {
+        (McpClient::ClaudeCode, true) => home_dir()?.join(".claude.json"),
+        (McpClient::ClaudeCode, false) => std::env::current_dir()?.join(".mcp.json"),
+        (McpClient::Opencode, true) => {
+            let base = std::env::var_os("XDG_CONFIG_HOME")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .map_or_else(|| home_dir().map(|h| h.join(".config")), Ok)?;
+            opencode_file(&base.join("opencode"))
+        }
+        (McpClient::Opencode, false) => opencode_file(&std::env::current_dir()?),
+        (McpClient::Antigravity, _) => home_dir()?
+            .join(".gemini")
+            .join("config")
+            .join("mcp_config.json"),
+    })
+}
+
+fn default_key(client: McpClient) -> &'static str {
+    match client {
+        McpClient::Opencode => "mcp",
+        McpClient::ClaudeCode | McpClient::Antigravity => "mcpServers",
+    }
+}
+
+/// The server entry in the shape each client expects.
+fn mcp_entry(client: McpClient, exe: &Path, db: Option<&Path>) -> serde_json::Value {
+    let exe = exe.to_string_lossy();
+    match client {
+        // https://opencode.ai/docs/mcp-servers/ — local servers take a single argv array.
+        McpClient::Opencode => {
+            let mut entry = serde_json::json!({
+                "type": "local",
+                "command": [exe, "serve"],
+                "enabled": true,
+            });
+            if let Some(db) = db {
+                entry["environment"] = serde_json::json!({ "MEMDAG_DB": db.to_string_lossy() });
+            }
+            entry
+        }
+        McpClient::ClaudeCode | McpClient::Antigravity => {
+            let mut entry = serde_json::json!({ "command": exe, "args": ["serve"] });
+            if let Some(db) = db {
+                entry["env"] = serde_json::json!({ "MEMDAG_DB": db.to_string_lossy() });
+            }
+            entry
+        }
+    }
+}
+
+/// Strip `//` and `/* */` comments and trailing commas so JSONC (opencode.jsonc) parses
+/// as JSON. String contents are left untouched.
+fn strip_jsonc(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    let mut in_str = false;
+    while let Some(c) = chars.next() {
+        if in_str {
+            out.push(c);
+            if c == '\\' {
+                if let Some(n) = chars.next() {
+                    out.push(n);
+                }
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match (c, chars.peek()) {
+            ('"', _) => {
+                in_str = true;
+                out.push(c);
+            }
+            ('/', Some('/')) => {
+                for n in chars.by_ref() {
+                    if n == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            ('/', Some('*')) => {
+                chars.next();
+                let mut prev = ' ';
+                for n in chars.by_ref() {
+                    if prev == '*' && n == '/' {
+                        break;
+                    }
+                    prev = n;
+                }
+                out.push(' ');
+            }
+            (',', _) => {
+                // Drop the comma if the next significant char closes an object/array.
+                let rest: String = chars.clone().collect();
+                let next = strip_jsonc_lookahead(&rest);
+                if !matches!(next, Some('}') | Some(']')) {
+                    out.push(c);
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// First char after whitespace and comments.
+fn strip_jsonc_lookahead(rest: &str) -> Option<char> {
+    let mut s = rest;
+    loop {
+        s = s.trim_start();
+        if let Some(r) = s.strip_prefix("//") {
+            s = r.split_once('\n').map_or("", |(_, r)| r);
+        } else if let Some(r) = s.strip_prefix("/*") {
+            s = r.split_once("*/").map_or("", |(_, r)| r);
+        } else {
+            return s.chars().next();
+        }
+    }
+}
+
+/// Load a JSON (or JSONC) object. Returns whether the file had comments, which a rewrite
+/// would drop (the caller backs the file up first).
+fn load_json_object(path: &Path) -> anyhow::Result<(serde_json::Value, bool)> {
     if !path.exists() {
-        return Ok(serde_json::json!({}));
+        return Ok((serde_json::json!({}), false));
     }
     let raw = std::fs::read_to_string(path)?;
-    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
-        anyhow::anyhow!("Failed to parse existing JSON at {}: {}", path.display(), e)
-    })?;
+    let (value, had_comments) = match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(v) => (v, false),
+        Err(e) => {
+            let stripped = strip_jsonc(&raw);
+            let v = serde_json::from_str(&stripped).map_err(|_| {
+                anyhow::anyhow!("Failed to parse existing JSON at {}: {}", path.display(), e)
+            })?;
+            (v, true)
+        }
+    };
     if !value.is_object() {
         anyhow::bail!(
             "{} does not contain a JSON object at its root",
             path.display()
         );
     }
-    Ok(value)
+    Ok((value, had_comments))
+}
+
+fn save_json_object(
+    path: &Path,
+    root: &serde_json::Value,
+    had_comments: bool,
+) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if had_comments {
+        let backup = PathBuf::from(format!("{}.bak", path.display()));
+        std::fs::copy(path, &backup)?;
+        eprintln!(
+            "Note: {} contained comments, which JSON rewriting drops; original saved as {}",
+            path.display(),
+            backup.display()
+        );
+    }
+    std::fs::write(path, serde_json::to_string_pretty(root)?)?;
+    Ok(())
 }
 
 /// Warn (not block) if the binary being registered lives somewhere likely to disappear or
@@ -337,23 +576,23 @@ fn unstable_binary_reason(exe: &Path, path_dirs: &[PathBuf]) -> Option<&'static 
 
 fn handle_mcp_action(action: &McpAction, cli_db: Option<PathBuf>) -> anyhow::Result<()> {
     match action {
-        McpAction::Install { global, path, key } => {
-            let cfg_path = mcp_config_path(*global, path.clone())?;
-            let mut root = load_json_object(&cfg_path)?;
+        McpAction::Install {
+            global,
+            path,
+            client,
+            key,
+        } => {
+            let cfg_path = mcp_config_path(*client, *global, path.clone())?;
+            let key = key.as_deref().unwrap_or(default_key(*client));
+            let (mut root, had_comments) = load_json_object(&cfg_path)?;
 
             let exe = std::env::current_exe()?;
             warn_if_unstable_binary_path(&exe);
-            let mut entry = serde_json::json!({
-                "command": exe.to_string_lossy(),
-                "args": ["serve"],
-            });
-            if let Some(db) = cli_db {
-                entry["env"] = serde_json::json!({ "MEMDAG_DB": db.to_string_lossy() });
-            }
+            let entry = mcp_entry(*client, &exe, cli_db.as_deref());
 
             root.as_object_mut()
                 .unwrap()
-                .entry(key.as_str())
+                .entry(key)
                 .or_insert_with(|| serde_json::json!({}))
                 .as_object_mut()
                 .ok_or_else(|| {
@@ -361,27 +600,30 @@ fn handle_mcp_action(action: &McpAction, cli_db: Option<PathBuf>) -> anyhow::Res
                 })?
                 .insert("memdag".to_string(), entry);
 
-            if let Some(parent) = cfg_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&cfg_path, serde_json::to_string_pretty(&root)?)?;
+            save_json_object(&cfg_path, &root, had_comments)?;
             println!(
                 "Installed memdag MCP server into {} (key: '{key}')",
                 cfg_path.display()
             );
         }
-        McpAction::Uninstall { global, path, key } => {
-            let cfg_path = mcp_config_path(*global, path.clone())?;
-            let mut root = load_json_object(&cfg_path)?;
+        McpAction::Uninstall {
+            global,
+            path,
+            client,
+            key,
+        } => {
+            let cfg_path = mcp_config_path(*client, *global, path.clone())?;
+            let key = key.as_deref().unwrap_or(default_key(*client));
+            let (mut root, had_comments) = load_json_object(&cfg_path)?;
 
             let removed = root
-                .get_mut(key.as_str())
+                .get_mut(key)
                 .and_then(|s| s.as_object_mut())
                 .and_then(|m| m.remove("memdag"))
                 .is_some();
 
             if removed {
-                std::fs::write(&cfg_path, serde_json::to_string_pretty(&root)?)?;
+                save_json_object(&cfg_path, &root, had_comments)?;
                 println!(
                     "Removed memdag MCP server entry from {}",
                     cfg_path.display()
@@ -392,6 +634,19 @@ fn handle_mcp_action(action: &McpAction, cli_db: Option<PathBuf>) -> anyhow::Res
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod jsonc_tests {
+    use super::strip_jsonc;
+
+    #[test]
+    fn strips_comments_and_trailing_commas_but_not_strings() {
+        let raw = "{\n  // c\n  \"a\": \"http://x//y\", /* b */\n  \"l\": [1, 2,],\n}\n";
+        let v: serde_json::Value = serde_json::from_str(&strip_jsonc(raw)).unwrap();
+        assert_eq!(v["a"], "http://x//y");
+        assert_eq!(v["l"], serde_json::json!([1, 2]));
+    }
 }
 
 #[cfg(test)]

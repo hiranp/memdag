@@ -164,6 +164,45 @@ pub enum Commands {
         /// Output file path. Prints to stdout if omitted.
         path: Option<PathBuf>,
     },
+
+    /// Rebuild/refresh the index from git-tracked sources (idempotent upsert by stable id).
+    /// With no source flags, imports all of them.
+    Import {
+        /// Repository root. Defaults to the nearest ancestor of the cwd containing `.git`.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+
+        /// Commits with a `Decision:` trailer -> decision `GIT-<sha7>`
+        #[arg(long)]
+        git: bool,
+
+        /// `docs/adr/NNNN-*.md` -> decision `ADR-NNNN`
+        #[arg(long)]
+        adr: bool,
+
+        /// Memory notes (`docs/memory/*.md`, or `[write_through] dir` from memdag.toml)
+        #[arg(long)]
+        notes: bool,
+
+        /// GitHub issue comments containing `<!-- handoff -->`, via the `gh` CLI (slow)
+        #[arg(long)]
+        gh: bool,
+
+        /// Only scan commits in `<REV>..HEAD` (ADRs and notes are always rescanned)
+        #[arg(long)]
+        since: Option<String>,
+    },
+}
+
+/// MCP client presets for `memdag mcp install|uninstall --client`.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpClient {
+    /// `.mcp.json` / `~/.claude.json`, key `mcpServers`
+    ClaudeCode,
+    /// `opencode.json[c]` / `~/.config/opencode/opencode.json[c]`, key `mcp`
+    Opencode,
+    /// `~/.gemini/config/mcp_config.json`, key `mcpServers` (always the global file)
+    Antigravity,
 }
 
 #[derive(Subcommand, Debug)]
@@ -178,10 +217,15 @@ pub enum McpAction {
         #[arg(long)]
         path: Option<PathBuf>,
 
-        /// Top-level JSON key servers are nested under. Most clients (Claude Code, Cursor,
-        /// Windsurf) use "mcpServers"; VS Code uses "servers" (e.g. for .vscode/mcp.json).
-        #[arg(long, default_value = "mcpServers")]
-        key: String,
+        /// Client preset: picks the default config path, top-level key and entry shape
+        #[arg(long, value_enum, default_value = "claude-code")]
+        client: McpClient,
+
+        /// Top-level JSON key servers are nested under (overrides the client's default).
+        /// Most clients (Claude Code, Cursor, Windsurf) use "mcpServers"; VS Code uses
+        /// "servers" (e.g. for .vscode/mcp.json); OpenCode uses "mcp".
+        #[arg(long)]
+        key: Option<String>,
     },
 
     /// Remove memdag's MCP server entry from a client config
@@ -194,8 +238,12 @@ pub enum McpAction {
         #[arg(long)]
         path: Option<PathBuf>,
 
+        /// Client preset (see `install --client`)
+        #[arg(long, value_enum, default_value = "claude-code")]
+        client: McpClient,
+
         /// Top-level JSON key servers are nested under (see `install --key`).
-        #[arg(long, default_value = "mcpServers")]
-        key: String,
+        #[arg(long)]
+        key: Option<String>,
     },
 }

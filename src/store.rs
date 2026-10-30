@@ -76,6 +76,10 @@ impl MemoryStore {
         &self.conn
     }
 
+    pub(crate) fn connection_mut(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
+
     /// Enable write-through: durable memories (see [`writes_through`]) are first written to
     /// `<dir>/<id>.md` (append-only, never rewritten) and then indexed from that file.
     pub fn set_write_through(&mut self, dir: Option<PathBuf>) {
