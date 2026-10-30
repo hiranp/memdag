@@ -113,20 +113,14 @@ explicit DAG supersession). Do **not** adopt Hindsight. Close three gaps:
 
 ## Known limitations (deferred after review)
 
-Found by an independent review of the branch and consciously not fixed yet:
+Found by an independent review of the branch. Pruning, resolutions in git, refresh inside
+`serve`, embedder identity and atomic note files were fixed afterwards; see ADR 0003. Still
+open:
 
-- The importer never prunes: deleting a note or ADR, or rewriting history (which changes
-  `GIT-<sha7>` ids), leaves the old row behind. A fix needs per-source ownership of ids.
-- `resolve_memory` changes the database only. Under write-through the note file is
-  unchanged, so a rebuild from git makes a resolved blocker `active` again. A rebuild
-  reproduces note-backed *content*; status, timestamps and session ids are not recorded in
-  git.
-- `serve` imports at startup only; a long-lived MCP session does not see later commits
-  until it restarts (the CLI refreshes on every `search`).
-- The embedder's identity is not recorded, so switching embedders silently mixes vector
-  spaces; run `DELETE FROM memories_vec` then `memdag embed` after a switch.
-- Note files are written without fsync or temp-file-plus-rename, so a crash can leave a
-  truncated note.
+- A rebuild reproduces note-backed content and resolutions, but not timestamps or session ids.
+- The embedder's identity is its command string; a different model behind the same command
+  is not detected.
+- A commit body containing the byte `0x1f` (the git importer's field separator) is misparsed.
 - Staleness spawns git once per cited path (twice for directories) per result shown, and
   `gh` import fetches every comment in the repository.
 - `search_vector` ignores status and kind filters (the hybrid path honours them).

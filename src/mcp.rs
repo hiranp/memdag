@@ -6,9 +6,11 @@ use crate::store::{
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io::{BufRead, Write};
+use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
@@ -68,13 +70,61 @@ fn string_list(value: Option<&Value>) -> Vec<String> {
 
 pub struct McpServer {
     store: RefCell<MemoryStore>,
+    refresh: Option<AutoRefresh>,
 }
+
+/// Re-import the repo before read tools, so a long-lived session sees commits made after it
+/// started. Throttled: a fresh index costs one `git rev-parse`, but not on every call.
+struct AutoRefresh {
+    repo: PathBuf,
+    notes_dir: PathBuf,
+    interval: Duration,
+    last: Cell<Option<Instant>>,
+}
+
+/// Default minimum gap between two refresh checks in a running server.
+pub const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Tools whose answers come from the index and should reflect the current checkout.
+const READ_TOOLS: &[&str] = &[
+    "search_memory",
+    "search_vector",
+    "get_memory",
+    "list_memories",
+    "list_ready",
+];
 
 impl McpServer {
     pub fn new(store: MemoryStore) -> Self {
         Self {
             store: RefCell::new(store),
+            refresh: None,
         }
+    }
+
+    /// Refresh the index from `repo` (at most once per `interval`) before read tools.
+    pub fn with_auto_refresh(
+        mut self,
+        repo: PathBuf,
+        notes_dir: PathBuf,
+        interval: Duration,
+    ) -> Self {
+        self.refresh = Some(AutoRefresh {
+            repo,
+            notes_dir,
+            interval,
+            last: Cell::new(None),
+        });
+        self
+    }
+
+    fn maybe_refresh(&self, store: &mut MemoryStore) {
+        let Some(r) = &self.refresh else { return };
+        if r.last.get().is_some_and(|t| t.elapsed() < r.interval) {
+            return;
+        }
+        crate::import::auto_refresh(store, &r.repo, &r.notes_dir);
+        r.last.set(Some(Instant::now()));
     }
 
     pub fn run_stdio(&self) -> Result<()> {
@@ -235,6 +285,9 @@ impl McpServer {
 
     fn execute_tool(&self, name: &str, args: Value) -> Result<String> {
         let mut store = self.store.borrow_mut();
+        if READ_TOOLS.contains(&name) {
+            self.maybe_refresh(&mut store);
+        }
 
         match name {
             "record_memory" => {

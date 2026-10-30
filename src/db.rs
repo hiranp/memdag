@@ -24,7 +24,7 @@ PRAGMA synchronous = NORMAL;
 "#;
 
 /// Bump when the schema changes; `init_pragmas_and_schema` migrates older databases up to it.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// `CREATE TABLE` for the core memories table, parameterised on its name so the v1
 /// migration can build a replacement table before swapping it in.
@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS {name} (
     paths TEXT,
     commit_sha TEXT,
     fingerprints TEXT,
-    source TEXT
+    source TEXT,
+    origin_repo TEXT
 );
 "#
     )
@@ -143,10 +144,19 @@ CREATE TABLE IF NOT EXISTS pending_relations (
 /// created before v2 get them via `ALTER TABLE ADD COLUMN` (no table rebuild).
 const V2_COLUMNS: &[&str] = &["paths", "commit_sha", "fingerprints", "source"];
 
+/// v3: `origin_repo` (canonical path of the repo an imported/note-backed row came from) lets
+/// an import prune rows whose source disappeared without touching rows from another repo
+/// that shares the same database.
+const V3_SQL: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_memories_origin ON memories(source, origin_repo);
+-- Vectors orphaned before the v2 delete trigger existed.
+DELETE FROM memories_vec WHERE id NOT IN (SELECT id FROM memories);
+"#;
+
 /// The full schema for a fresh database.
 pub fn ddl_sql() -> String {
     format!(
-        "{}{REST_DDL_SQL}{MEMORIES_DEPENDENTS_SQL}{VEC_TRIGGERS_SQL}{V1_DDL_SQL}",
+        "{}{REST_DDL_SQL}{MEMORIES_DEPENDENTS_SQL}{VEC_TRIGGERS_SQL}{V1_DDL_SQL}{V3_SQL}",
         memories_table_sql("memories")
     )
 }
@@ -220,6 +230,9 @@ fn init_pragmas_and_schema(conn: &Connection) -> Result<()> {
     if version < 2 {
         migrate_to_v2(conn).context("Failed to migrate memdag schema to v2")?;
     }
+    if version < 3 {
+        migrate_to_v3(conn).context("Failed to migrate memdag schema to v3")?;
+    }
     Ok(())
 }
 
@@ -265,6 +278,31 @@ fn migrate_to_v2(conn: &Connection) -> Result<()> {
             )?;
             conn.execute_batch(VEC_TRIGGERS_SQL)?;
             conn.execute_batch("PRAGMA user_version = 2;")?;
+        }
+        Ok(())
+    })();
+    match step {
+        Ok(()) => conn.execute_batch("COMMIT;")?,
+        Err(e) => {
+            conn.execute_batch("ROLLBACK;").ok();
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// v2 -> v3: add `origin_repo` and drop orphan vectors. Rows imported before v3 have no
+/// origin; the next import of their repo claims them.
+fn migrate_to_v3(conn: &Connection) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let step = (|| -> Result<()> {
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < 3 {
+            if !has_column(conn, "memories", "origin_repo")? {
+                conn.execute_batch("ALTER TABLE memories ADD COLUMN origin_repo TEXT;")?;
+            }
+            conn.execute_batch(V3_SQL)?;
+            conn.execute_batch("PRAGMA user_version = 3;")?;
         }
         Ok(())
     })();
@@ -453,5 +491,36 @@ INSERT INTO memory_relations (source_id, target_id, relation_type) VALUES ('TSK-
 
         // Reopening a migrated DB is a no-op.
         open_connection(&path).unwrap();
+    }
+
+    #[test]
+    fn migrates_v2_database_adding_origin_and_dropping_orphan_vectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v2.db");
+        let zeros = format!("[{}]", vec!["0"; 384].join(","));
+        let conn = open_connection(&path).unwrap();
+        conn.execute_batch(
+            "DROP INDEX idx_memories_origin;
+             ALTER TABLE memories DROP COLUMN origin_repo;
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memories_vec (id, embedding) VALUES ('GONE-1', ?1)",
+            [&zeros],
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = open_connection(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+        assert!(has_column(&conn, "memories", "origin_repo").unwrap());
+        let orphans: i64 = conn
+            .query_row("SELECT count(*) FROM memories_vec", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(orphans, 0);
     }
 }

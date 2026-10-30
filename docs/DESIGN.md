@@ -192,6 +192,17 @@ fingerprints are validated on write and again on import, because note files come
 `memories_vec` rows are removed by trigger when a memory is deleted or its title/body is
 rewritten. See ADR 0001.
 
+### 4.1.2 Schema v3: per-repo ownership
+
+`origin_repo` (canonical repo path, `import::repo_key`) is set on every imported or note-backed
+row. With `source` it defines ownership: after a source is scanned completely, the importer
+deletes the rows `(source, origin_repo)` owns that it did not produce (`ImportReport::pruned`),
+re-derives each imported row's outgoing `supersedes` edges, and reactivates rows left with no
+incoming `supersedes` edge. Resolutions of note-backed memories live in append-only
+`<notes_dir>/<id>.resolved.md` sidecars that the importer merges into the note's row. The
+`memdag_meta` key `embedder` records the embed command behind `memories_vec`; a different
+command clears the table. See ADR 0003.
+
 ### 4.2 Memory Kinds & Lifecycle States
 
 | Kind | Description | Default Status | Eviction Policy |

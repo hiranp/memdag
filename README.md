@@ -364,7 +364,26 @@ memdag embed                                      # backfill vectors for existin
 
 New memories are embedded on write (best effort: an embedder outage never blocks recording).
 If the command is missing or failing, search falls back to BM25. The command is read from the
-environment only, so a cloned repository can't make memdag run anything.
+environment only, so a cloned repository can't make memdag run anything. memdag records which
+command produced the stored vectors; if you switch to a different command, the old vectors are
+dropped (vectors from two models can't be compared) and `memdag embed` recomputes them.
+
+### The index follows git
+
+`memdag import` (and the automatic refresh on `search`, and before read tools in a running
+`serve`) keeps the index in step with the files and commits it was built from:
+
+- Delete a note or ADR, or amend/rebase away a `Decision:` commit, and its memory is removed
+  on the next import. A file that exists but fails to parse keeps its memory, with a warning.
+- Remove a note's `supersedes:` line, or the superseding note itself, and the older memory
+  becomes active again.
+- With write-through, resolving a note-backed blocker writes `docs/memory/<id>.resolved.md`
+  next to the note, so the resolution survives a rebuild from git. Commit it with the note.
+- Several repositories can share one database (`MEMDAG_DB`); each import only touches rows
+  from its own repository.
+
+The index reflects the current checkout: notes and commits on other branches are not in it
+until you switch back. See [ADR 0003](docs/adr/0003-imported-rows-follow-their-sources.md).
 
 ### Scope & Limitations
 

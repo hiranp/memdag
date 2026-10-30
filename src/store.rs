@@ -5,12 +5,14 @@ use crate::models::{
     MemorySearchResult, MemoryStatus, RelatedEntity, RelationType, SessionLearning,
 };
 use crate::notes::{
-    Note, clean_provenance, is_valid_commit, is_valid_note_id, is_valid_repo_path, join_paths,
-    join_tags, parse_note, slugify, split_paths, split_tags,
+    Note, RESOLVED_SUFFIX, clean_provenance, is_valid_commit, is_valid_note_id, is_valid_repo_path,
+    join_paths, join_tags, parse_note, render_resolution, resolution_suffix, slugify, split_paths,
+    split_tags, write_new_file_atomic,
 };
 use crate::provenance;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -88,7 +90,12 @@ pub struct MemoryStore {
     write_through: Option<PathBuf>,
     repo_root: Option<PathBuf>,
     embed_cmd: Option<String>,
+    /// Whether `embed_cmd` has been compared with the embedder recorded in the database.
+    embedder_checked: Cell<bool>,
 }
+
+/// `memdag_meta` key holding the embed command that produced the stored vectors.
+const EMBEDDER_META_KEY: &str = "embedder";
 
 /// Kinds that are durable enough to become git-tracked note files under write-through.
 pub fn writes_through(kind: MemoryKind) -> bool {
@@ -105,6 +112,7 @@ impl MemoryStore {
             write_through: None,
             repo_root: None,
             embed_cmd: None,
+            embedder_checked: Cell::new(false),
         }
     }
 
@@ -116,6 +124,59 @@ impl MemoryStore {
     /// Shell command that turns stdin text into a 384-float JSON vector (see [`embed`]).
     pub fn set_embed_command(&mut self, cmd: Option<String>) {
         self.embed_cmd = cmd.filter(|c| !c.trim().is_empty());
+        self.embedder_checked.set(false);
+    }
+
+    /// The embed command, after making sure the stored vectors came from it. Vectors from
+    /// different embedders live in different spaces, so mixing them makes KNN meaningless.
+    /// On a mismatch every stored vector is dropped (`memdag embed` recomputes them). The
+    /// command string is the identity: change it only when the model changes.
+    fn embedder(&self) -> Option<&str> {
+        let cmd = self.embed_cmd.as_deref()?;
+        if !self.embedder_checked.get() {
+            if let Err(e) = self.check_embedder_identity(cmd) {
+                eprintln!("[memdag] could not check embedder identity: {e:#}");
+            }
+            self.embedder_checked.set(true);
+        }
+        Some(cmd)
+    }
+
+    fn check_embedder_identity(&self, cmd: &str) -> Result<()> {
+        let recorded: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM memdag_meta WHERE key = ?1",
+                params![EMBEDDER_META_KEY],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if recorded.as_deref() == Some(cmd) {
+            return Ok(());
+        }
+        if recorded.is_some() {
+            let dropped = self.conn.execute("DELETE FROM memories_vec", [])?;
+            if dropped > 0 {
+                eprintln!(
+                    "[memdag] {} changed since the stored vectors were computed; dropped {dropped} \
+                     vectors (run `memdag embed` to recompute them)",
+                    embed::EMBED_CMD_ENV
+                );
+            }
+        }
+        // No record yet: vectors from before identities were tracked are adopted as-is.
+        self.conn.execute(
+            "INSERT INTO memdag_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![EMBEDDER_META_KEY, cmd],
+        )?;
+        Ok(())
+    }
+
+    /// Canonical key of the repo note-backed rows belong to (see `memories.origin_repo`).
+    fn origin_for(&self, source: Option<&str>) -> Option<String> {
+        source?;
+        self.repo_root.as_deref().map(crate::import::repo_key)
     }
 
     pub fn has_embedder(&self) -> bool {
@@ -195,12 +256,8 @@ impl MemoryStore {
             .with_context(|| format!("Failed to create write-through dir {}", dir.display()))?;
         let path = dir.join(format!("{id}.md"));
         // Notes are append-only: never overwrite an existing file.
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
+        write_new_file_atomic(&path, text.as_bytes())
             .with_context(|| format!("Failed to create note {}", path.display()))?;
-        std::io::Write::write_all(&mut file, text.as_bytes())?;
         Ok((parsed, path))
     }
 
@@ -288,7 +345,7 @@ impl MemoryStore {
     /// Embed a memory if an embedder is configured. Never fails the write: an embedder
     /// outage must not stop an agent from recording a decision. `memdag embed` backfills.
     fn embed_best_effort(&self, memory: &Memory) {
-        let Some(cmd) = &self.embed_cmd else { return };
+        let Some(cmd) = self.embedder() else { return };
         let text = embed::memory_text(&memory.title, &memory.body);
         match embed::embed(cmd, &text).and_then(|e| self.upsert_embedding(&memory.id, &e)) {
             Ok(()) => {}
@@ -320,8 +377,8 @@ impl MemoryStore {
     /// refresh never turns into a long blocking job.
     pub fn embed_missing_up_to(&mut self, limit: usize) -> Result<usize> {
         let cmd = self
-            .embed_cmd
-            .clone()
+            .embedder()
+            .map(str::to_string)
             .ok_or_else(|| anyhow::anyhow!("{} is not set", embed::EMBED_CMD_ENV))?;
         let pending: Vec<(String, String, String)> = self
             .conn
@@ -363,6 +420,7 @@ impl MemoryStore {
             MemoryStatus::Active
         };
 
+        let origin = self.origin_for(source);
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -394,8 +452,8 @@ impl MemoryStore {
         // Insert new entity FIRST so foreign keys can reference it
         tx.execute(
             r#"
-            INSERT INTO memories (id, kind, title, body, tags, status, session_id, paths, commit_sha, fingerprints, source)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            INSERT INTO memories (id, kind, title, body, tags, status, session_id, paths, commit_sha, fingerprints, source, origin_repo)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             "#,
             params![
                 new_id,
@@ -409,6 +467,7 @@ impl MemoryStore {
                 opts.commit,
                 join_paths(fingerprints),
                 source,
+                origin,
             ],
         )
         .context("Failed to insert memory record")?;
@@ -537,15 +596,14 @@ impl MemoryStore {
     /// Embed `text` with the configured embedder (errors if none is configured).
     pub fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
         let cmd = self
-            .embed_cmd
-            .as_deref()
+            .embedder()
             .ok_or_else(|| anyhow::anyhow!("{} is not set", embed::EMBED_CMD_ENV))?;
         embed::embed(cmd, text)
     }
 
     /// Embed a search query, degrading to BM25-only if the embedder is absent or failing.
     fn embed_query(&self, query: &str) -> Option<Vec<f32>> {
-        let cmd = self.embed_cmd.as_ref()?;
+        let cmd = self.embedder()?;
         match embed::embed(cmd, query) {
             Ok(e) => Some(e),
             Err(e) => {
@@ -801,6 +859,7 @@ impl MemoryStore {
         prepared: &[PreparedLearning],
         purge_ephemeral: bool,
     ) -> Result<ConsolidationResult> {
+        let origin = self.origin_for(Some("note"));
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -810,8 +869,8 @@ impl MemoryStore {
         for (learning, p) in learnings.iter().zip(prepared) {
             tx.execute(
                 r#"
-                INSERT INTO memories (id, kind, title, body, tags, status, session_id, paths, commit_sha, fingerprints, source)
-                VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7, ?8, ?9, ?10)
+                INSERT INTO memories (id, kind, title, body, tags, status, session_id, paths, commit_sha, fingerprints, source, origin_repo)
+                VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7, ?8, ?9, ?10, ?11)
                 "#,
                 params![
                     p.id,
@@ -824,6 +883,7 @@ impl MemoryStore {
                     p.commit,
                     join_paths(&p.fingerprints),
                     p.source,
+                    p.source.and(origin.as_deref()),
                 ],
             )
             .context("Failed to insert consolidated session learning")?;
@@ -952,25 +1012,73 @@ impl MemoryStore {
 
     /// Mark a memory as resolved, appending an optional resolution note to the body.
     pub fn resolve_memory(&mut self, id: &str, note: Option<&str>) -> Result<Memory> {
+        let note = note.map(str::trim).filter(|n| !n.is_empty());
         if let Some(n) = note {
             check_for_secrets("", n, None)?;
         }
-        let suffix = note
-            .map(|n| format!("\n\n[Resolved]: {n}"))
-            .unwrap_or_default();
-        self.conn
+
+        // A note-backed memory is rebuilt from its file, so a database-only status change
+        // would be lost on the next rebuild. Record the resolution next to the note (the note
+        // itself stays append-only) and let the importer merge it.
+        let sidecar = self.resolution_sidecar_path(id)?;
+        if let Some(path) = &sidecar {
+            write_new_file_atomic(path, render_resolution(id, note).as_bytes()).with_context(
+                || {
+                    format!(
+                        "Failed to record the resolution of '{id}' in {}",
+                        path.display()
+                    )
+                },
+            )?;
+        }
+
+        let result = self
+            .conn
             .query_row(
                 &format!(
                     "UPDATE memories SET status = 'resolved', body = body || ?2,
                      updated_at = CURRENT_TIMESTAMP WHERE id = ?1
                      RETURNING {MEMORY_COLS}"
                 ),
-                params![id, suffix],
+                params![id, resolution_suffix(note)],
                 row_to_memory,
             )
             .optional()
-            .context("Failed to resolve memory")?
-            .ok_or_else(|| anyhow::anyhow!("Memory '{}' not found", id))
+            .context("Failed to resolve memory")
+            .and_then(|m| m.ok_or_else(|| anyhow::anyhow!("Memory '{}' not found", id)));
+        if result.is_err()
+            && let Some(path) = &sidecar
+        {
+            std::fs::remove_file(path).ok();
+        }
+        result
+    }
+
+    /// `<notes_dir>/<id>.resolved.md` when `id` is backed by a write-through note file, else
+    /// None. Errors if that memory was already resolved (resolutions are append-only too).
+    fn resolution_sidecar_path(&self, id: &str) -> Result<Option<PathBuf>> {
+        let Some(dir) = self.write_through.as_deref() else {
+            return Ok(None);
+        };
+        if !is_valid_note_id(id) || !dir.join(format!("{id}.md")).is_file() {
+            return Ok(None);
+        }
+        let source: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT source FROM memories WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if source.flatten().as_deref() != Some("note") {
+            return Ok(None);
+        }
+        let path = dir.join(format!("{id}{RESOLVED_SUFFIX}.md"));
+        if path.exists() {
+            bail!("Memory '{id}' is already resolved ({})", path.display());
+        }
+        Ok(Some(path))
     }
 
     /// Search memories by dense vector embedding using sqlite-vec KNN.

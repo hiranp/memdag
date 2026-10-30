@@ -369,9 +369,100 @@ pub fn is_valid_note_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 120
         && !id.starts_with('.')
+        && !id.to_ascii_lowercase().ends_with(RESOLVED_SUFFIX)
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// `<id>.resolved.md` records that note `<id>` was resolved, so the resolution survives a
+/// rebuild from git. The note itself stays append-only; the suffix is reserved for this.
+pub const RESOLVED_SUFFIX: &str = ".resolved";
+
+/// The body text `resolve_memory` appends for a resolution note (and the importer
+/// reproduces from a sidecar). `None`/blank means "resolved, no note".
+pub fn resolution_suffix(note: Option<&str>) -> String {
+    match note.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(n) => format!("\n\n[Resolved]: {n}"),
+        None => String::new(),
+    }
+}
+
+/// Render a resolution sidecar for note `id`.
+pub fn render_resolution(id: &str, note: Option<&str>) -> String {
+    let mut out = format!("---\nresolves: {id}\n---\n");
+    if let Some(n) = note.map(str::trim).filter(|n| !n.is_empty()) {
+        out.push_str(n);
+        out.push('\n');
+    }
+    out
+}
+
+/// Parse a resolution sidecar: `(resolved id, note)`.
+pub fn parse_resolution(text: &str) -> Result<(String, Option<String>)> {
+    let (front, body) = split_front_matter(text)
+        .ok_or_else(|| anyhow::anyhow!("missing `---` front-matter block"))?;
+    let id = front
+        .lines()
+        .find_map(|l| l.strip_prefix("resolves:"))
+        .map(unquote)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("resolution has no `resolves:` id"))?;
+    let note = Some(body.trim().to_string()).filter(|b| !b.is_empty());
+    Ok((id, note))
+}
+
+/// Create `path` with `bytes`, atomically and without ever replacing an existing file: write
+/// a hidden temp file in the same directory, fsync it, then hard-link it into place (fails if
+/// `path` exists). A crash leaves either no note or the whole note, never a truncated one;
+/// the temp name is dot-prefixed with a `.tmp` extension so importers skip leftovers.
+pub fn write_new_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    if path.exists() {
+        bail!("{} already exists", path.display());
+    }
+    let tmp = dir.join(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let result = (|| -> Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .with_context(|| format!("Failed to create {}", tmp.display()))?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        match std::fs::hard_link(&tmp, path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                bail!("{} already exists", path.display())
+            }
+            // Filesystems without hard links: rename is still atomic, and the exists check
+            // above makes clobbering a race rather than the normal path.
+            Err(_) => {
+                if path.exists() {
+                    bail!("{} already exists", path.display());
+                }
+                std::fs::rename(&tmp, path)
+                    .with_context(|| format!("Failed to create {}", path.display()))
+            }
+        }
+    })();
+    std::fs::remove_file(&tmp).ok();
+    result?;
+    #[cfg(unix)]
+    if let Ok(d) = std::fs::File::open(dir) {
+        d.sync_all().ok();
+    }
+    Ok(())
 }
 
 /// Lowercase, hyphenated, at most ~6 words / 40 chars.

@@ -7,13 +7,14 @@
 
 use crate::models::{MemoryKind, RelationType};
 use crate::notes::{
-    is_valid_commit, is_valid_note_id, is_valid_repo_path, join_paths, join_tags, parse_note,
-    split_front_matter, split_title,
+    RESOLVED_SUFFIX, is_valid_commit, is_valid_note_id, is_valid_repo_path, join_paths, join_tags,
+    parse_note, parse_resolution, resolution_suffix, split_front_matter, split_title,
 };
 use crate::provenance::is_valid_fingerprint;
 use crate::store::MemoryStore;
 use anyhow::{Context, Result, bail};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -83,6 +84,8 @@ pub struct ImportReport {
     pub edges: usize,
     /// Relations still waiting for their target to be imported.
     pub pending: usize,
+    /// Rows removed because their source (note, ADR, commit, comment) no longer exists.
+    pub pruned: usize,
     /// HEAD recorded as imported (set when the git source ran).
     pub head: Option<String>,
     pub warnings: Vec<String>,
@@ -176,6 +179,8 @@ struct Item {
     created_at: Option<String>,
     /// The source itself says it's superseded (e.g. an ADR's Status line).
     superseded: bool,
+    /// A `<id>.resolved.md` sidecar says this note was resolved.
+    resolved: bool,
     /// Provenance (notes only): files the item cites, and the commit it was recorded at.
     paths: Vec<String>,
     commit: Option<String>,
@@ -189,6 +194,17 @@ struct Batch {
     items: Vec<Item>,
     /// (source, target, relation)
     edges: Vec<(String, String, RelationType)>,
+    /// Sources that were scanned completely, so rows they own but didn't produce are gone.
+    prune: Vec<&'static str>,
+    /// Ids to keep although no item was produced for them (the file exists but couldn't be
+    /// read or parsed this time; deleting its row would be a surprise).
+    keep: HashMap<&'static str, HashSet<String>>,
+}
+
+impl Batch {
+    fn keep(&mut self, source: &'static str, id: String) {
+        self.keep.entry(source).or_default().insert(id);
+    }
 }
 
 /// Nearest ancestor (inclusive) containing `.git` (a dir, or a file in a worktree).
@@ -230,9 +246,14 @@ fn is_ancestor(repo: &Path, ancestor: &str, head: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn head_meta_key(repo: &Path) -> String {
+/// Canonical path of `repo`: the key for per-repo import state and `memories.origin_repo`.
+pub fn repo_key(repo: &Path) -> String {
     let path = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
-    format!("last_import_head:{}", path.display())
+    path.display().to_string()
+}
+
+fn head_meta_key(repo: &Path) -> String {
+    format!("last_import_head:{}", repo_key(repo))
 }
 
 /// A ref that names another memory (ADR-0003, DEC-..., GIT-abc1234) rather than an issue
@@ -375,6 +396,7 @@ fn collect_git(
             tags,
             created_at: Some(f[1].trim().to_string()),
             superseded: false,
+            resolved: false,
             paths: Vec::new(),
             commit: None,
             fingerprints: Vec::new(),
@@ -452,6 +474,7 @@ fn parse_adr(num: &str, text: &str, batch: &mut Batch) {
         tags,
         created_at: adr_field(text, "Date").map(str::to_string),
         superseded,
+        resolved: false,
         paths: Vec::new(),
         commit: None,
         fingerprints: Vec::new(),
@@ -459,21 +482,35 @@ fn parse_adr(num: &str, text: &str, batch: &mut Batch) {
     });
 }
 
-fn md_files(dir: &Path) -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|e| e == "md") && p.is_file())
-                .collect()
-        })
-        .unwrap_or_default();
+/// `*.md` files in `dir`, sorted. A missing directory is empty; any other read error is an
+/// error, so the caller knows the scan was incomplete and must not prune.
+fn md_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut files = Vec::new();
+    for entry in rd {
+        let p = entry?.path();
+        if p.extension().is_some_and(|e| e == "md") && p.is_file() {
+            files.push(p);
+        }
+    }
     files.sort();
-    files
+    Ok(files)
 }
 
-fn collect_adrs(dir: &Path, batch: &mut Batch, report: &mut ImportReport) {
-    for path in md_files(dir) {
+/// Returns whether the directory was scanned completely.
+fn collect_adrs(dir: &Path, batch: &mut Batch, report: &mut ImportReport) -> bool {
+    let files = match md_files(dir) {
+        Ok(f) => f,
+        Err(e) => {
+            report.warnings.push(format!("{}: {e}", dir.display()));
+            return false;
+        }
+    };
+    for path in files {
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         let Some(num) = adr_number(&name) else {
             continue;
@@ -483,39 +520,70 @@ fn collect_adrs(dir: &Path, batch: &mut Batch, report: &mut ImportReport) {
                 parse_adr(num, &text, batch);
                 report.adr += 1;
             }
-            Err(e) => report.warnings.push(format!("{}: {e}", path.display())),
+            Err(e) => {
+                report.warnings.push(format!("{}: {e}", path.display()));
+                batch.keep("adr", format!("ADR-{num}"));
+            }
         }
     }
+    true
 }
 
-fn collect_notes(dir: &Path, batch: &mut Batch, report: &mut ImportReport) {
-    for path in md_files(dir) {
+/// Returns whether the directory was scanned completely.
+fn collect_notes(dir: &Path, batch: &mut Batch, report: &mut ImportReport) -> bool {
+    let files = match md_files(dir) {
+        Ok(f) => f,
+        Err(e) => {
+            report.warnings.push(format!("{}: {e}", dir.display()));
+            return false;
+        }
+    };
+    let mut resolutions: Vec<(String, Option<String>, PathBuf)> = Vec::new();
+    for path in files {
+        let stem = path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
         let Ok(text) = std::fs::read_to_string(&path) else {
             report
                 .warnings
                 .push(format!("{}: unreadable", path.display()));
+            batch.keep("note", stem);
             continue;
         };
+        if let Some(target) = stem.strip_suffix(RESOLVED_SUFFIX) {
+            match parse_resolution(&text) {
+                Ok((id, note)) if id == target => resolutions.push((id, note, path)),
+                Ok((id, _)) => report.warnings.push(format!(
+                    "{}: resolves '{id}' but must be named {id}{RESOLVED_SUFFIX}.md; skipped",
+                    path.display()
+                )),
+                Err(e) => report.warnings.push(format!("{}: {e}", path.display())),
+            }
+            continue;
+        }
         // README.md and other prose without front-matter are not notes.
         if split_front_matter(&text).is_none() {
             continue;
         }
-        let stem = path.file_stem().unwrap_or_default().to_string_lossy();
         let note = match parse_note(&text, &stem) {
             Ok(n) => n,
             Err(e) => {
                 report.warnings.push(format!("{}: {e}", path.display()));
+                batch.keep("note", stem);
                 continue;
             }
         };
         // The file name is the identity. Trusting a front-matter `id:` that differs would let
         // any note overwrite an unrelated memory by claiming its id.
-        if note.id != *stem || !is_valid_note_id(&note.id) {
+        if note.id != stem || !is_valid_note_id(&note.id) {
             report.warnings.push(format!(
                 "{}: note id '{}' must equal the file name and be a valid id; skipped",
                 path.display(),
                 note.id
             ));
+            batch.keep("note", stem);
             continue;
         }
         if let Some(old) = &note.supersedes {
@@ -534,6 +602,7 @@ fn collect_notes(dir: &Path, batch: &mut Batch, report: &mut ImportReport) {
             tags,
             created_at: None,
             superseded: false,
+            resolved: false,
             // Note files come from the repo, so re-validate before trusting them. Fingerprints
             // are aligned with paths, so they survive only if every path does.
             fingerprints: if note.paths.iter().all(|p| is_valid_repo_path(p))
@@ -554,6 +623,25 @@ fn collect_notes(dir: &Path, batch: &mut Batch, report: &mut ImportReport) {
         });
         report.notes += 1;
     }
+
+    // Merge each resolution into its note, reproducing what `resolve_memory` did to the row.
+    for (id, note, path) in resolutions {
+        match batch
+            .items
+            .iter_mut()
+            .find(|i| i.source == "note" && i.id == id)
+        {
+            Some(item) => {
+                item.body.push_str(&resolution_suffix(note.as_deref()));
+                item.resolved = true;
+            }
+            None => report.warnings.push(format!(
+                "{}: no note '{id}' to resolve; skipped",
+                path.display()
+            )),
+        }
+    }
+    true
 }
 
 fn collect_gh(comments: Vec<GhComment>, batch: &mut Batch, report: &mut ImportReport) {
@@ -606,6 +694,7 @@ fn collect_gh(comments: Vec<GhComment>, batch: &mut Batch, report: &mut ImportRe
             tags,
             created_at: c.created_at,
             superseded: false,
+            resolved: false,
             paths: Vec::new(),
             commit: None,
             fingerprints: Vec::new(),
@@ -626,25 +715,32 @@ pub fn import_repo(
     let mut report = ImportReport::default();
     let mut batch = Batch::default();
 
-    if opts.git
-        && let Err(e) = collect_git(repo, opts.since.as_deref(), &mut batch, &mut report)
-    {
-        report.warnings.push(format!("git: {e:#}"));
+    if opts.git {
+        match collect_git(repo, opts.since.as_deref(), &mut batch, &mut report) {
+            // Only a full history scan proves a commit is gone (amended, rebased away, or on
+            // a branch that isn't checked out); an incremental `--since` scan proves nothing.
+            Ok(()) if opts.since.is_none() && report.head.is_some() => batch.prune.push("git"),
+            Ok(()) => {}
+            Err(e) => report.warnings.push(format!("git: {e:#}")),
+        }
     }
-    if opts.adr {
-        collect_adrs(&repo.join(&opts.adr_dir), &mut batch, &mut report);
+    if opts.adr && collect_adrs(&repo.join(&opts.adr_dir), &mut batch, &mut report) {
+        batch.prune.push("adr");
     }
-    if opts.notes {
-        collect_notes(&repo.join(&opts.notes_dir), &mut batch, &mut report);
+    if opts.notes && collect_notes(&repo.join(&opts.notes_dir), &mut batch, &mut report) {
+        batch.prune.push("note");
     }
     if opts.gh {
         match gh.fetch_comments(repo) {
-            Ok(comments) => collect_gh(comments, &mut batch, &mut report),
+            Ok(comments) => {
+                collect_gh(comments, &mut batch, &mut report);
+                batch.prune.push("gh");
+            }
             Err(e) => report.warnings.push(format!("gh: skipped ({e:#})")),
         }
     }
 
-    apply(store, &batch, &mut report)?;
+    apply(store, &batch, &mut report, &repo_key(repo))?;
 
     if opts.record_head
         && let Some(head) = &report.head
@@ -663,7 +759,12 @@ fn is_note_kind(kind: &str) -> bool {
     matches!(kind, "decision" | "invariant" | "learning" | "blocker")
 }
 
-fn apply(store: &mut MemoryStore, batch: &Batch, report: &mut ImportReport) -> Result<()> {
+fn apply(
+    store: &mut MemoryStore,
+    batch: &Batch,
+    report: &mut ImportReport,
+    repo: &str,
+) -> Result<()> {
     let tx = store
         .connection_mut()
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -671,7 +772,8 @@ fn apply(store: &mut MemoryStore, batch: &Batch, report: &mut ImportReport) -> R
 
     // Ids whose import was refused; edges that start from them are dropped too, or a
     // refused item could still rewrite the graph through its `supersedes:` line.
-    let mut refused: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut refused: HashSet<&str> = HashSet::new();
+    let mut applied: Vec<&Item> = Vec::new();
 
     for item in &batch.items {
         // Imported text reaches the agent's context, so it gets the same guards as a direct
@@ -693,24 +795,30 @@ fn apply(store: &mut MemoryStore, batch: &Batch, report: &mut ImportReport) -> R
             continue;
         }
 
-        // An import may refresh only rows it owns (same source), or adopt a source-less row
-        // that a note file legitimately describes. Anything else is an id collision with a
-        // locally recorded memory or a different source, and must not be overwritten.
-        let existing: Option<(Option<String>, String)> = tx
+        // An import may refresh only rows it owns (same source, same repo), or adopt a
+        // source-less row that a note file legitimately describes. Anything else is an id
+        // collision with a locally recorded memory, a different source, or another repo
+        // sharing this database, and must not be overwritten.
+        let existing: Option<(Option<String>, String, Option<String>)> = tx
             .query_row(
-                "SELECT source, kind FROM memories WHERE id = ?1",
+                "SELECT source, kind, origin_repo FROM memories WHERE id = ?1",
                 params![item.id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        if let Some((src, kind)) = &existing {
-            let owned = src.as_deref() == Some(item.source);
+        if let Some((src, kind, origin)) = &existing {
+            let same_source = src.as_deref() == Some(item.source);
+            let same_repo = origin.as_deref().is_none_or(|o| o == repo);
             let adoptable = src.is_none() && item.source == "note" && is_note_kind(kind);
-            if !owned && !adoptable {
+            if !(same_source && same_repo) && !adoptable {
+                let owner = match (src.as_deref(), same_source) {
+                    (Some(s), true) => format!("{s} memory from another repository"),
+                    (Some(s), false) => format!("{s} memory"),
+                    (None, _) => "locally recorded memory".into(),
+                };
                 report.warnings.push(format!(
-                    "{} not imported: id already used by a {} memory",
-                    item.id,
-                    src.as_deref().unwrap_or("locally recorded")
+                    "{} not imported: id already used by a {owner}",
+                    item.id
                 ));
                 refused.insert(&item.id);
                 continue;
@@ -719,13 +827,15 @@ fn apply(store: &mut MemoryStore, batch: &Batch, report: &mut ImportReport) -> R
 
         let status = if item.superseded {
             "superseded"
+        } else if item.resolved {
+            "resolved"
         } else {
             "active"
         };
         report.changed += tx.execute(
             r#"
-            INSERT INTO memories (id, kind, title, body, tags, status, created_at, updated_at, paths, commit_sha, fingerprints, source)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, COALESCE(datetime(?7), CURRENT_TIMESTAMP), CURRENT_TIMESTAMP, ?9, ?10, ?11, ?12)
+            INSERT INTO memories (id, kind, title, body, tags, status, created_at, updated_at, paths, commit_sha, fingerprints, source, origin_repo)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, COALESCE(datetime(?7), CURRENT_TIMESTAMP), CURRENT_TIMESTAMP, ?9, ?10, ?11, ?12, ?13)
             ON CONFLICT(id) DO UPDATE SET
                 kind = excluded.kind,
                 title = excluded.title,
@@ -735,7 +845,11 @@ fn apply(store: &mut MemoryStore, batch: &Batch, report: &mut ImportReport) -> R
                 commit_sha = excluded.commit_sha,
                 fingerprints = excluded.fingerprints,
                 source = excluded.source,
-                status = CASE WHEN ?8 THEN 'superseded' ELSE memories.status END,
+                origin_repo = excluded.origin_repo,
+                status = CASE
+                    WHEN ?8 THEN 'superseded'
+                    WHEN ?14 AND memories.status IS NOT 'superseded' THEN 'resolved'
+                    ELSE memories.status END,
                 updated_at = CURRENT_TIMESTAMP
             WHERE memories.kind IS NOT excluded.kind
                OR memories.title IS NOT excluded.title
@@ -745,7 +859,9 @@ fn apply(store: &mut MemoryStore, batch: &Batch, report: &mut ImportReport) -> R
                OR memories.commit_sha IS NOT excluded.commit_sha
                OR memories.fingerprints IS NOT excluded.fingerprints
                OR memories.source IS NOT excluded.source
+               OR memories.origin_repo IS NOT excluded.origin_repo
                OR (?8 AND memories.status IS NOT 'superseded')
+               OR (?14 AND memories.status NOT IN ('resolved', 'superseded'))
             "#,
             params![
                 item.id,
@@ -760,10 +876,49 @@ fn apply(store: &mut MemoryStore, batch: &Batch, report: &mut ImportReport) -> R
                 item.commit,
                 join_paths(&item.fingerprints),
                 item.source,
+                repo,
+                item.resolved,
             ],
         )?;
+        applied.push(item);
         // A changed title/body drops the stored vector via a trigger; `memdag embed`
         // (or the auto-refresh) recomputes it.
+    }
+
+    // Targets that may have lost their last `supersedes` edge in this run.
+    let mut unsuperseded: Vec<String> = Vec::new();
+
+    // Supersession is re-derived from the files: an applied row keeps exactly the outgoing
+    // `supersedes` edges its source still states. (Other relation types may have been added
+    // by agents through link_entities and are left alone.)
+    let supersedes = RelationType::Supersedes.as_str();
+    let desired: HashSet<(&str, &str)> = batch
+        .edges
+        .iter()
+        .filter(|(_, _, r)| *r == RelationType::Supersedes)
+        .map(|(s, t, _)| (s.as_str(), t.as_str()))
+        .collect();
+    for item in &applied {
+        let current: Vec<String> = tx
+            .prepare(
+                "SELECT target_id FROM memory_relations WHERE source_id = ?1 AND relation_type = ?2
+                 UNION SELECT target_id FROM pending_relations WHERE source_id = ?1 AND relation_type = ?2",
+            )?
+            .query_map(params![item.id, supersedes], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        for target in current {
+            if !desired.contains(&(item.id.as_str(), target.as_str())) {
+                tx.execute(
+                    "DELETE FROM memory_relations WHERE source_id = ?1 AND target_id = ?2 AND relation_type = ?3",
+                    params![item.id, target, supersedes],
+                )?;
+                tx.execute(
+                    "DELETE FROM pending_relations WHERE source_id = ?1 AND target_id = ?2 AND relation_type = ?3",
+                    params![item.id, target, supersedes],
+                )?;
+                unsuperseded.push(target);
+            }
+        }
     }
 
     for (source, target, rel) in &batch.edges {
@@ -792,7 +947,7 @@ fn apply(store: &mut MemoryStore, batch: &Batch, report: &mut ImportReport) -> R
              VALUES (?1, ?2, ?3)",
             params![source, target, rel],
         )?;
-        if rel == RelationType::Supersedes.as_str() {
+        if rel == supersedes {
             // An imported file may supersede imported memories and durable note-kind rows,
             // but not hide a locally recorded task, blocker-in-progress or scratch memory.
             tx.execute(
@@ -809,6 +964,65 @@ fn apply(store: &mut MemoryStore, batch: &Batch, report: &mut ImportReport) -> R
             params![source, target, rel],
         )?;
     }
+
+    // Prune: a fully scanned source owns its rows in this repo, so a row it no longer
+    // produced (deleted note/ADR, amended or rebased-away commit, deleted comment) goes.
+    for &source in &batch.prune {
+        let mut keep: HashSet<&str> = batch
+            .items
+            .iter()
+            .filter(|i| i.source == source)
+            .map(|i| i.id.as_str())
+            .collect();
+        if let Some(k) = batch.keep.get(source) {
+            keep.extend(k.iter().map(String::as_str));
+        }
+        let owned: Vec<String> = tx
+            .prepare("SELECT id FROM memories WHERE source = ?1 AND origin_repo = ?2")?
+            .query_map(params![source, repo], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        for id in owned.iter().filter(|id| !keep.contains(id.as_str())) {
+            let targets: Vec<String> = tx
+                .prepare(
+                    "SELECT target_id FROM memory_relations WHERE source_id = ?1 AND relation_type = ?2",
+                )?
+                .query_map(params![id, supersedes], |r| r.get(0))?
+                .collect::<Result<_, _>>()?;
+            unsuperseded.extend(targets);
+            tx.execute(
+                "DELETE FROM pending_relations WHERE source_id = ?1",
+                params![id],
+            )?;
+            // Relations cascade; FTS and vector rows go via triggers.
+            report.pruned += tx.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
+        }
+    }
+
+    // A row superseded only by an edge that is now gone becomes current again, as does an
+    // imported row whose own source no longer says it's superseded.
+    let resolved: HashMap<&str, bool> = applied
+        .iter()
+        .map(|i| (i.id.as_str(), i.resolved))
+        .collect();
+    let candidates = unsuperseded.iter().map(String::as_str).chain(
+        applied
+            .iter()
+            .filter(|i| !i.superseded)
+            .map(|i| i.id.as_str()),
+    );
+    let mut seen = HashSet::new();
+    for id in candidates.filter(|id| seen.insert(*id)) {
+        report.changed += tx.execute(
+            "UPDATE memories
+             SET status = CASE WHEN ?2 THEN 'resolved' ELSE 'active' END,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1 AND status = 'superseded'
+               AND NOT EXISTS (SELECT 1 FROM memory_relations
+                               WHERE target_id = ?1 AND relation_type = 'supersedes')",
+            params![id, resolved.get(id).copied().unwrap_or(false)],
+        )?;
+    }
+
     report.pending = tx.query_row("SELECT count(*) FROM pending_relations", [], |r| {
         r.get::<_, i64>(0)
     })? as usize;
@@ -853,6 +1067,37 @@ pub fn refresh_if_stale(
         ..ImportOptions::local()
     };
     import_repo(store, repo, &opts, &GhCli).map(Some)
+}
+
+/// [`refresh_if_stale`], then embed up to 50 rows that lost their vectors, logging to stderr.
+/// Never fails: a broken import must not stop a search or an MCP session.
+pub fn auto_refresh(store: &mut MemoryStore, repo: &Path, notes_dir: &Path) {
+    match refresh_if_stale(store, repo, notes_dir) {
+        Ok(Some(r)) => {
+            for w in &r.warnings {
+                eprintln!("[memdag] auto-import warning: {w}");
+            }
+            if r.changed > 0 || r.pruned > 0 {
+                eprintln!(
+                    "[memdag] auto-imported {} changed and {} removed memories from {}",
+                    r.changed,
+                    r.pruned,
+                    repo.display()
+                );
+            }
+            // Changed rows lost their vectors (trigger); refill a bounded number so hybrid
+            // search keeps covering imported memories without a long blocking job.
+            if r.changed > 0 && store.has_embedder() {
+                match store.embed_missing_up_to(50) {
+                    Ok(0) => {}
+                    Ok(n) => eprintln!("[memdag] embedded {n} imported memories"),
+                    Err(e) => eprintln!("[memdag] embedding after import skipped: {e:#}"),
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!("[memdag] auto-import failed (continuing): {e:#}"),
+    }
 }
 
 #[cfg(test)]

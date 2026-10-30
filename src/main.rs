@@ -52,11 +52,7 @@ fn main() -> anyhow::Result<()> {
 
     match args.command {
         Some(Commands::Mcp { .. }) => unreachable!("handled above"),
-        Some(Commands::Serve) => {
-            auto_refresh(&mut store, repo.as_deref(), &config);
-            let mcp = McpServer::new(store);
-            mcp.run_stdio()?;
-        }
+        Some(Commands::Serve) => serve(store, repo, &config)?,
         Some(Commands::Record {
             kind,
             title,
@@ -345,9 +341,7 @@ fn main() -> anyhow::Result<()> {
             // Default behavior: if stdin is not a terminal (e.g. piped or spawned by MCP client), run MCP server.
             // If it is a terminal, print help.
             if !std::io::stdin().is_terminal() {
-                auto_refresh(&mut store, repo.as_deref(), &config);
-                let mcp = McpServer::new(store);
-                mcp.run_stdio()?;
+                serve(store, repo, &config)?;
             } else {
                 println!(
                     "memdag v{} - Relational DAG & FTS5 memory engine with sqlite-vec",
@@ -365,8 +359,8 @@ fn main() -> anyhow::Result<()> {
 
 fn print_report(r: &ImportReport) {
     println!(
-        "Imported git: {}, adr: {}, notes: {}, gh: {} ({} changed, {} new edges, {} pending)",
-        r.git, r.adr, r.notes, r.gh, r.changed, r.edges, r.pending
+        "Imported git: {}, adr: {}, notes: {}, gh: {} ({} changed, {} removed, {} new edges, {} pending)",
+        r.git, r.adr, r.notes, r.gh, r.changed, r.pruned, r.edges, r.pending
     );
     for w in &r.warnings {
         eprintln!("warning: {w}");
@@ -375,32 +369,24 @@ fn print_report(r: &ImportReport) {
 
 /// Re-import local git sources if HEAD moved since the last import. Never fatal: a broken
 /// import must not stop search or the MCP server, so failures are only logged to stderr.
+/// Run the stdio MCP server. The index is refreshed at startup and, while the server runs,
+/// before read tools whenever HEAD has moved.
+fn serve(mut store: MemoryStore, repo: Option<PathBuf>, config: &RepoConfig) -> anyhow::Result<()> {
+    auto_refresh(&mut store, repo.as_deref(), config);
+    let mut mcp = McpServer::new(store);
+    if let Some(repo) = repo {
+        mcp = mcp.with_auto_refresh(
+            repo,
+            config.notes_dir(),
+            memdag::mcp::DEFAULT_REFRESH_INTERVAL,
+        );
+    }
+    mcp.run_stdio()
+}
+
 fn auto_refresh(store: &mut MemoryStore, repo: Option<&Path>, config: &RepoConfig) {
-    let Some(repo) = repo else { return };
-    match memdag::import::refresh_if_stale(store, repo, &config.notes_dir()) {
-        Ok(Some(r)) => {
-            for w in &r.warnings {
-                eprintln!("[memdag] auto-import warning: {w}");
-            }
-            if r.changed > 0 {
-                eprintln!(
-                    "[memdag] auto-imported {} changed memories from {}",
-                    r.changed,
-                    repo.display()
-                );
-            }
-            // Changed rows lost their vectors (trigger); refill a bounded number so hybrid
-            // search keeps covering imported memories without a long blocking job.
-            if r.changed > 0 && store.has_embedder() {
-                match store.embed_missing_up_to(50) {
-                    Ok(0) => {}
-                    Ok(n) => eprintln!("[memdag] embedded {n} imported memories"),
-                    Err(e) => eprintln!("[memdag] embedding after import skipped: {e:#}"),
-                }
-            }
-        }
-        Ok(None) => {}
-        Err(e) => eprintln!("[memdag] auto-import failed (continuing): {e:#}"),
+    if let Some(repo) = repo {
+        memdag::import::auto_refresh(store, repo, &config.notes_dir());
     }
 }
 

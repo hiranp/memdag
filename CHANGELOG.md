@@ -8,7 +8,8 @@ versions follow [Semantic Versioning](https://semver.org/). Releases are cut wit
 ## [Unreleased]
 
 Planned as 0.4.0 (new features and a schema bump, no breaking CLI/MCP changes). See
-[ADR 0001](docs/adr/0001-evidence-informed-memory-direction.md) for the reasoning.
+[ADR 0001](docs/adr/0001-evidence-informed-memory-direction.md) and
+[ADR 0003](docs/adr/0003-imported-rows-follow-their-sources.md) for the reasoning.
 
 ### Added
 
@@ -33,7 +34,14 @@ Planned as 0.4.0 (new features and a schema bump, no breaking CLI/MCP changes). 
 - **Git-backed memory:** `memdag import` rebuilds the SQLite index from git-tracked text:
   `Decision:` commit trailers, ADRs in `docs/adr/`, memory note files, and (opt-in with `--gh`)
   `<!-- handoff -->` issue comments. Re-running an import never duplicates. The index refreshes
-  when `HEAD` moves: at `serve` startup and on every CLI `search`.
+  when `HEAD` moves: on every CLI `search`, and in a running `serve` before each read tool (at
+  most every 2 s).
+- **Imports prune.** A deleted note or ADR, an amended or rebased-away `Decision:` commit, or a
+  deleted handoff comment is removed from the index on the next import (`N removed` in the
+  report). Files that fail to parse keep their row. Removing a `supersedes:` line, or the
+  superseding note, makes the older memory active again.
+- **Resolutions survive a rebuild.** Under write-through, `resolve_memory` on a note-backed
+  memory writes an append-only `<id>.resolved.md` sidecar that the importer merges back.
 - **Write-through notes.** With `[write_through] dir = "docs/memory"` in `memdag.toml`, durable
   memories (decision, invariant, learning, blocker) are first written as append-only note files
   and indexed from them, so a rebuild reproduces identical rows.
@@ -46,6 +54,13 @@ Planned as 0.4.0 (new features and a schema bump, no breaking CLI/MCP changes). 
 
 ### Changed
 
+- **Schema v3** adds `origin_repo`, so rows are owned per repository: an import never prunes or
+  overwrites rows from another repo sharing the database. The migration also drops orphaned
+  vectors.
+- Switching `MEMDAG_EMBED_CMD` drops vectors computed by the previous command (recorded in
+  `memdag_meta`) instead of silently mixing two vector spaces.
+- Note files are written to a temp file, fsynced and linked into place, so a crash can't leave
+  a truncated note.
 - **Schema v2** adds nullable `paths`, `commit_sha`, `fingerprints` and `source` columns
   (`ALTER TABLE ADD COLUMN`, no table rebuild) and triggers that drop a memory's vector when the
   memory is deleted or its title/body is rewritten (appending a resolution note keeps it). Databases migrate on open; existing note files stay valid and notes without
@@ -93,10 +108,10 @@ Planned as 0.4.0 (new features and a schema bump, no breaking CLI/MCP changes). 
 
 ### Known limitations
 
-Deferred after review; see ADR 0001 for detail. The importer does not prune deleted notes/ADRs
-or rows from rewritten commits; `resolve_memory` is database-only, so a rebuild from git
-reverts a resolved blocker to active; `serve` imports at startup only; the embedder's identity
-is not recorded; note files are not fsynced or renamed atomically.
+See ADR 0001. Staleness spawns git once per cited path per result shown; `gh` import fetches
+every comment in the repository; `search_vector` ignores status and kind filters; a commit body
+containing the byte `0x1f` confuses the git importer; the embedder's identity is its command
+string, so changing the model behind an unchanged command is not detected.
 
 ## [0.3.0] - 2026-09-21
 
