@@ -170,17 +170,27 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memories_vec USING vec0(
 
 ### 4.1.1 Schema v2: provenance
 
-`memories` gained two nullable columns in schema v2 (`PRAGMA user_version = 2`), added with
-`ALTER TABLE ... ADD COLUMN` (no rebuild; v0 and v1 databases step up on open):
+`memories` gained four nullable columns in schema v2 (`PRAGMA user_version = 2`), added with
+`ALTER TABLE ... ADD COLUMN` (no rebuild; v0 and v1 databases step up on open; a fresh database
+creates them directly, and creation is re-checked under the write lock so concurrent first
+opens cannot collide):
 
 | Column | Meaning |
 | --- | --- |
 | `paths` | Newline-joined repo-relative files/dirs the memory is about |
-| `commit_sha` | Git commit (hex) the memory was recorded at; defaults to `HEAD` when `paths` is set |
+| `commit_sha` | Git commit (hex) at record time; informational, and the baseline only when no fingerprints exist |
+| `fingerprints` | Newline-joined content fingerprint per path, aligned with `paths` (`-` = path absent) |
+| `source` | Importer that owns the row (`git`, `adr`, `note`, `gh`); `NULL` = recorded directly |
 
-`MemoryStore::stale_paths` runs `git --literal-pathspecs diff --name-only --no-renames <commit> -- <paths>`
-(working tree included, so uncommitted edits and deletions count). Paths and commit are validated
-on write and again on import, because note files come from the repo. See ADR 0001.
+A fingerprint is `git hash-object` of the file's working-tree content; for a directory, a hash
+over the `(path, blob hash)` pairs of its tracked files (`src/provenance.rs`).
+`MemoryStore::stale_paths` recomputes them and reports cited paths whose fingerprint differs. With
+only an explicit `commit` it falls back to
+`git --literal-pathspecs diff --name-only --no-renames <commit> -- <paths>`. Paths, commits and
+fingerprints are validated on write and again on import, because note files come from the repo.
+`source` gates imports: a run may refresh only rows it owns or adopt a source-less durable row.
+`memories_vec` rows are removed by trigger when a memory is deleted or its title/body is
+rewritten. See ADR 0001.
 
 ### 4.2 Memory Kinds & Lifecycle States
 

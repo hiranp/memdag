@@ -11,6 +11,7 @@
 //! refs: ["#719", "ADR-0003"]
 //! paths: ["src/store.rs"]   (optional: files the note is about)
 //! commit: 1a2b3c4           (optional: HEAD when the note was recorded)
+//! fingerprints: ["<hash>"]  (optional: content hash of each path when recorded)
 //! ---
 //! # Title
 //!
@@ -37,8 +38,10 @@ pub struct Note {
     pub refs: Vec<String>,
     /// Repo-relative files/dirs this note is about; see [`is_valid_repo_path`].
     pub paths: Vec<String>,
-    /// Git commit the note was recorded at (hex), the baseline for staleness checks.
+    /// Git commit the note was recorded at (hex), informational.
     pub commit: Option<String>,
+    /// Content fingerprint per path (aligned with `paths`); the staleness baseline.
+    pub fingerprints: Vec<String>,
 }
 
 impl Note {
@@ -70,6 +73,15 @@ impl Note {
         }
         if let Some(c) = &self.commit {
             provenance.push_str(&format!("commit: {c}\n"));
+        }
+        if !self.fingerprints.is_empty() {
+            let fps = self
+                .fingerprints
+                .iter()
+                .map(|f| render_list_item(f, true))
+                .collect::<Vec<_>>()
+                .join(", ");
+            provenance.push_str(&format!("fingerprints: [{fps}]\n"));
         }
         let mut out = format!(
             "---\nid: {}\nkind: {}\ntags: [{tags}]\nsupersedes: {}\nrefs: [{refs}]\n{provenance}---\n# {}\n",
@@ -111,6 +123,7 @@ pub fn parse_note(text: &str, fallback_id: &str) -> Result<Note> {
     let mut refs = Vec::new();
     let mut paths = Vec::new();
     let mut commit = None;
+    let mut fingerprints = Vec::new();
 
     let mut lines = front.lines().peekable();
     while let Some(line) = lines.next() {
@@ -155,6 +168,7 @@ pub fn parse_note(text: &str, fallback_id: &str) -> Result<Note> {
             "refs" => refs = parse_list(&value),
             "paths" => paths = parse_list(&value),
             "commit" => commit = Some(unquote(&value)).filter(|s| !s.is_empty()),
+            "fingerprints" => fingerprints = parse_list(&value),
             _ => {}
         }
     }
@@ -174,6 +188,7 @@ pub fn parse_note(text: &str, fallback_id: &str) -> Result<Note> {
         refs,
         paths,
         commit,
+        fingerprints,
     })
 }
 
@@ -471,6 +486,7 @@ mod tests {
             refs: vec!["#719".into(), "ADR-0003".into()],
             paths: Vec::new(),
             commit: None,
+            fingerprints: Vec::new(),
         }
     }
 
@@ -491,9 +507,12 @@ mod tests {
         let mut n = sample();
         n.paths = vec!["src/store.rs".into(), "docs/a b.md".into()];
         n.commit = Some("1a2b3c4d".into());
+        n.fingerprints = vec!["a".repeat(40), "-".into()];
         let text = n.render();
+        assert!(text.contains("fingerprints: ["));
         assert!(text.contains("paths: [\"src/store.rs\", \"docs/a b.md\"]"));
-        assert!(text.contains("commit: 1a2b3c4d\n---\n# Use WAL"));
+        assert!(text.contains("commit: 1a2b3c4d\nfingerprints: ["));
+        assert!(text.contains("\"-\"]\n---\n# Use WAL"));
         assert_eq!(parse_note(&text, "x").unwrap(), n);
     }
 

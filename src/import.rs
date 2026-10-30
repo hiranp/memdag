@@ -7,9 +7,10 @@
 
 use crate::models::{MemoryKind, RelationType};
 use crate::notes::{
-    is_valid_commit, is_valid_repo_path, join_paths, join_tags, parse_note, split_front_matter,
-    split_title,
+    is_valid_commit, is_valid_note_id, is_valid_repo_path, join_paths, join_tags, parse_note,
+    split_front_matter, split_title,
 };
+use crate::provenance::is_valid_fingerprint;
 use crate::store::MemoryStore;
 use anyhow::{Context, Result, bail};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -32,7 +33,19 @@ pub struct ImportOptions {
     /// Repo-relative (or absolute) directories.
     pub adr_dir: PathBuf,
     pub notes_dir: PathBuf,
+    /// Remember the imported HEAD so auto-refresh only scans newer commits. Turn off for a
+    /// partial `--since` import, or older decisions would never be picked up later.
+    pub record_head: bool,
 }
+
+/// Cap on an imported item's body. Real decisions are a few KB; anything this large is more
+/// likely pasted logs or an attempt to flood the model's context.
+pub const MAX_IMPORT_BODY_BYTES: usize = 20_000;
+
+/// GitHub `author_association` values trusted to write handoff comments. Anyone else
+/// (CONTRIBUTOR, NONE, ...) can comment on a public issue, so their text never becomes
+/// agent-visible memory.
+pub const TRUSTED_ASSOCIATIONS: &[&str] = &["OWNER", "MEMBER", "COLLABORATOR"];
 
 impl ImportOptions {
     /// All sources, including GitHub.
@@ -45,6 +58,7 @@ impl ImportOptions {
             since: None,
             adr_dir: PathBuf::from(DEFAULT_ADR_DIR),
             notes_dir: PathBuf::from(crate::notes::DEFAULT_NOTES_DIR),
+            record_head: true,
         }
     }
 
@@ -82,6 +96,8 @@ pub struct GhComment {
     pub body: String,
     pub created_at: Option<String>,
     pub author: Option<String>,
+    /// GitHub's `author_association` (OWNER, MEMBER, COLLABORATOR, CONTRIBUTOR, NONE, ...).
+    pub association: Option<String>,
     pub url: Option<String>,
 }
 
@@ -140,6 +156,7 @@ pub fn parse_gh_comments(raw: &str) -> Result<Vec<GhComment>> {
                     .and_then(|u| u.get("login"))
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
+                association: s("author_association"),
                 url: s("html_url"),
             });
         }
@@ -162,6 +179,9 @@ struct Item {
     /// Provenance (notes only): files the item cites, and the commit it was recorded at.
     paths: Vec<String>,
     commit: Option<String>,
+    fingerprints: Vec<String>,
+    /// Which importer produced this row: `git`, `adr`, `note` or `gh`.
+    source: &'static str,
 }
 
 #[derive(Debug, Default)]
@@ -188,6 +208,9 @@ pub(crate) fn git(repo: &Path, args: &[&str]) -> Result<std::process::Output> {
         .arg("-C")
         .arg(repo)
         .args(args)
+        // Read-only background calls must not take the index lock and contend with the
+        // user's own git commands.
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .output()
         .context("`git` not found on PATH")
 }
@@ -279,6 +302,11 @@ fn collect_git(
             .push("git: not a git repository or no commits yet; skipped".into());
         return Ok(());
     };
+    if let Some(s) = since
+        && (s.starts_with('-') || s.contains(char::is_whitespace))
+    {
+        bail!("--since '{s}' is not a valid revision");
+    }
     let range = match since {
         Some(s) => format!("{s}..{head}"),
         None => head.clone(),
@@ -349,6 +377,8 @@ fn collect_git(
             superseded: false,
             paths: Vec::new(),
             commit: None,
+            fingerprints: Vec::new(),
+            source: "git",
         });
         report.git += 1;
     }
@@ -424,6 +454,8 @@ fn parse_adr(num: &str, text: &str, batch: &mut Batch) {
         superseded,
         paths: Vec::new(),
         commit: None,
+        fingerprints: Vec::new(),
+        source: "adr",
     });
 }
 
@@ -476,6 +508,16 @@ fn collect_notes(dir: &Path, batch: &mut Batch, report: &mut ImportReport) {
                 continue;
             }
         };
+        // The file name is the identity. Trusting a front-matter `id:` that differs would let
+        // any note overwrite an unrelated memory by claiming its id.
+        if note.id != *stem || !is_valid_note_id(&note.id) {
+            report.warnings.push(format!(
+                "{}: note id '{}' must equal the file name and be a valid id; skipped",
+                path.display(),
+                note.id
+            ));
+            continue;
+        }
         if let Some(old) = &note.supersedes {
             batch
                 .edges
@@ -492,13 +534,23 @@ fn collect_notes(dir: &Path, batch: &mut Batch, report: &mut ImportReport) {
             tags,
             created_at: None,
             superseded: false,
-            // Note files come from the repo, so re-validate before trusting them.
+            // Note files come from the repo, so re-validate before trusting them. Fingerprints
+            // are aligned with paths, so they survive only if every path does.
+            fingerprints: if note.paths.iter().all(|p| is_valid_repo_path(p))
+                && note.fingerprints.len() == note.paths.len()
+                && note.fingerprints.iter().all(|f| is_valid_fingerprint(f))
+            {
+                note.fingerprints
+            } else {
+                Vec::new()
+            },
             paths: note
                 .paths
                 .into_iter()
                 .filter(|p| is_valid_repo_path(p))
                 .collect(),
             commit: note.commit.filter(|c| is_valid_commit(c)),
+            source: "note",
         });
         report.notes += 1;
     }
@@ -506,7 +558,22 @@ fn collect_notes(dir: &Path, batch: &mut Batch, report: &mut ImportReport) {
 
 fn collect_gh(comments: Vec<GhComment>, batch: &mut Batch, report: &mut ImportReport) {
     for c in comments {
-        if !c.body.contains(HANDOFF_MARKER) {
+        // The marker must open the comment: a reply that quotes a handoff would otherwise
+        // import a duplicate (and quoting is how someone untrusted gets text near the marker).
+        if !c.body.trim_start().starts_with(HANDOFF_MARKER) {
+            continue;
+        }
+        // Fail closed: a comment with no association, or from outside the team, is ignored.
+        let trusted = c
+            .association
+            .as_deref()
+            .is_some_and(|a| TRUSTED_ASSOCIATIONS.contains(&a));
+        if !trusted {
+            report.warnings.push(format!(
+                "gh: ignored handoff comment {} from an untrusted author ({})",
+                c.id,
+                c.association.as_deref().unwrap_or("unknown association")
+            ));
             continue;
         }
         let body = c.body.replace(HANDOFF_MARKER, "").trim().to_string();
@@ -541,6 +608,8 @@ fn collect_gh(comments: Vec<GhComment>, batch: &mut Batch, report: &mut ImportRe
             superseded: false,
             paths: Vec::new(),
             commit: None,
+            fingerprints: Vec::new(),
+            source: "gh",
         });
         report.gh += 1;
     }
@@ -577,7 +646,9 @@ pub fn import_repo(
 
     apply(store, &batch, &mut report)?;
 
-    if let Some(head) = &report.head {
+    if opts.record_head
+        && let Some(head) = &report.head
+    {
         store.connection().execute(
             "INSERT INTO memdag_meta (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -587,22 +658,74 @@ pub fn import_repo(
     Ok(report)
 }
 
+/// Kinds that note files may own; imported notes may adopt a local row only of these kinds.
+fn is_note_kind(kind: &str) -> bool {
+    matches!(kind, "decision" | "invariant" | "learning" | "blocker")
+}
+
 fn apply(store: &mut MemoryStore, batch: &Batch, report: &mut ImportReport) -> Result<()> {
     let tx = store
         .connection_mut()
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .context("Failed to begin import transaction")?;
 
+    // Ids whose import was refused; edges that start from them are dropped too, or a
+    // refused item could still rewrite the graph through its `supersedes:` line.
+    let mut refused: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
     for item in &batch.items {
+        // Imported text reaches the agent's context, so it gets the same guards as a direct
+        // write, plus a size cap.
+        if let Err(e) = crate::store::check_for_secrets(&item.title, &item.body, None) {
+            report
+                .warnings
+                .push(format!("{} not imported: {e}", item.id));
+            refused.insert(&item.id);
+            continue;
+        }
+        if item.body.len() > MAX_IMPORT_BODY_BYTES {
+            report.warnings.push(format!(
+                "{} not imported: body is {} bytes (limit {MAX_IMPORT_BODY_BYTES})",
+                item.id,
+                item.body.len()
+            ));
+            refused.insert(&item.id);
+            continue;
+        }
+
+        // An import may refresh only rows it owns (same source), or adopt a source-less row
+        // that a note file legitimately describes. Anything else is an id collision with a
+        // locally recorded memory or a different source, and must not be overwritten.
+        let existing: Option<(Option<String>, String)> = tx
+            .query_row(
+                "SELECT source, kind FROM memories WHERE id = ?1",
+                params![item.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((src, kind)) = &existing {
+            let owned = src.as_deref() == Some(item.source);
+            let adoptable = src.is_none() && item.source == "note" && is_note_kind(kind);
+            if !owned && !adoptable {
+                report.warnings.push(format!(
+                    "{} not imported: id already used by a {} memory",
+                    item.id,
+                    src.as_deref().unwrap_or("locally recorded")
+                ));
+                refused.insert(&item.id);
+                continue;
+            }
+        }
+
         let status = if item.superseded {
             "superseded"
         } else {
             "active"
         };
-        let changed = tx.execute(
+        report.changed += tx.execute(
             r#"
-            INSERT INTO memories (id, kind, title, body, tags, status, created_at, updated_at, paths, commit_sha)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, COALESCE(datetime(?7), CURRENT_TIMESTAMP), CURRENT_TIMESTAMP, ?9, ?10)
+            INSERT INTO memories (id, kind, title, body, tags, status, created_at, updated_at, paths, commit_sha, fingerprints, source)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, COALESCE(datetime(?7), CURRENT_TIMESTAMP), CURRENT_TIMESTAMP, ?9, ?10, ?11, ?12)
             ON CONFLICT(id) DO UPDATE SET
                 kind = excluded.kind,
                 title = excluded.title,
@@ -610,6 +733,8 @@ fn apply(store: &mut MemoryStore, batch: &Batch, report: &mut ImportReport) -> R
                 tags = excluded.tags,
                 paths = excluded.paths,
                 commit_sha = excluded.commit_sha,
+                fingerprints = excluded.fingerprints,
+                source = excluded.source,
                 status = CASE WHEN ?8 THEN 'superseded' ELSE memories.status END,
                 updated_at = CURRENT_TIMESTAMP
             WHERE memories.kind IS NOT excluded.kind
@@ -618,6 +743,8 @@ fn apply(store: &mut MemoryStore, batch: &Batch, report: &mut ImportReport) -> R
                OR memories.tags IS NOT excluded.tags
                OR memories.paths IS NOT excluded.paths
                OR memories.commit_sha IS NOT excluded.commit_sha
+               OR memories.fingerprints IS NOT excluded.fingerprints
+               OR memories.source IS NOT excluded.source
                OR (?8 AND memories.status IS NOT 'superseded')
             "#,
             params![
@@ -631,18 +758,16 @@ fn apply(store: &mut MemoryStore, batch: &Batch, report: &mut ImportReport) -> R
                 item.superseded,
                 join_paths(&item.paths),
                 item.commit,
+                join_paths(&item.fingerprints),
+                item.source,
             ],
         )?;
-        report.changed += changed;
-        if changed > 0 {
-            // The text may have changed, so any stored vector is stale; `memdag embed`
-            // recomputes missing ones. Harmless when the row is new (nothing to delete).
-            tx.execute("DELETE FROM memories_vec WHERE id = ?1", params![item.id])?;
-        }
+        // A changed title/body drops the stored vector via a trigger; `memdag embed`
+        // (or the auto-refresh) recomputes it.
     }
 
     for (source, target, rel) in &batch.edges {
-        if source != target {
+        if source != target && !refused.contains(source.as_str()) {
             tx.execute(
                 "INSERT OR IGNORE INTO pending_relations (source_id, target_id, relation_type)
                  VALUES (?1, ?2, ?3)",
@@ -668,9 +793,13 @@ fn apply(store: &mut MemoryStore, batch: &Batch, report: &mut ImportReport) -> R
             params![source, target, rel],
         )?;
         if rel == RelationType::Supersedes.as_str() {
+            // An imported file may supersede imported memories and durable note-kind rows,
+            // but not hide a locally recorded task, blocker-in-progress or scratch memory.
             tx.execute(
                 "UPDATE memories SET status = 'superseded', updated_at = CURRENT_TIMESTAMP
-                 WHERE id = ?1 AND status IS NOT 'superseded'",
+                 WHERE id = ?1 AND status IS NOT 'superseded'
+                   AND (source IS NOT NULL
+                        OR kind IN ('decision', 'invariant', 'learning', 'blocker'))",
                 params![target],
             )?;
         }

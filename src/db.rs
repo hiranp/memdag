@@ -14,9 +14,11 @@ pub fn ensure_sqlite_vec_registered() {
     });
 }
 
+// busy_timeout must come first: switching to WAL needs a lock, and without a busy handler a
+// concurrent first open fails immediately with SQLITE_BUSY instead of waiting.
 pub const PRAGMA_SQL: &str = r#"
-PRAGMA journal_mode = WAL;
 PRAGMA busy_timeout = 5000;
+PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 PRAGMA synchronous = NORMAL;
 "#;
@@ -38,7 +40,11 @@ CREATE TABLE IF NOT EXISTS {name} (
     status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'superseded', 'resolved', 'ephemeral')),
     session_id TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    paths TEXT,
+    commit_sha TEXT,
+    fingerprints TEXT,
+    source TEXT
 );
 "#
     )
@@ -65,6 +71,22 @@ CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
     VALUES ('delete', old.rowid, old.id, old.title, old.body, old.tags);
     INSERT INTO memories_fts(rowid, id, title, body, tags) 
     VALUES (new.rowid, new.id, new.title, new.body, new.tags);
+END;
+"#;
+
+/// Keep `memories_vec` honest: a deleted memory must not leave an orphan vector that
+/// occupies a KNN slot, and a new title or rewritten body invalidates its vector (`memdag embed`
+/// recomputes missing ones). Separate from the FTS triggers so v1 databases can add them.
+const VEC_TRIGGERS_SQL: &str = r#"
+CREATE TRIGGER IF NOT EXISTS memories_vec_ad AFTER DELETE ON memories BEGIN
+    DELETE FROM memories_vec WHERE id = old.id;
+END;
+-- Appending to the body (resolve_memory adds a resolution note) keeps the vector: the
+-- memory is still about the same thing. A new title or a rewritten body does not.
+CREATE TRIGGER IF NOT EXISTS memories_vec_au AFTER UPDATE OF title, body ON memories
+WHEN old.title IS NOT new.title
+  OR substr(new.body, 1, length(old.body)) IS NOT old.body BEGIN
+    DELETE FROM memories_vec WHERE id = old.id;
 END;
 "#;
 
@@ -116,17 +138,15 @@ CREATE TABLE IF NOT EXISTS pending_relations (
 );
 "#;
 
-/// Columns added in schema v2: provenance for staleness checks. Nullable, so existing rows
-/// and `INSERT`s that omit them stay valid; no table rebuild needed.
-const V2_DDL_SQL: &str = r#"
-ALTER TABLE memories ADD COLUMN paths TEXT;
-ALTER TABLE memories ADD COLUMN commit_sha TEXT;
-"#;
+/// Columns added in schema v2: provenance for staleness checks and the source of imported
+/// rows. All nullable, so existing rows and `INSERT`s that omit them stay valid; databases
+/// created before v2 get them via `ALTER TABLE ADD COLUMN` (no table rebuild).
+const V2_COLUMNS: &[&str] = &["paths", "commit_sha", "fingerprints", "source"];
 
 /// The full schema for a fresh database.
 pub fn ddl_sql() -> String {
     format!(
-        "{}{REST_DDL_SQL}{MEMORIES_DEPENDENTS_SQL}{V1_DDL_SQL}{V2_DDL_SQL}",
+        "{}{REST_DDL_SQL}{MEMORIES_DEPENDENTS_SQL}{VEC_TRIGGERS_SQL}{V1_DDL_SQL}",
         memories_table_sql("memories")
     )
 }
@@ -156,25 +176,44 @@ fn init_pragmas_and_schema(conn: &Connection) -> Result<()> {
     // batch on every process start creates needless write contention when many short-lived
     // CLI processes (e.g. concurrent subagents) open the same database at once. Skip it once
     // the schema is known to exist.
-    let schema_exists: bool = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memories'",
-            [],
-            |_| Ok(true),
-        )
-        .optional()?
-        .unwrap_or(false);
+    let schema_exists = memories_table_exists(conn)?;
 
     if !schema_exists {
-        conn.execute_batch(&format!(
-            "BEGIN IMMEDIATE;\n{}\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;",
-            ddl_sql()
-        ))
-        .context("Failed to initialize memdag schema")?;
-        return Ok(());
+        // Re-check under the write lock: another process may have created the schema while we
+        // waited for it, in which case we must not run (or fail on) the creation batch.
+        conn.execute_batch("BEGIN IMMEDIATE;")
+            .context("Failed to lock database for schema creation")?;
+        let created = (|| -> Result<bool> {
+            if memories_table_exists(conn)? {
+                return Ok(false);
+            }
+            conn.execute_batch(&ddl_sql())?;
+            conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+            Ok(true)
+        })();
+        match created {
+            Ok(true) => {
+                conn.execute_batch("COMMIT;")
+                    .context("Failed to initialize memdag schema")?;
+                return Ok(());
+            }
+            Ok(false) => {
+                conn.execute_batch("ROLLBACK;").ok();
+            }
+            Err(e) => {
+                conn.execute_batch("ROLLBACK;").ok();
+                return Err(e).context("Failed to initialize memdag schema");
+            }
+        }
     }
 
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version > SCHEMA_VERSION {
+        anyhow::bail!(
+            "Database schema is version {version} but this memdag only understands up to \
+             {SCHEMA_VERSION}; upgrade memdag instead of opening it with an older build"
+        );
+    }
     if version < 1 {
         migrate_to_v1(conn).context("Failed to migrate memdag schema to v1")?;
     }
@@ -184,6 +223,27 @@ fn init_pragmas_and_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn memories_table_exists(conn: &Connection) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memories'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false))
+}
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let found = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|c| c == column);
+    Ok(found)
+}
+
 /// v1 -> v2: add the provenance columns. Re-checks the version under the write lock
 /// because another process may have migrated while we waited.
 fn migrate_to_v2(conn: &Connection) -> Result<()> {
@@ -191,7 +251,19 @@ fn migrate_to_v2(conn: &Connection) -> Result<()> {
     let step = (|| -> Result<()> {
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version < 2 {
-            conn.execute_batch(V2_DDL_SQL)?;
+            // The v1 table rebuild already includes these columns, so add only what's missing.
+            for col in V2_COLUMNS {
+                if !has_column(conn, "memories", col)? {
+                    conn.execute_batch(&format!("ALTER TABLE memories ADD COLUMN {col} TEXT;"))?;
+                }
+            }
+            // The triggers reference memories_vec; real v0/v1 databases have it, but don't
+            // depend on that (same definition as REST_DDL_SQL).
+            conn.execute_batch(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS memories_vec USING vec0(
+                     id TEXT PRIMARY KEY, embedding float[384]);",
+            )?;
+            conn.execute_batch(VEC_TRIGGERS_SQL)?;
             conn.execute_batch("PRAGMA user_version = 2;")?;
         }
         Ok(())

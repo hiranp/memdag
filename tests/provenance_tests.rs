@@ -126,8 +126,9 @@ fn uncommitted_edits_and_deletions_count_as_stale() {
     o.paths = vec!["src".into()]; // a directory cites everything under it
     let mem = store.record_memory(o).unwrap();
 
+    // The cited path is the directory, so a deletion inside it reports the directory.
     std::fs::remove_file(tmp.path().join("src/b.rs")).unwrap();
-    assert_eq!(store.stale_paths(&mem), vec!["src/b.rs"]);
+    assert_eq!(store.stale_paths(&mem), vec!["src"]);
 }
 
 #[test]

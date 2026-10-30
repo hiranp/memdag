@@ -4,6 +4,7 @@ pub mod import;
 pub mod mcp;
 pub mod models;
 pub mod notes;
+pub mod provenance;
 pub mod store;
 
 pub use db::{default_db_path, open_connection, open_in_memory};

@@ -272,6 +272,11 @@ fn main() -> anyhow::Result<()> {
             println!("Embedded {n} memories.");
         }
         Some(Commands::Stale) => {
+            if repo.is_none() {
+                anyhow::bail!(
+                    "Not inside a git repository, so staleness can't be checked (cited paths are repo-relative)"
+                );
+            }
             let stale = store.list_stale()?;
             if stale.is_empty() {
                 println!("No stale memories: no cited path changed since it was recorded.");
@@ -320,12 +325,15 @@ fn main() -> anyhow::Result<()> {
                 })?,
             };
             let config = RepoConfig::load(&root)?;
-            let all = !(git || adr || notes || gh);
+            // Bare `import` means the local, git-tracked sources. GitHub comments need an
+            // explicit --gh: they are a network call and anyone can comment on an issue.
+            let any = git || adr || notes || gh;
             let opts = ImportOptions {
-                git: all || git,
-                adr: all || adr,
-                notes: all || notes,
-                gh: all || gh,
+                git: !any || git,
+                adr: !any || adr,
+                notes: !any || notes,
+                gh,
+                record_head: since.is_none(),
                 since,
                 notes_dir: config.notes_dir(),
                 ..ImportOptions::all()
@@ -380,6 +388,15 @@ fn auto_refresh(store: &mut MemoryStore, repo: Option<&Path>, config: &RepoConfi
                     r.changed,
                     repo.display()
                 );
+            }
+            // Changed rows lost their vectors (trigger); refill a bounded number so hybrid
+            // search keeps covering imported memories without a long blocking job.
+            if r.changed > 0 && store.has_embedder() {
+                match store.embed_missing_up_to(50) {
+                    Ok(0) => {}
+                    Ok(n) => eprintln!("[memdag] embedded {n} imported memories"),
+                    Err(e) => eprintln!("[memdag] embedding after import skipped: {e:#}"),
+                }
             }
         }
         Ok(None) => {}

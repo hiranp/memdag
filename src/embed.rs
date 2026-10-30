@@ -9,8 +9,10 @@
 //! execute a command.
 
 use anyhow::{Context, Result, bail};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 /// Dimension of the `memories_vec` table.
@@ -58,9 +60,62 @@ pub fn parse_embedding(raw: &str) -> Result<Vec<f32>> {
     Ok(vec)
 }
 
+/// After a failure the embedder is skipped for this long, so a dead command costs one
+/// timeout, not one per search/write in a long-lived MCP server.
+const COOLDOWN: Duration = Duration::from_secs(60);
+/// How long to wait for output after the process has exited (a surviving grandchild can
+/// keep the pipe open).
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Per-command failure times; keyed by command so unrelated embedders don't affect each other.
+static FAILED_AT: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
+
+fn in_cooldown(cmd: &str) -> bool {
+    let guard = FAILED_AT.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .as_ref()
+        .and_then(|m| m.get(cmd))
+        .is_some_and(|t| t.elapsed() < COOLDOWN)
+}
+
+fn record_failure(cmd: &str) {
+    let mut guard = FAILED_AT.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .get_or_insert_with(HashMap::new)
+        .insert(cmd.to_string(), Instant::now());
+}
+
 /// Run `cmd` through the platform shell with `text` on stdin. Bounded by a timeout so a
-/// wedged embedder can't hang the MCP server.
+/// wedged embedder can't hang the MCP server, and skipped for a cooldown after a failure.
 pub fn embed(cmd: &str, text: &str) -> Result<Vec<f32>> {
+    if in_cooldown(cmd) {
+        bail!(
+            "{EMBED_CMD_ENV} failed recently; skipping it for {}s",
+            COOLDOWN.as_secs()
+        );
+    }
+    let result = run_with_timeout(cmd, text, TIMEOUT);
+    if result.is_err() {
+        record_failure(cmd);
+    }
+    result
+}
+
+/// Kill the whole process group on unix (the shell's pipeline children would otherwise
+/// survive `kill()` of just `sh`); fall back to killing the child elsewhere.
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-KILL", &format!("-{}", child.id())])
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+}
+
+/// [`embed`] without the failure cooldown and with an explicit timeout.
+pub fn run_with_timeout(cmd: &str, text: &str, timeout: Duration) -> Result<Vec<f32>> {
     let text: String = text.chars().take(MAX_INPUT_CHARS).collect();
 
     #[cfg(windows)]
@@ -71,8 +126,10 @@ pub fn embed(cmd: &str, text: &str) -> Result<Vec<f32>> {
     };
     #[cfg(not(windows))]
     let mut command = {
+        use std::os::unix::process::CommandExt;
         let mut c = Command::new("sh");
         c.args(["-c", cmd]);
+        c.process_group(0); // own group, so kill_tree can reach the whole pipeline
         c
     };
 
@@ -90,26 +147,30 @@ pub fn embed(cmd: &str, text: &str) -> Result<Vec<f32>> {
         let _ = stdin.write_all(text.as_bytes());
     });
     let mut stdout = child.stdout.take().context("embed command has no stdout")?;
-    let reader = std::thread::spawn(move || {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
         let mut buf = String::new();
         let _ = stdout.read_to_string(&mut buf);
-        buf
+        let _ = tx.send(buf);
     });
 
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
+            kill_tree(&mut child);
             let _ = child.wait();
-            bail!("{EMBED_CMD_ENV} timed out after {}s", TIMEOUT.as_secs());
+            bail!("{EMBED_CMD_ENV} timed out after {}s", timeout.as_secs());
         }
         std::thread::sleep(Duration::from_millis(10));
     };
     let _ = writer.join();
-    let out = reader.join().unwrap_or_default();
+    // Bounded wait: a grandchild holding the pipe open must not block us forever.
+    let out = rx
+        .recv_timeout(DRAIN_TIMEOUT)
+        .map_err(|_| anyhow::anyhow!("{EMBED_CMD_ENV} output did not close after exit"))?;
     if !status.success() {
         bail!("{EMBED_CMD_ENV} exited with {status}");
     }

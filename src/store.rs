@@ -8,17 +8,18 @@ use crate::notes::{
     Note, clean_provenance, is_valid_commit, is_valid_note_id, is_valid_repo_path, join_paths,
     join_tags, parse_note, slugify, split_paths, split_tags,
 };
+use crate::provenance;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-/// The 11 memory columns, in the order `row_to_memory` expects.
-const MEMORY_COLS: &str =
-    "id, kind, title, body, tags, status, session_id, created_at, updated_at, paths, commit_sha";
+/// The 13 memory columns, in the order `row_to_memory` expects.
+const MEMORY_COLS: &str = "id, kind, title, body, tags, status, session_id, created_at, updated_at, \
+     paths, commit_sha, fingerprints, source";
 /// Index of the extra score column (BM25 rank / vector distance) selected after the memory
 /// columns.
-const SCORE_COL: usize = 11;
+const SCORE_COL: usize = 13;
 /// Reciprocal Rank Fusion constant (Cormack et al.; also what Hindsight uses).
 const RRF_K: f64 = 60.0;
 /// Default output budget for search results, in estimated tokens.
@@ -78,6 +79,8 @@ struct PreparedLearning {
     tags: Option<String>,
     paths: Vec<String>,
     commit: Option<String>,
+    fingerprints: Vec<String>,
+    source: Option<&'static str>,
 }
 
 pub struct MemoryStore {
@@ -204,7 +207,9 @@ impl MemoryStore {
     /// Record a memory entity with atomic supersession handling.
     pub fn record_memory(&mut self, mut opts: RecordOptions) -> Result<Memory> {
         check_for_secrets(&opts.title, &opts.body, opts.tags.as_deref())?;
-        self.stamp_provenance(&mut opts.paths, &mut opts.commit)?;
+        let mut fingerprints = Vec::new();
+        self.stamp_provenance(&mut opts.paths, &mut opts.commit, &mut fingerprints)?;
+        let mut source: Option<&'static str> = None;
 
         let mut written: Option<PathBuf> = None;
         if let Some(dir) = self
@@ -222,6 +227,7 @@ impl MemoryStore {
                 refs: Vec::new(),
                 paths: opts.paths.clone(),
                 commit: opts.commit.clone(),
+                fingerprints: fingerprints.clone(),
             };
             let (note, path) = self.write_note(&dir, draft)?;
             opts.id = Some(note.id);
@@ -230,11 +236,14 @@ impl MemoryStore {
             opts.tags = join_tags(&note.tags);
             opts.paths = note.paths;
             opts.commit = note.commit;
+            fingerprints = note.fingerprints;
+            // The note file now backs this row, so the importer may refresh it.
+            source = Some("note");
             written = Some(path);
         }
 
         let had_embedding = opts.embedding.is_some();
-        let result = self.insert_memory(opts);
+        let result = self.insert_memory(opts, &fingerprints, source);
         if result.is_err()
             && let Some(path) = written
         {
@@ -249,18 +258,30 @@ impl MemoryStore {
         result
     }
 
-    /// Validate user-supplied provenance and default `commit` to the repo's HEAD when paths
-    /// are cited. Memories without paths are left untouched (no git call).
-    fn stamp_provenance(&self, paths: &mut Vec<String>, commit: &mut Option<String>) -> Result<()> {
+    /// Validate user-supplied provenance, then (for a memory that cites paths and names no
+    /// explicit commit) stamp the repo's HEAD and fingerprint the cited files. An explicit
+    /// `commit` means the caller knows the baseline, so no fingerprints are taken and
+    /// staleness falls back to diffing against that commit. Memories without paths are left
+    /// untouched (no git call).
+    fn stamp_provenance(
+        &self,
+        paths: &mut Vec<String>,
+        commit: &mut Option<String>,
+        fingerprints: &mut Vec<String>,
+    ) -> Result<()> {
         let (clean, explicit) = clean_provenance(paths, commit.as_deref())?;
         *paths = clean;
-        *commit = explicit.or_else(|| {
-            if paths.is_empty() {
-                None
-            } else {
-                self.repo_root.as_deref().and_then(git_head)
-            }
-        });
+        fingerprints.clear();
+        if explicit.is_some() || paths.is_empty() {
+            *commit = explicit;
+            return Ok(());
+        }
+        *commit = self.repo_root.as_deref().and_then(git_head);
+        if let Some(root) = self.repo_root.as_deref()
+            && let Some(fps) = provenance::fingerprints(root, paths)
+        {
+            *fingerprints = fps;
+        }
         Ok(())
     }
 
@@ -292,6 +313,12 @@ impl MemoryStore {
     /// failure (so a dead embedder doesn't burn a timeout per row). Returns how many were
     /// embedded.
     pub fn embed_missing(&mut self) -> Result<usize> {
+        self.embed_missing_up_to(usize::MAX)
+    }
+
+    /// Like [`Self::embed_missing`] but embeds at most `limit` memories, so an automatic
+    /// refresh never turns into a long blocking job.
+    pub fn embed_missing_up_to(&mut self, limit: usize) -> Result<usize> {
         let cmd = self
             .embed_cmd
             .clone()
@@ -302,9 +329,12 @@ impl MemoryStore {
                 "SELECT m.id, m.title, m.body FROM memories m
                  WHERE m.kind != 'ephemeral'
                    AND NOT EXISTS (SELECT 1 FROM memories_vec v WHERE v.id = m.id)
-                 ORDER BY m.created_at",
+                 ORDER BY m.created_at
+                 LIMIT ?1",
             )?
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .query_map(params![limit.min(i64::MAX as usize) as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
             .collect::<Result<_, _>>()?;
         let mut done = 0;
         for (id, title, body) in pending {
@@ -316,7 +346,12 @@ impl MemoryStore {
         Ok(done)
     }
 
-    fn insert_memory(&mut self, opts: RecordOptions) -> Result<Memory> {
+    fn insert_memory(
+        &mut self,
+        opts: RecordOptions,
+        fingerprints: &[String],
+        source: Option<&str>,
+    ) -> Result<Memory> {
         let new_id = opts.id.unwrap_or_else(|| {
             let short_uuid = &uuid::Uuid::new_v4().to_string()[..8];
             format!("{}-{}", opts.kind.prefix(), short_uuid)
@@ -359,8 +394,8 @@ impl MemoryStore {
         // Insert new entity FIRST so foreign keys can reference it
         tx.execute(
             r#"
-            INSERT INTO memories (id, kind, title, body, tags, status, session_id, paths, commit_sha)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            INSERT INTO memories (id, kind, title, body, tags, status, session_id, paths, commit_sha, fingerprints, source)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
             "#,
             params![
                 new_id,
@@ -372,6 +407,8 @@ impl MemoryStore {
                 opts.session_id,
                 join_paths(&opts.paths),
                 opts.commit,
+                join_paths(fingerprints),
+                source,
             ],
         )
         .context("Failed to insert memory record")?;
@@ -601,21 +638,27 @@ impl MemoryStore {
             .collect()
     }
 
-    /// Cited paths that changed (modified, deleted or renamed) since the memory's commit,
-    /// including uncommitted edits. Empty when the memory cites nothing, there is no repo,
-    /// or the commit is unknown (shallow clone, rewritten history): no signal, not a false
-    /// alarm. Values read from note files are re-validated before reaching `git`.
+    /// Cited paths whose content changed since the memory was recorded. Uses the stored
+    /// content fingerprints; for memories that only have a `commit` (hand-written notes, or
+    /// an explicit `--commit`) it falls back to `git diff` against that commit, which
+    /// includes uncommitted edits. Empty when the memory cites nothing, there is no repo,
+    /// or no baseline is comparable: no signal, never a false alarm. Everything read from
+    /// note files is re-validated before it reaches `git`.
     pub fn stale_paths(&self, memory: &Memory) -> Vec<String> {
-        let (Some(root), Some(commit)) = (self.repo_root.as_deref(), memory.commit.as_deref())
-        else {
+        let Some(root) = self.repo_root.as_deref() else {
             return Vec::new();
         };
-        if memory.paths.is_empty()
-            || !is_valid_commit(commit)
-            || !memory.paths.iter().all(|p| is_valid_repo_path(p))
-        {
+        if memory.paths.is_empty() || !memory.paths.iter().all(|p| is_valid_repo_path(p)) {
             return Vec::new();
         }
+        if !memory.fingerprints.is_empty()
+            && let Some(changed) = provenance::changed(root, &memory.paths, &memory.fingerprints)
+        {
+            return changed;
+        }
+        let Some(commit) = memory.commit.as_deref().filter(|c| is_valid_commit(c)) else {
+            return Vec::new();
+        };
         // --literal-pathspecs: a cited path like ":(exclude)x" must be a file name, not magic.
         let mut args = vec![
             "--literal-pathspecs",
@@ -643,7 +686,8 @@ impl MemoryStore {
             .conn
             .prepare(&format!(
                 "SELECT {MEMORY_COLS} FROM memories
-                 WHERE status = 'active' AND paths IS NOT NULL AND commit_sha IS NOT NULL
+                 WHERE status = 'active' AND paths IS NOT NULL
+                   AND (fingerprints IS NOT NULL OR commit_sha IS NOT NULL)
                  ORDER BY updated_at DESC"
             ))?
             .query_map([], row_to_memory)?
@@ -671,7 +715,8 @@ impl MemoryStore {
                 check_for_secrets(&learning.title, &learning.body, learning.tags.as_deref())?;
                 let mut paths = learning.paths.clone();
                 let mut commit = learning.commit.clone();
-                self.stamp_provenance(&mut paths, &mut commit)?;
+                let mut fingerprints = Vec::new();
+                self.stamp_provenance(&mut paths, &mut commit, &mut fingerprints)?;
                 match self
                     .write_through
                     .clone()
@@ -688,6 +733,7 @@ impl MemoryStore {
                             refs: Vec::new(),
                             paths,
                             commit,
+                            fingerprints,
                         };
                         let (note, path) = self.write_note(&dir, draft)?;
                         written.push(path);
@@ -698,6 +744,8 @@ impl MemoryStore {
                             tags: join_tags(&note.tags),
                             paths: note.paths,
                             commit: note.commit,
+                            fingerprints: note.fingerprints,
+                            source: Some("note"),
                         });
                     }
                     None => {
@@ -709,6 +757,8 @@ impl MemoryStore {
                             tags: learning.tags.clone(),
                             paths,
                             commit,
+                            fingerprints,
+                            source: None,
                         });
                     }
                 }
@@ -734,6 +784,8 @@ impl MemoryStore {
                         updated_at: String::new(),
                         paths: Vec::new(),
                         commit: None,
+                        fingerprints: Vec::new(),
+                        source: None,
                     };
                     self.embed_best_effort(&stub);
                 }
@@ -758,8 +810,8 @@ impl MemoryStore {
         for (learning, p) in learnings.iter().zip(prepared) {
             tx.execute(
                 r#"
-                INSERT INTO memories (id, kind, title, body, tags, status, session_id, paths, commit_sha)
-                VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7, ?8)
+                INSERT INTO memories (id, kind, title, body, tags, status, session_id, paths, commit_sha, fingerprints, source)
+                VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7, ?8, ?9, ?10)
                 "#,
                 params![
                     p.id,
@@ -770,6 +822,8 @@ impl MemoryStore {
                     session_id,
                     join_paths(&p.paths),
                     p.commit,
+                    join_paths(&p.fingerprints),
+                    p.source,
                 ],
             )
             .context("Failed to insert consolidated session learning")?;
@@ -898,6 +952,9 @@ impl MemoryStore {
 
     /// Mark a memory as resolved, appending an optional resolution note to the body.
     pub fn resolve_memory(&mut self, id: &str, note: Option<&str>) -> Result<Memory> {
+        if let Some(n) = note {
+            check_for_secrets("", n, None)?;
+        }
         let suffix = note
             .map(|n| format!("\n\n[Resolved]: {n}"))
             .unwrap_or_default();
@@ -1087,33 +1144,124 @@ impl MemoryStore {
     }
 }
 
-/// Case-insensitive substrings that flag likely secrets/credentials before they get written
-/// into a memory. Not exhaustive, catches common API key/token prefixes and PEM blocks.
-/// ponytail: hardcoded denylist; move to a config file if false positives pile up.
-const SECRET_PATTERNS: &[&str] = &[
-    "-----begin ", // PEM private keys/certs
-    "sk-",         // OpenAI-style secret keys
-    "ghp_",
-    "gho_",
-    "github_pat_", // GitHub tokens
-    "xoxb-",
-    "xoxp-", // Slack tokens
+/// Token-shaped secrets: `(prefix, minimum characters after it, label)`. A prefix only counts
+/// at a word boundary, and the token body must be long enough to be a real credential, so
+/// ordinary words like "task-queue", "risk-based" or "disk-backed" don't trip `sk-`.
+const TOKEN_PREFIXES: &[(&str, usize, &str)] = &[
+    ("sk-", 16, "API secret key (sk-)"),
+    ("sk_live_", 16, "Stripe live key"),
+    ("sk_test_", 16, "Stripe test key"),
+    ("ghp_", 30, "GitHub token"),
+    ("gho_", 30, "GitHub token"),
+    ("ghu_", 30, "GitHub token"),
+    ("ghs_", 30, "GitHub token"),
+    ("github_pat_", 30, "GitHub token"),
+    ("glpat-", 16, "GitLab token"),
+    ("xoxb-", 20, "Slack token"),
+    ("xoxp-", 20, "Slack token"),
+    ("xoxa-", 20, "Slack token"),
+    ("npm_", 30, "npm token"),
+    ("AKIA", 16, "AWS access key id"),
+    ("AIza", 35, "Google API key"),
+];
+
+/// Names that, followed by `=` or `:` and a long value, indicate an inline credential.
+const SECRET_NAMES: &[&str] = &[
+    "api_key",
+    "apikey",
+    "api-key",
+    "secret_key",
+    "client_secret",
     "aws_secret_access_key",
-    "akia", // AWS access key id prefix
-    "aiza", // Google API key prefix
-    "api_key=",
-    "apikey=",
-    "api-key:",
+    "password",
+    "passwd",
     "authorization: bearer",
 ];
 
-/// Reject recording a memory whose title/body/tags contain an obvious secret pattern.
-fn check_for_secrets(title: &str, body: &str, tags: Option<&str>) -> Result<()> {
-    let haystack = format!("{title}\n{body}\n{}", tags.unwrap_or("")).to_lowercase();
-    if let Some(pat) = SECRET_PATTERNS.iter().find(|p| haystack.contains(*p)) {
+fn is_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
+}
+
+/// Characters allowed in an inline credential value.
+fn is_value_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "+/_-.=~".contains(c)
+}
+
+fn boundary_before(text: &str, idx: usize) -> bool {
+    text[..idx]
+        .chars()
+        .next_back()
+        .is_none_or(|c| !c.is_ascii_alphanumeric())
+}
+
+/// A description of the first secret-looking thing in `text`, never the secret itself.
+/// Heuristic denylist, not a scanner: it catches accidental paste-ins of common credential
+/// shapes, not deliberately obfuscated ones.
+/// ponytail: hardcoded; move to a config file if false positives pile up.
+fn find_secret(text: &str) -> Option<&'static str> {
+    let lower = text.to_ascii_lowercase(); // ASCII-only, so byte offsets match `text`
+    if lower.contains("-----begin ") {
+        return Some("PEM private key or certificate");
+    }
+
+    for (prefix, min_len, label) in TOKEN_PREFIXES {
+        for (idx, _) in text.match_indices(prefix) {
+            if !boundary_before(text, idx) {
+                continue;
+            }
+            let body = text[idx + prefix.len()..]
+                .chars()
+                .take_while(|c| is_token_char(*c))
+                .count();
+            if body >= *min_len {
+                return Some(label);
+            }
+        }
+    }
+
+    // JWT: eyJ<b64>.<b64>
+    for (idx, _) in text.match_indices("eyJ") {
+        if !boundary_before(text, idx) {
+            continue;
+        }
+        let rest = &text[idx..];
+        let head = rest.chars().take_while(|c| is_token_char(*c)).count();
+        if head >= 10 && rest[head..].starts_with('.') {
+            let tail = rest[head + 1..]
+                .chars()
+                .take_while(|c| is_token_char(*c))
+                .count();
+            if tail >= 10 {
+                return Some("JSON Web Token");
+            }
+        }
+    }
+
+    for name in SECRET_NAMES {
+        for (idx, _) in lower.match_indices(name) {
+            let after = text[idx + name.len()..].trim_start_matches([' ', '\t']);
+            let after = if *name == "authorization: bearer" {
+                after
+            } else {
+                match after.strip_prefix(['=', ':']) {
+                    Some(v) => v.trim_start_matches([' ', '\t', '"', '\'']),
+                    None => continue,
+                }
+            };
+            if after.chars().take_while(|c| is_value_char(*c)).count() >= 12 {
+                return Some("inline credential (key/password assignment)");
+            }
+        }
+    }
+    None
+}
+
+/// Reject recording a memory whose title/body/tags contain an obvious secret.
+pub(crate) fn check_for_secrets(title: &str, body: &str, tags: Option<&str>) -> Result<()> {
+    let haystack = format!("{title}\n{body}\n{}", tags.unwrap_or(""));
+    if let Some(what) = find_secret(&haystack) {
         bail!(
-            "Refusing to record memory: content matches secret pattern '{}'. Redact it before retrying.",
-            pat.trim()
+            "Refusing to record memory: content matches secret pattern '{what}'. Redact it before retrying."
         );
     }
     Ok(())
@@ -1133,6 +1281,8 @@ fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
         updated_at: row.get(8)?,
         paths: split_paths(row.get::<_, Option<String>>(9)?.as_deref()),
         commit: row.get(10)?,
+        fingerprints: split_paths(row.get::<_, Option<String>>(11)?.as_deref()),
+        source: row.get(12)?,
     })
 }
 
@@ -1255,19 +1405,51 @@ pub fn format_search_results_for_llm(results: &[MemorySearchResult]) -> String {
     format_search_results_with_budget(results, None)
 }
 
+/// Collapse a title to one line.
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Escape lines that start with `#` so memory text can't open a fake `### n. [ID]` result
+/// block (or any heading) in the model's context.
+fn neutralize_headings(body: &str) -> String {
+    body.lines()
+        .map(|l| {
+            if l.trim_start().starts_with('#') {
+                format!("\\{l}")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// One result as markdown. `body_chars` truncates the body (used when a single result must
 /// be squeezed into the budget).
 fn render_result(index: usize, res: &MemorySearchResult, body_chars: Option<usize>) -> String {
     let mem = &res.memory;
+    // Imported rows come from files and comments anyone with repo access can write, so say
+    // where they came from and keep their text from forging result blocks.
+    let source = mem
+        .source
+        .as_deref()
+        .map(|s| format!(", source: {s}"))
+        .unwrap_or_default();
     let mut out = format!(
-        "### {}. [{}] {} (kind: {}, status: {}, score: {:.4})\n",
-        index, mem.id, mem.title, mem.kind, mem.status, res.rank
+        "### {}. [{}] {} (kind: {}, status: {}{source}, score: {:.4})\n",
+        index,
+        mem.id,
+        one_line(&mem.title),
+        mem.kind,
+        mem.status,
+        res.rank
     );
     if let Some(tags) = mem.tags.as_deref().filter(|t| !t.trim().is_empty()) {
         out.push_str(&format!("- **Tags**: {tags}\n"));
     }
     out.push_str(&format_provenance(mem, &res.stale_paths));
-    let body = mem.body.trim();
+    let body = &neutralize_headings(mem.body.trim());
     match body_chars {
         Some(limit) if body.chars().count() > limit => {
             let cut: String = body.chars().take(limit).collect();

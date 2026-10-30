@@ -335,12 +335,14 @@ files a memory is about and memdag does the bookkeeping:
 memdag record -k decision -t "Search packs results by token budget" -b "..." --paths src/store.rs
 ```
 
-The memory is stamped with the current git `HEAD` (and, with write-through, the note file gets
-`paths:` and `commit:` front matter so a rebuilt index is identical). On every search and `get`,
-memdag runs `git diff --name-only <commit> -- <paths>`; if a cited file changed (committed or
-not), the result carries a `STALE` warning. `memdag stale` lists every active memory in that
-state. Memories without `paths` cost nothing. An unknown commit (shallow clone, rewritten
-history) yields no signal rather than a false alarm.
+The memory is stamped with the current git `HEAD` and a content fingerprint (git blob hash) of
+each cited path; with write-through, the note file records them as `paths:`, `commit:` and
+`fingerprints:`. On every search and `get`, memdag recomputes the fingerprints; if a cited file's
+content differs from what it was when the memory was recorded, the result carries a `STALE`
+warning. `memdag stale` lists every active memory in that state. Because the baseline is
+content, not the commit, recording a decision about a file you just edited is not stale, and
+rebases, amends and shallow clones don't cause false alarms. Memories without `paths` cost
+nothing.
 
 ### Token-budgeted recall
 

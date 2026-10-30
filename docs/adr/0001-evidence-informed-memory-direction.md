@@ -58,12 +58,20 @@ explicit DAG supersession). Do **not** adopt Hindsight. Close three gaps:
 2. **Recall output is token-budgeted.** `search_memory` takes `max_tokens` (default 2000,
    `0` = unlimited), packs results in rank order, always returns at least one (truncated
    to fit), caps relations per result, and says how many results were omitted.
-3. **Memories carry provenance and can be flagged stale.** New optional `paths` and
-   `commit` fields (schema v2, note front matter, importer, MCP/CLI). A memory recorded
-   with `paths` is stamped with the current git HEAD. At read time memdag runs
-   `git diff --name-only <commit> -- <paths>` and marks the memory STALE when cited paths
-   changed. `memdag stale` lists them. Unknown commits (shallow clone, rewritten history)
-   yield no signal rather than a false alarm.
+3. **Memories carry provenance and can be flagged stale.** New optional `paths`,
+   `commit`, `fingerprints` and `source` fields (schema v2, note front matter, importer,
+   MCP/CLI). A memory recorded with `paths` is stamped with the current git HEAD and a
+   **content fingerprint** of each cited path (git blob hash; for a directory, a hash over
+   its tracked files). At read time memdag recomputes the fingerprints and marks the memory
+   STALE when a cited path's content differs. `memdag stale` lists them. Memories that only
+   have an explicit `commit` fall back to `git diff <commit> -- <paths>`. A baseline that
+   cannot be compared yields no signal rather than a false alarm.
+
+   The first implementation diffed against the recorded commit. Review showed that is wrong
+   for the most common workflow: edit `x.rs`, then record a decision about it. The working
+   tree already differs from HEAD, so the memory is stale from birth and stays stale after
+   the edit is committed. Content fingerprints fix that and also survive rebases, amends,
+   branch switches and shallow clones.
 
 ## Alternatives considered
 
@@ -82,16 +90,46 @@ explicit DAG supersession). Do **not** adopt Hindsight. Close three gaps:
 
 ## Consequences
 
-- Schema bumps to v2 (two nullable columns, `ALTER TABLE ADD COLUMN`; no table rebuild).
-  Existing databases migrate on open; existing note files stay valid.
+- Schema bumps to v2 (four nullable columns: `paths`, `commit_sha`, `fingerprints`, `source`;
+  `ALTER TABLE ADD COLUMN`, no table rebuild). Existing databases migrate on open; existing
+  note files stay valid.
+- `source` records which importer owns a row. An import may refresh only rows it owns (or
+  adopt a source-less durable row that a note file describes), so a note, ADR or comment can
+  no longer overwrite an unrelated local memory by claiming its id.
 - Notes gain optional `paths:` and `commit:` front-matter keys, emitted only when set, so
   existing note output is byte-identical.
 - Provenance is opt-in. Memories without `paths` behave exactly as before and cost no git
   calls.
 - Imported ADR, git-trailer and GitHub-handoff memories carry no paths yet. Extracting a
   `Paths:` trailer from `Decision:` commits is a natural follow-up.
+- **Imported content is untrusted.** Anyone who can open a PR can add a note, and anyone can
+  comment on a public issue. Imports now get the same secret check as direct writes plus a
+  size cap; note ids must equal the file name; `gh` is opt-in and only `OWNER`/`MEMBER`/
+  `COLLABORATOR` comments that *start* with the handoff marker are accepted; search output
+  labels imported rows with their source and escapes heading lines so memory text cannot
+  forge result blocks.
 - Observed-versus-inferred markers and confidence (Hindsight's evidence/belief split) are
   deliberately deferred until provenance proves useful.
+
+## Known limitations (deferred after review)
+
+Found by an independent review of the branch and consciously not fixed yet:
+
+- The importer never prunes: deleting a note or ADR, or rewriting history (which changes
+  `GIT-<sha7>` ids), leaves the old row behind. A fix needs per-source ownership of ids.
+- `resolve_memory` changes the database only. Under write-through the note file is
+  unchanged, so a rebuild from git makes a resolved blocker `active` again. A rebuild
+  reproduces note-backed *content*; status, timestamps and session ids are not recorded in
+  git.
+- `serve` imports at startup only; a long-lived MCP session does not see later commits
+  until it restarts (the CLI refreshes on every `search`).
+- The embedder's identity is not recorded, so switching embedders silently mixes vector
+  spaces; run `DELETE FROM memories_vec` then `memdag embed` after a switch.
+- Note files are written without fsync or temp-file-plus-rename, so a crash can leave a
+  truncated note.
+- Staleness spawns git once per cited path (twice for directories) per result shown, and
+  `gh` import fetches every comment in the repository.
+- `search_vector` ignores status and kind filters (the hybrid path honours them).
 
 ## Validation
 

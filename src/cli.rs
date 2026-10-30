@@ -186,7 +186,7 @@ pub enum Commands {
     },
 
     /// Rebuild/refresh the index from git-tracked sources (idempotent upsert by stable id).
-    /// With no source flags, imports all of them.
+    /// With no source flags, imports the local sources (git, adr, notes); GitHub comments need --gh.
     Import {
         /// Repository root. Defaults to the nearest ancestor of the cwd containing `.git`.
         #[arg(long)]
@@ -204,7 +204,8 @@ pub enum Commands {
         #[arg(long)]
         notes: bool,
 
-        /// GitHub issue comments containing `<!-- handoff -->`, via the `gh` CLI (slow)
+        /// GitHub issue comments starting with `<!-- handoff -->` from OWNER/MEMBER/COLLABORATOR
+        /// authors, via the `gh` CLI (network, slow). Never part of a bare `import`.
         #[arg(long)]
         gh: bool,
 

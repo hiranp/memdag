@@ -12,12 +12,15 @@ Planned as 0.4.0 (new features and a schema bump, no breaking CLI/MCP changes). 
 
 ### Added
 
-- **Provenance and staleness.** Memories can cite repo files (`paths`) and are stamped with the
-  git commit they were recorded at (`commit`, defaulting to `HEAD`). Search, `get` and
-  `get_memory` mark a memory **STALE** when a cited file changed since (committed, uncommitted or
-  deleted); `memdag stale` lists them. Available via `record --paths/--commit`, the
-  `record_memory` and `consolidate_session` MCP tools, note front matter (`paths:`, `commit:`),
-  and the importer. Memories without `paths` cost no git calls.
+- **Provenance and staleness.** Memories can cite repo files (`paths`). They are stamped with
+  `HEAD` and a content fingerprint of each cited file (a git blob hash; for a directory, a hash
+  over its tracked files). Search, `get` and `get_memory` mark a memory **STALE** when a cited
+  file's content differs from what it was when the memory was recorded; `memdag stale` lists
+  them. Content, not the commit, is the baseline, so recording a decision about a file you just
+  edited is not stale, and rebases, amends and shallow clones don't cause false alarms. Available
+  via `record --paths/--commit`, the `record_memory` and `consolidate_session` MCP tools, note
+  front matter (`paths:`, `commit:`, `fingerprints:`), and the importer. Memories without
+  `paths` cost no git calls on write or read.
 - **Token-budgeted recall.** `search_memory` / `memdag search` pack results in rank order into an
   estimated token budget (`max_tokens` / `--max-tokens`, default 2000, `0` = unlimited). The top
   result is always returned (shortened if needed), relations are capped at six per result, and
@@ -28,10 +31,9 @@ Planned as 0.4.0 (new features and a schema bump, no breaking CLI/MCP changes). 
   `memdag embed` backfills existing ones. `search_vector` now accepts plain `query` text.
   No model is bundled and no dependency was added.
 - **Git-backed memory:** `memdag import` rebuilds the SQLite index from git-tracked text:
-  `Decision:` commit trailers, ADRs in `docs/adr/`, memory note files, and (optionally, via
-  `gh`) `<!-- handoff -->` issue comments. The database is a disposable cache; re-running an
-  import never duplicates. The index refreshes automatically on `serve` and `search` when
-  `HEAD` moves.
+  `Decision:` commit trailers, ADRs in `docs/adr/`, memory note files, and (opt-in with `--gh`)
+  `<!-- handoff -->` issue comments. Re-running an import never duplicates. The index refreshes
+  when `HEAD` moves: at `serve` startup and on every CLI `search`.
 - **Write-through notes.** With `[write_through] dir = "docs/memory"` in `memdag.toml`, durable
   memories (decision, invariant, learning, blocker) are first written as append-only note files
   and indexed from them, so a rebuild reproduces identical rows.
@@ -44,8 +46,9 @@ Planned as 0.4.0 (new features and a schema bump, no breaking CLI/MCP changes). 
 
 ### Changed
 
-- **Schema v2** adds nullable `paths` and `commit_sha` columns (`ALTER TABLE ADD COLUMN`, no
-  table rebuild). Databases migrate on open; existing note files stay valid and notes without
+- **Schema v2** adds nullable `paths`, `commit_sha`, `fingerprints` and `source` columns
+  (`ALTER TABLE ADD COLUMN`, no table rebuild) and triggers that drop a memory's vector when the
+  memory is deleted or its title/body is rewritten (appending a resolution note keeps it). Databases migrate on open; existing note files stay valid and notes without
   provenance render byte-for-byte as before.
 - MCP `search_memory` now applies the 2000-token default budget (previously unbounded). Pass
   `max_tokens: 0` for the old behaviour.
@@ -56,17 +59,44 @@ Planned as 0.4.0 (new features and a schema bump, no breaking CLI/MCP changes). 
   release profile strips symbols; see [ADR 0002](docs/adr/0002-build-profile-and-low-load-builds.md)
   for measurements.
 
+- Bare `memdag import` now imports only the local sources (git, ADRs, notes). GitHub comments
+  need an explicit `--gh`. A note file's `id:` must equal its file name.
+- Imports refuse to overwrite a row they don't own: a note, ADR or comment that reuses the id
+  of a locally recorded or differently sourced memory is skipped with a warning.
+- Secret detection is token-shaped instead of substring-based, so `task-queue` and `risk-based`
+  no longer trip `sk-`, and JWTs, GitLab/npm/Slack tokens and `password = ...` assignments are
+  caught. Imports and resolution notes are checked too.
+
 ### Fixed
 
 - `--tags` no longer collides with a short flag in clap.
+- Opening a brand-new database from several processes at once could fail with
+  `duplicate column name` or `SQLITE_BUSY`: schema creation is now re-checked under the write
+  lock and `busy_timeout` is set before switching to WAL.
+- Opening a database written by a newer memdag is refused with a clear error instead of being
+  treated as current.
+- `--since` no longer marks everything up to `HEAD` as imported, and rejects option-like values.
 
 ### Security
 
 - The embed command is read from the environment only, never from `memdag.toml`, so a cloned
   repository cannot make memdag execute a command.
+- Imported content is untrusted: GitHub handoffs are accepted only from OWNER/MEMBER/
+  COLLABORATOR authors and only when the comment starts with the marker; imported text gets the
+  secret check and a 20 KB size cap; search output labels imported rows (`source: note`) and
+  escapes heading lines so memory text cannot forge result blocks.
+- The embed command is killed as a process group on timeout, and skipped for 60 s after a
+  failure so a dead embedder costs one timeout, not one per request.
 - Cited paths and commits are validated (repo-relative, no `..`, no leading `-`, hex commits)
   on write and again on import, and git is invoked with `--literal-pathspecs` and `--`, so a
   hostile note file cannot inject git options or pathspec magic.
+
+### Known limitations
+
+Deferred after review; see ADR 0001 for detail. The importer does not prune deleted notes/ADRs
+or rows from rewritten commits; `resolve_memory` is database-only, so a rebuild from git
+reverts a resolved blocker to active; `serve` imports at startup only; the embedder's identity
+is not recorded; note files are not fsynced or renamed atomically.
 
 ## [0.3.0] - 2026-09-21
 

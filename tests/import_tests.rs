@@ -63,6 +63,7 @@ fn fake_gh() -> FakeGh {
             body: "<!-- handoff -->\n**Handoff** — opencode, 2026-10-30, branch `feat/x`\n- Tried: WAL\n- Next: ship".into(),
             created_at: Some("2026-10-30T10:00:00Z".into()),
             author: Some("hiranp".into()),
+            association: Some("OWNER".into()),
             url: Some("https://github.com/o/r/issues/752#issuecomment-9001".into()),
         },
         GhComment {

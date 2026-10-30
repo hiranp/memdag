@@ -179,9 +179,18 @@ pub struct Memory {
     /// Repo-relative files or directories this memory is about (provenance).
     #[serde(default)]
     pub paths: Vec<String>,
-    /// Git commit the memory was recorded at; staleness is measured against it.
+    /// Git commit the memory was recorded at (informational; also the staleness baseline
+    /// when no fingerprints are stored).
     #[serde(default)]
     pub commit: Option<String>,
+    /// Content fingerprint of each cited path when recorded, aligned with `paths`. The
+    /// staleness baseline; see [`crate::provenance`].
+    #[serde(default)]
+    pub fingerprints: Vec<String>,
+    /// Where an imported row came from (`git`, `adr`, `note`, `gh`); `None` for rows
+    /// recorded directly in the database.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
