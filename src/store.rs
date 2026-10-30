@@ -2,8 +2,10 @@ use crate::models::{
     DatabaseStats, EdgeDirection, ExportData, Memory, MemoryKind, MemoryRelation,
     MemorySearchResult, MemoryStatus, RelatedEntity, RelationType, SessionLearning,
 };
+use crate::notes::{Note, is_valid_note_id, join_tags, parse_note, slugify, split_tags};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 /// The 9 memory columns, in the order `row_to_memory` expects.
@@ -51,21 +53,140 @@ pub struct ConsolidationResult {
 
 pub struct MemoryStore {
     conn: Connection,
+    write_through: Option<PathBuf>,
+}
+
+/// Kinds that are durable enough to become git-tracked note files under write-through.
+pub fn writes_through(kind: MemoryKind) -> bool {
+    matches!(
+        kind,
+        MemoryKind::Decision | MemoryKind::Invariant | MemoryKind::Learning | MemoryKind::Blocker
+    )
 }
 
 impl MemoryStore {
     pub fn new(conn: Connection) -> Self {
-        Self { conn }
+        Self {
+            conn,
+            write_through: None,
+        }
     }
 
     pub fn connection(&self) -> &Connection {
         &self.conn
     }
 
+    /// Enable write-through: durable memories (see [`writes_through`]) are first written to
+    /// `<dir>/<id>.md` (append-only, never rewritten) and then indexed from that file.
+    pub fn set_write_through(&mut self, dir: Option<PathBuf>) {
+        self.write_through = dir;
+    }
+
+    pub fn write_through_dir(&self) -> Option<&Path> {
+        self.write_through.as_deref()
+    }
+
+    fn id_exists(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row("SELECT 1 FROM memories WHERE id = ?1", params![id], |_| {
+                Ok(true)
+            })
+            .optional()?
+            .unwrap_or(false))
+    }
+
+    /// `<PREFIX>-YYYY-MM-DD-<slug>`, suffixed `-2`, `-3`... if taken in the DB or on disk.
+    fn generate_note_id(&self, kind: MemoryKind, title: &str, dir: &Path) -> Result<String> {
+        let date: String = self
+            .conn
+            .query_row("SELECT date('now')", [], |r| r.get(0))?;
+        let base = format!("{}-{date}-{}", kind.prefix(), slugify(title));
+        let mut id = base.clone();
+        let mut n = 1;
+        while self.id_exists(&id)? || dir.join(format!("{id}.md")).exists() {
+            n += 1;
+            id = format!("{base}-{n}");
+        }
+        Ok(id)
+    }
+
+    /// Write the note file for a write-through memory and return what the DB should index:
+    /// the id plus title/body/tags exactly as they parse back from the file, so a later
+    /// rebuild-from-git yields an identical row.
+    ///
+    /// `note.id` may be empty, in which case an id is generated from kind/date/title.
+    fn write_note(&self, dir: &Path, mut note: Note) -> Result<(Note, PathBuf)> {
+        if note.id.is_empty() {
+            note.id = self.generate_note_id(note.kind, &note.title, dir)?;
+        }
+        let id = note.id.clone();
+        if !is_valid_note_id(&id) {
+            bail!(
+                "Memory id '{id}' can't be used as a write-through file name (use letters, digits, '-', '_', '.')"
+            );
+        }
+        if self.id_exists(&id)? {
+            bail!("Memory '{id}' already exists");
+        }
+        if let Some(old) = note.supersedes.as_deref()
+            && !self.id_exists(old)?
+        {
+            bail!("Target supersedes_id '{}' does not exist", old);
+        }
+        let text = note.render();
+        let parsed = parse_note(&text, &id)?;
+
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("Failed to create write-through dir {}", dir.display()))?;
+        let path = dir.join(format!("{id}.md"));
+        // Notes are append-only: never overwrite an existing file.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .with_context(|| format!("Failed to create note {}", path.display()))?;
+        std::io::Write::write_all(&mut file, text.as_bytes())?;
+        Ok((parsed, path))
+    }
+
     /// Record a memory entity with atomic supersession handling.
-    pub fn record_memory(&mut self, opts: RecordOptions) -> Result<Memory> {
+    pub fn record_memory(&mut self, mut opts: RecordOptions) -> Result<Memory> {
         check_for_secrets(&opts.title, &opts.body, opts.tags.as_deref())?;
 
+        let mut written: Option<PathBuf> = None;
+        if let Some(dir) = self
+            .write_through
+            .clone()
+            .filter(|_| writes_through(opts.kind))
+        {
+            let draft = Note {
+                id: opts.id.take().unwrap_or_default(),
+                kind: opts.kind,
+                title: opts.title.clone(),
+                body: opts.body.clone(),
+                tags: opts.tags.as_deref().map(split_tags).unwrap_or_default(),
+                supersedes: opts.supersedes_id.clone(),
+                refs: Vec::new(),
+            };
+            let (note, path) = self.write_note(&dir, draft)?;
+            opts.id = Some(note.id);
+            opts.title = note.title;
+            opts.body = note.body;
+            opts.tags = join_tags(&note.tags);
+            written = Some(path);
+        }
+
+        let result = self.insert_memory(opts);
+        if result.is_err()
+            && let Some(path) = written
+        {
+            std::fs::remove_file(path).ok();
+        }
+        result
+    }
+
+    fn insert_memory(&mut self, opts: RecordOptions) -> Result<Memory> {
         let new_id = opts.id.unwrap_or_else(|| {
             let short_uuid = &uuid::Uuid::new_v4().to_string()[..8];
             format!("{}-{}", opts.kind.prefix(), short_uuid)
@@ -268,18 +389,65 @@ impl MemoryStore {
         learnings: Vec<SessionLearning>,
         purge_ephemeral: bool,
     ) -> Result<ConsolidationResult> {
+        let mut prepared = Vec::with_capacity(learnings.len());
+        let mut written: Vec<PathBuf> = Vec::new();
+        let result = (|| -> Result<ConsolidationResult> {
+            for learning in &learnings {
+                check_for_secrets(&learning.title, &learning.body, learning.tags.as_deref())?;
+                match self
+                    .write_through
+                    .clone()
+                    .filter(|_| writes_through(learning.kind))
+                {
+                    Some(dir) => {
+                        let draft = Note {
+                            id: String::new(),
+                            kind: learning.kind,
+                            title: learning.title.clone(),
+                            body: learning.body.clone(),
+                            tags: learning.tags.as_deref().map(split_tags).unwrap_or_default(),
+                            supersedes: None,
+                            refs: Vec::new(),
+                        };
+                        let (note, path) = self.write_note(&dir, draft)?;
+                        written.push(path);
+                        prepared.push((note.id, note.title, note.body, join_tags(&note.tags)));
+                    }
+                    None => {
+                        let short_uuid = &uuid::Uuid::new_v4().to_string()[..8];
+                        prepared.push((
+                            format!("{}-{}", learning.kind.prefix(), short_uuid),
+                            learning.title.clone(),
+                            learning.body.clone(),
+                            learning.tags.clone(),
+                        ));
+                    }
+                }
+            }
+            self.consolidate_tx(session_id, &learnings, &prepared, purge_ephemeral)
+        })();
+        if result.is_err() {
+            for path in written {
+                std::fs::remove_file(path).ok();
+            }
+        }
+        result
+    }
+
+    fn consolidate_tx(
+        &mut self,
+        session_id: &str,
+        learnings: &[SessionLearning],
+        prepared: &[(String, String, String, Option<String>)],
+        purge_ephemeral: bool,
+    ) -> Result<ConsolidationResult> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("Failed to begin immediate transaction for consolidate_session")?;
 
         let mut recorded_ids = Vec::new();
-        for learning in &learnings {
-            check_for_secrets(&learning.title, &learning.body, learning.tags.as_deref())?;
-
-            let short_uuid = &uuid::Uuid::new_v4().to_string()[..8];
-            let new_id = format!("{}-{}", learning.kind.prefix(), short_uuid);
-
+        for (learning, (new_id, title, body, tags)) in learnings.iter().zip(prepared) {
             tx.execute(
                 r#"
                 INSERT INTO memories (id, kind, title, body, tags, status, session_id)
@@ -288,15 +456,15 @@ impl MemoryStore {
                 params![
                     new_id,
                     learning.kind.as_str(),
-                    learning.title,
-                    learning.body,
-                    learning.tags,
-                    session_id,
+                    title,
+                    body,
+                    tags,
+                    session_id
                 ],
             )
             .context("Failed to insert consolidated session learning")?;
 
-            recorded_ids.push(new_id);
+            recorded_ids.push(new_id.clone());
         }
 
         let mut ephemeral_purged = 0;

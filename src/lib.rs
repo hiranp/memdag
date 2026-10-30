@@ -1,6 +1,7 @@
 pub mod db;
 pub mod mcp;
 pub mod models;
+pub mod notes;
 pub mod store;
 
 pub use db::{default_db_path, open_connection, open_in_memory};
