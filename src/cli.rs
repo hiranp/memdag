@@ -30,9 +30,9 @@ pub enum Commands {
         action: McpAction,
     },
 
-    /// Record a memory (decision, task, invariant, blocker, ephemeral)
+    /// Record a memory (decision, task, invariant, blocker, learning, ephemeral)
     Record {
-        /// Memory kind: decision, task, invariant, blocker, ephemeral
+        /// Memory kind: decision, task, invariant, blocker, learning, ephemeral
         #[arg(short, long)]
         kind: String,
 

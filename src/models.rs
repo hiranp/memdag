@@ -9,6 +9,7 @@ pub enum MemoryKind {
     Task,
     Invariant,
     Blocker,
+    Learning,
     Ephemeral,
 }
 
@@ -19,6 +20,7 @@ impl MemoryKind {
             MemoryKind::Task => "task",
             MemoryKind::Invariant => "invariant",
             MemoryKind::Blocker => "blocker",
+            MemoryKind::Learning => "learning",
             MemoryKind::Ephemeral => "ephemeral",
         }
     }
@@ -29,6 +31,7 @@ impl MemoryKind {
             MemoryKind::Task => "TSK",
             MemoryKind::Invariant => "INV",
             MemoryKind::Blocker => "BLK",
+            MemoryKind::Learning => "LRN",
             MemoryKind::Ephemeral => "EPH",
         }
     }
@@ -49,9 +52,10 @@ impl FromStr for MemoryKind {
             "task" => Ok(MemoryKind::Task),
             "invariant" => Ok(MemoryKind::Invariant),
             "blocker" => Ok(MemoryKind::Blocker),
+            "learning" => Ok(MemoryKind::Learning),
             "ephemeral" => Ok(MemoryKind::Ephemeral),
             other => Err(format!(
-                "Invalid memory kind: {}. Must be one of: decision, task, invariant, blocker, ephemeral",
+                "Invalid memory kind: {}. Must be one of: decision, task, invariant, blocker, learning, ephemeral",
                 other
             )),
         }

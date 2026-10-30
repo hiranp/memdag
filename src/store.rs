@@ -540,7 +540,9 @@ impl MemoryStore {
     pub fn export_all(&self) -> Result<ExportData> {
         let memories = self
             .conn
-            .prepare(&format!("SELECT {MEMORY_COLS} FROM memories ORDER BY created_at"))?
+            .prepare(&format!(
+                "SELECT {MEMORY_COLS} FROM memories ORDER BY created_at"
+            ))?
             .query_map([], row_to_memory)?
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -562,7 +564,10 @@ impl MemoryStore {
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(ExportData { memories, relations })
+        Ok(ExportData {
+            memories,
+            relations,
+        })
     }
 
     pub fn stats(&self) -> Result<DatabaseStats> {
