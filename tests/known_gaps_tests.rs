@@ -6,7 +6,7 @@ use memdag::db::{open_connection, open_in_memory};
 use memdag::import::{CommentSource, GhComment, ImportOptions, import_repo, refresh_if_stale};
 use memdag::models::{MemoryKind, MemoryStatus};
 use memdag::notes::{is_valid_note_id, write_new_file_atomic};
-use memdag::store::{MemoryStore, RecordOptions};
+use memdag::store::{MemoryStore, RecordOptions, SearchOptions};
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -437,6 +437,118 @@ fn switching_embedders_drops_vectors_from_the_old_one() {
     other.set_embed_command(Some(one_hot(1)));
     assert_eq!(other.embed_missing().unwrap(), 1);
     assert_eq!(vectors(&other), 1);
+}
+
+/// Opens `path` with the given embedder, returns how many vectors `memdag embed` had to
+/// (re)compute, and the store.
+#[cfg(unix)]
+fn reopen_with_embedder(path: &Path, cmd: String, model: Option<&str>) -> (MemoryStore, usize) {
+    let mut s = MemoryStore::new(open_connection(path).unwrap());
+    s.set_embed_command(Some(cmd));
+    s.set_embed_model(model.map(str::to_string));
+    let recomputed = s.embed_missing().unwrap();
+    (s, recomputed)
+}
+
+#[cfg(unix)]
+fn seed_one_vector(path: &Path, cmd: String, model: Option<&str>) {
+    let mut s = MemoryStore::new(open_connection(path).unwrap());
+    s.set_embed_command(Some(cmd));
+    s.set_embed_model(model.map(str::to_string));
+    s.record_memory(opts(MemoryKind::Decision, "d", "b"))
+        .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn changing_embed_model_with_the_same_command_drops_vectors() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("m.db");
+    seed_one_vector(&path, one_hot(0), Some("model-a"));
+    assert_eq!(
+        reopen_with_embedder(&path, one_hot(0), Some("model-a")).1,
+        0
+    );
+    assert_eq!(
+        reopen_with_embedder(&path, one_hot(0), Some("model-b")).1,
+        1
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn same_embed_model_with_a_different_command_keeps_vectors() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("m.db");
+    seed_one_vector(&path, one_hot(0), Some("model-a"));
+    assert_eq!(
+        reopen_with_embedder(&path, one_hot(1), Some("model-a")).1,
+        0
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unset_embed_model_keeps_the_command_as_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("m.db");
+    // A database written before MEMDAG_EMBED_MODEL existed records the raw command.
+    seed_one_vector(&path, one_hot(0), None);
+    assert_eq!(reopen_with_embedder(&path, one_hot(0), None).1, 0);
+    // Naming the model, or dropping the name again, cannot prove the old space matches.
+    assert_eq!(
+        reopen_with_embedder(&path, one_hot(0), Some("model-a")).1,
+        1
+    );
+    assert_eq!(reopen_with_embedder(&path, one_hot(0), None).1, 1);
+}
+
+// ------------------------------------------------ vector search filters
+
+#[test]
+fn search_vector_honours_status_and_kind_filters() {
+    let mut store = MemoryStore::new(open_in_memory().unwrap());
+    let unit = |nudge: f32| {
+        let mut v = vec![0.0f32; 384];
+        v[0] = 1.0;
+        v[1] = nudge;
+        v
+    };
+    let mut record = |id: &str, kind: MemoryKind, nudge: f32| {
+        let mut o = opts(kind, id, "body");
+        o.id = Some(id.into());
+        o.embedding = Some(unit(nudge));
+        store.record_memory(o).unwrap();
+    };
+    // The excluded rows are the nearest, so a k = limit KNN would return nothing useful.
+    record("DEC-resolved", MemoryKind::Decision, 0.0);
+    record("LRN-other-kind", MemoryKind::Learning, 0.0);
+    record("DEC-active", MemoryKind::Decision, 0.01);
+    store.resolve_memory("DEC-resolved", None).unwrap();
+
+    let ids = |kind: Option<MemoryKind>, include_resolved: bool, limit: usize| -> Vec<String> {
+        store
+            .search_vector(
+                &unit(0.0),
+                &SearchOptions {
+                    query: String::new(),
+                    kind,
+                    include_resolved,
+                    limit,
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .map(|r| r.memory.id)
+            .collect()
+    };
+
+    assert_eq!(ids(None, false, 10), ["LRN-other-kind", "DEC-active"]);
+    assert_eq!(ids(Some(MemoryKind::Decision), false, 1), ["DEC-active"]);
+    let mut all = ids(None, true, 10);
+    all.sort();
+    assert_eq!(all, ["DEC-active", "DEC-resolved", "LRN-other-kind"]);
+    assert_eq!(ids(Some(MemoryKind::Decision), true, 10).len(), 2);
 }
 
 // -------------------------------------------------------- atomic note files

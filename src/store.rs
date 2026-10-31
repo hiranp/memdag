@@ -142,11 +142,13 @@ pub struct MemoryStore {
     write_through: Option<PathBuf>,
     repo_root: Option<PathBuf>,
     embed_cmd: Option<String>,
+    /// Model name behind `embed_cmd` (`MEMDAG_EMBED_MODEL`); see [`MemoryStore::embedder_identity`].
+    embed_model: Option<String>,
     /// Whether `embed_cmd` has been compared with the embedder recorded in the database.
     embedder_checked: Cell<bool>,
 }
 
-/// `memdag_meta` key holding the embed command that produced the stored vectors.
+/// `memdag_meta` key holding the identity of the embedder that produced the stored vectors.
 const EMBEDDER_META_KEY: &str = "embedder";
 
 /// Kinds that are durable enough to become git-tracked note files under write-through.
@@ -164,6 +166,7 @@ impl MemoryStore {
             write_through: None,
             repo_root: None,
             embed_cmd: None,
+            embed_model: None,
             embedder_checked: Cell::new(false),
         }
     }
@@ -179,14 +182,36 @@ impl MemoryStore {
         self.embedder_checked.set(false);
     }
 
-    /// The embed command, after making sure the stored vectors came from it. Vectors from
-    /// different embedders live in different spaces, so mixing them makes KNN meaningless.
-    /// On a mismatch every stored vector is dropped (`memdag embed` recomputes them). The
-    /// command string is the identity: change it only when the model changes.
+    /// Name of the model behind the embed command (`MEMDAG_EMBED_MODEL`). When set, it
+    /// replaces the command string as the embedder identity.
+    pub fn set_embed_model(&mut self, model: Option<String>) {
+        self.embed_model = model
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty());
+        self.embedder_checked.set(false);
+    }
+
+    /// Value recorded under [`EMBEDDER_META_KEY`]. With a model name it is `model:<name>`, so
+    /// the command can change freely (a new path, flags) without discarding vectors. Without
+    /// one it is the raw command string, as before model names existed, so existing
+    /// databases keep their vectors. The prefix keeps the two forms apart: turning the model
+    /// name on or off for the same command counts as a change and drops the vectors, because
+    /// nothing proves the old vectors came from the newly named model.
+    fn embedder_identity(&self, cmd: &str) -> String {
+        match &self.embed_model {
+            Some(model) => format!("model:{model}"),
+            None => cmd.to_string(),
+        }
+    }
+
+    /// The embed command, after making sure the stored vectors came from the same embedder
+    /// (see [`Self::embedder_identity`]). Vectors from different embedders live in different
+    /// spaces, so mixing them makes KNN meaningless. On a mismatch every stored vector is
+    /// dropped (`memdag embed` recomputes them).
     fn embedder(&self) -> Option<&str> {
         let cmd = self.embed_cmd.as_deref()?;
         if !self.embedder_checked.get() {
-            if let Err(e) = self.check_embedder_identity(cmd) {
+            if let Err(e) = self.check_embedder_identity(&self.embedder_identity(cmd)) {
                 eprintln!("[memdag] could not check embedder identity: {e:#}");
             }
             self.embedder_checked.set(true);
@@ -194,7 +219,7 @@ impl MemoryStore {
         Some(cmd)
     }
 
-    fn check_embedder_identity(&self, cmd: &str) -> Result<()> {
+    fn check_embedder_identity(&self, identity: &str) -> Result<()> {
         let recorded: Option<String> = self
             .conn
             .query_row(
@@ -203,16 +228,17 @@ impl MemoryStore {
                 |r| r.get(0),
             )
             .optional()?;
-        if recorded.as_deref() == Some(cmd) {
+        if recorded.as_deref() == Some(identity) {
             return Ok(());
         }
         if recorded.is_some() {
             let dropped = self.conn.execute("DELETE FROM memories_vec", [])?;
             if dropped > 0 {
                 eprintln!(
-                    "[memdag] {} changed since the stored vectors were computed; dropped {dropped} \
-                     vectors (run `memdag embed` to recompute them)",
-                    embed::EMBED_CMD_ENV
+                    "[memdag] the embedder ({} / {}) changed since the stored vectors were \
+                     computed; dropped {dropped} vectors (run `memdag embed` to recompute them)",
+                    embed::EMBED_CMD_ENV,
+                    embed::EMBED_MODEL_ENV
                 );
             }
         }
@@ -220,7 +246,7 @@ impl MemoryStore {
         self.conn.execute(
             "INSERT INTO memdag_meta (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![EMBEDDER_META_KEY, cmd],
+            params![EMBEDDER_META_KEY, identity],
         )?;
         Ok(())
     }
@@ -1418,31 +1444,19 @@ impl MemoryStore {
         Ok(Some(path))
     }
 
-    /// Search memories by dense vector embedding using sqlite-vec KNN.
+    /// Search memories by dense vector embedding using sqlite-vec KNN, honouring the
+    /// `kind`, `include_resolved` and `limit` filters of `opts` (`opts.query` is unused).
     /// The `rank` field of each result carries the vector distance (lower is closer).
     pub fn search_vector(
         &self,
         embedding: &[f32],
-        limit: usize,
+        opts: &SearchOptions,
     ) -> Result<Vec<MemorySearchResult>> {
-        let mut stmt = self.conn.prepare(&format!(
-            r#"
-            SELECT m.{MEMORY_COLS_M}, v.distance
-            FROM memories_vec v
-            JOIN memories m ON v.id = m.id
-            WHERE v.embedding MATCH ?1 AND v.k = ?2
-            ORDER BY v.distance ASC
-            "#,
-            MEMORY_COLS_M = MEMORY_COLS.replace(", ", ", m.")
-        ))?;
-
-        let hits = stmt
-            .query_map(
-                params![embedding_to_json(embedding), limit.clamp(1, 100) as i64],
-                |row| Ok((row_to_memory(row)?, row.get::<_, f64>(SCORE_COL)?)),
-            )?
-            .collect::<Result<Vec<_>, _>>()?;
-
+        let limit = opts.limit.clamp(1, 100);
+        // sqlite-vec filters after picking the k nearest; over-fetch so filtered-out rows
+        // don't leave the result short.
+        let mut hits = self.vector_hits(embedding, opts, (limit * 4).min(400))?;
+        hits.truncate(limit);
         self.finish_results(hits)
     }
 

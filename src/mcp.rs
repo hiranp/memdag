@@ -651,7 +651,23 @@ impl McpServer {
                     );
                 }
 
-                let results = store.search_vector(&embedding, limit)?;
+                let kind = args
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .and_then(|k| MemoryKind::from_str(k).ok());
+                let include_resolved = args
+                    .get("include_resolved")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let results = store.search_vector(
+                    &embedding,
+                    &SearchOptions {
+                        query: String::new(),
+                        kind,
+                        include_resolved,
+                        limit,
+                    },
+                )?;
                 Ok(format_search_results_for_llm(&results))
             }
             "get_work" => {
@@ -950,6 +966,15 @@ impl McpServer {
                             "type": "array",
                             "items": { "type": "number" },
                             "description": "Alternative to 'query': a precomputed 384-float vector."
+                        },
+                        "kind": {
+                            "type": "string",
+                            "enum": ["decision", "task", "invariant", "blocker", "learning", "ephemeral"],
+                            "description": "Optional filter by memory kind."
+                        },
+                        "include_resolved": {
+                            "type": "boolean",
+                            "description": "Whether to include resolved or superseded memories (default: false)."
                         },
                         "limit": {
                             "type": "integer",

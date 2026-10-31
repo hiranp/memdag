@@ -114,6 +114,7 @@ fn main() -> anyhow::Result<()> {
     store.set_repo_root(repo.clone());
     // Environment only: a cloned repo's memdag.toml must not be able to run a command.
     store.set_embed_command(memdag::embed::command_from_env());
+    store.set_embed_model(memdag::embed::model_from_env());
 
     match args.command {
         Some(Commands::Mcp { .. })
