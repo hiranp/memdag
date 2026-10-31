@@ -28,6 +28,52 @@ const NEEDS_KEYWORDS: &str = "keywords IS NULL AND kind != 'ephemeral' AND statu
 /// guesses about how someone might search, so a match there counts half as much as one in
 /// the memory's own text.
 const BM25_WEIGHTS: &str = "1.0, 1.0, 1.0, 1.0, 0.5";
+/// The kinds a consolidate worker compares: claims that should not be duplicated or
+/// contradict each other.
+const DURABLE_KINDS: &str = "kind IN ('decision', 'invariant', 'learning')";
+/// Durable memories scanned for consolidation candidates per batch (newest first).
+pub const CONSOLIDATE_SCAN: usize = 300;
+/// Matches considered per memory when looking for consolidation candidates.
+pub const CONSOLIDATE_HITS: usize = 2;
+/// Title words too common to suggest two memories are about the same thing.
+const CONSOLIDATE_STOPWORDS: &[&str] = &[
+    "the", "and", "for", "with", "not", "are", "was", "use", "uses", "using", "from", "that",
+    "this", "into", "when", "all", "any", "can", "has", "have", "our", "its", "but", "per", "via",
+    "always", "never", "should", "must", "instead",
+];
+
+/// Whether a memory takes part in consolidation: active and of a durable kind.
+fn is_consolidatable(m: &Memory) -> bool {
+    m.status == MemoryStatus::Active
+        && matches!(
+            m.kind,
+            MemoryKind::Decision | MemoryKind::Invariant | MemoryKind::Learning
+        )
+}
+
+/// An FTS5 query matching any significant word of `title` (3+ characters, not a stopword).
+fn title_or_query(title: &str) -> String {
+    let mut words: Vec<String> = Vec::new();
+    for word in title.split_whitespace() {
+        let clean: String = word
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+            .collect::<String>()
+            .to_lowercase();
+        if clean.chars().count() >= 3
+            && clean.chars().any(char::is_alphanumeric)
+            && !CONSOLIDATE_STOPWORDS.contains(&clean.as_str())
+            && !words.contains(&clean)
+        {
+            words.push(clean);
+        }
+    }
+    words
+        .iter()
+        .map(|w| format!("\"{w}\""))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
 /// Reciprocal Rank Fusion constant (Cormack et al.; also what Hindsight uses).
 const RRF_K: f64 = 60.0;
 /// Default output budget for search results, in estimated tokens.
@@ -1129,6 +1175,102 @@ impl MemoryStore {
             .optional()?
             .flatten()
             .filter(|k| !k.is_empty()))
+    }
+
+    /// Pairs of active durable memories that look like duplicates or contradictions of each
+    /// other and haven't been reviewed yet, each ordered (smaller id, larger id), plus how many
+    /// such pairs the scan found. Bounded: one FTS query for each of the newest
+    /// [`CONSOLIDATE_SCAN`] durable memories.
+    pub fn consolidation_candidates(&self, limit: usize) -> Result<(Vec<(Memory, Memory)>, usize)> {
+        let mems = self
+            .conn
+            .prepare(&format!(
+                "SELECT {MEMORY_COLS} FROM memories WHERE status = 'active' AND {DURABLE_KINDS}
+                 ORDER BY updated_at DESC, rowid DESC LIMIT ?1"
+            ))?
+            .query_map(params![CONSOLIDATE_SCAN as i64], row_to_memory)?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut seen = std::collections::HashSet::new();
+        let mut pairs = Vec::new();
+        for m in &mems {
+            for hit in self.consolidation_hits(m)? {
+                let (a, b) = if m.id < hit.id {
+                    (m.clone(), hit)
+                } else {
+                    (hit, m.clone())
+                };
+                if seen.insert((a.id.clone(), b.id.clone())) {
+                    pairs.push((a, b));
+                }
+            }
+        }
+        let total = pairs.len();
+        pairs.truncate(limit);
+        Ok((pairs, total))
+    }
+
+    /// The best (at most [`CONSOLIDATE_HITS`]) unreviewed active durable memories matching any
+    /// word of `memory`'s title, best first. Empty for a memory that isn't active and durable.
+    pub fn consolidation_hits(&self, memory: &Memory) -> Result<Vec<Memory>> {
+        if !is_consolidatable(memory) {
+            return Ok(Vec::new());
+        }
+        let query = title_or_query(&memory.title);
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let hits = self
+            .conn
+            .prepare(&format!(
+                "SELECT m.{MEMORY_COLS_M} FROM memories_fts f JOIN memories m ON f.rowid = m.rowid
+                 WHERE memories_fts MATCH ?1 AND m.id != ?2
+                   AND m.status = 'active' AND m.{DURABLE_KINDS}
+                   AND NOT EXISTS (SELECT 1 FROM reviewed_pairs r
+                       WHERE (r.a = ?2 AND r.b = m.id) OR (r.a = m.id AND r.b = ?2))
+                 ORDER BY bm25(memories_fts, {BM25_WEIGHTS}) LIMIT ?3",
+                MEMORY_COLS_M = MEMORY_COLS.replace(", ", ", m.")
+            ))?
+            .query_map(
+                params![query, memory.id, CONSOLIDATE_HITS as i64],
+                row_to_memory,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(hits)
+    }
+
+    /// Whether `a` and `b` are a current consolidation candidate: both active and durable,
+    /// not reviewed, and one is among the other's best matches.
+    pub fn is_consolidation_candidate(&self, a: &Memory, b: &Memory) -> Result<bool> {
+        if a.id == b.id || !is_consolidatable(a) || !is_consolidatable(b) {
+            return Ok(false);
+        }
+        Ok(self.consolidation_hits(a)?.iter().any(|m| m.id == b.id)
+            || self.consolidation_hits(b)?.iter().any(|m| m.id == a.id))
+    }
+
+    /// The verdict recorded for a pair of memories, in either order.
+    pub fn pair_review(&self, a: &str, b: &str) -> Result<Option<String>> {
+        let (a, b) = if a < b { (a, b) } else { (b, a) };
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT verdict FROM reviewed_pairs WHERE a = ?1 AND b = ?2",
+                params![a, b],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Record that a pair has been judged, so it isn't offered for consolidation again.
+    pub fn mark_pair_reviewed(&mut self, a: &str, b: &str, verdict: &str) -> Result<()> {
+        let (a, b) = if a < b { (a, b) } else { (b, a) };
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO reviewed_pairs (a, b, verdict) VALUES (?1, ?2, ?3)",
+                params![a, b, verdict],
+            )
+            .context("Failed to record the reviewed pair")?;
+        Ok(())
     }
 
     /// Someone checked a STALE memory against the current code and it still holds: take the

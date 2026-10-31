@@ -8,8 +8,10 @@
 //! - `expand`: search keywords for memories (synonyms, related terms) so keyword search finds
 //!   them with words they don't contain. The no-embedder alternative to vector search.
 //! - `verify`: check STALE memories against the code they cite; confirm, correct or skip.
+//! - `consolidate`: judge pairs of similar durable memories: duplicate (resolve one),
+//!   conflict (becomes a task for a person), related (link them) or distinct.
 
-use crate::models::{Memory, MemoryKind, MemoryStatus};
+use crate::models::{Memory, MemoryKind, MemoryStatus, RelationType};
 use crate::store::{MemoryStore, RecordOptions};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -29,15 +31,17 @@ const MAX_KEYWORD_CHARS: usize = 40;
 pub enum WorkTask {
     Expand,
     Verify,
+    Consolidate,
 }
 
 impl WorkTask {
-    pub const ALL: [WorkTask; 2] = [WorkTask::Expand, WorkTask::Verify];
+    pub const ALL: [WorkTask; 3] = [WorkTask::Expand, WorkTask::Verify, WorkTask::Consolidate];
 
     pub fn as_str(self) -> &'static str {
         match self {
             WorkTask::Expand => "expand",
             WorkTask::Verify => "verify",
+            WorkTask::Consolidate => "consolidate",
         }
     }
 
@@ -47,6 +51,7 @@ impl WorkTask {
         match self {
             WorkTask::Expand => EXPAND_INSTRUCTIONS,
             WorkTask::Verify => VERIFY_INSTRUCTIONS,
+            WorkTask::Consolidate => CONSOLIDATE_INSTRUCTIONS,
         }
     }
 }
@@ -63,8 +68,9 @@ impl FromStr for WorkTask {
         match s.trim().to_ascii_lowercase().as_str() {
             "expand" | "keywords" | "enrich" => Ok(WorkTask::Expand),
             "verify" | "verify_stale" | "stale" => Ok(WorkTask::Verify),
+            "consolidate" | "consolidate_memories" | "dedupe" => Ok(WorkTask::Consolidate),
             other => Err(format!(
-                "unknown work task '{other}' (expected: expand, verify)"
+                "unknown work task '{other}' (expected: expand, verify, consolidate)"
             )),
         }
     }
@@ -99,6 +105,21 @@ For EACH item:
 Rules: do not edit any files. Do not include secrets or credentials. Answer with ONLY this JSON, no prose and no code fences:
 {"task":"verify","results":[{"id":"<item id>","verdict":"valid|outdated|unsure","reason":"...","correction":{"title":"optional","body":"required when outdated"}}]}"#;
 
+const CONSOLIDATE_INSTRUCTIONS: &str = r#"You tidy a software project's memory index. Each item below is a pair of entries ("a" and "b": decisions, invariants or learnings) that use similar words. Decide what the pair is.
+
+For EACH pair, give one "verdict":
+- "duplicate": both say the same thing. Then give "keep": the id of the entry to keep (the clearer, more complete one). The other is closed as a duplicate.
+- "conflict": they contradict each other and the text does not make clear which one is current. A person will reconcile them.
+- "related": different claims about the same topic, worth linking.
+- "distinct": unrelated, or only superficially similar.
+And "reason": one sentence saying why.
+
+Rules:
+- When unsure, prefer "distinct" or "related". Only say "duplicate" when one entry adds nothing the other lacks, and "conflict" when both cannot be true at once.
+- Judge only from the text given. Never invent facts. No secrets or credentials.
+- Answer with ONLY this JSON, no prose and no code fences:
+{"task":"consolidate","results":[{"pair":["<a id>","<b id>"],"verdict":"duplicate|conflict|related|distinct","keep":"<id, duplicates only>","reason":"..."}]}"#;
+
 fn truncate(text: &str, max: usize) -> String {
     let mut out: String = text.chars().take(max).collect();
     if text.chars().count() > max {
@@ -117,6 +138,12 @@ fn base_item(m: &Memory) -> serde_json::Map<String, Value> {
         o.insert("tags".into(), json!(t));
     }
     o
+}
+
+fn pair_member(m: &Memory) -> Value {
+    let mut o = base_item(m);
+    o.insert("status".into(), json!(m.status.as_str()));
+    Value::Object(o)
 }
 
 /// The next batch for `task`: `{task, instructions, items, remaining, submit}`. `remaining`
@@ -145,6 +172,20 @@ pub fn next_batch(store: &MemoryStore, task: WorkTask, limit: usize) -> Result<V
                         o.insert("recorded_at_commit".into(), json!(c));
                     }
                     Value::Object(o)
+                })
+                .collect();
+            (items, total)
+        }
+        WorkTask::Consolidate => {
+            let (pairs, total) = store.consolidation_candidates(limit)?;
+            let items = pairs
+                .iter()
+                .map(|(a, b)| {
+                    json!({
+                        "pair": [a.id, b.id],
+                        "a": pair_member(a),
+                        "b": pair_member(b),
+                    })
                 })
                 .collect();
             (items, total)
@@ -217,7 +258,7 @@ pub fn reply_task(reply: &Value, explicit: Option<WorkTask>) -> Result<WorkTask>
             bail!("the reply is for task '{n}' but '{e}' was requested")
         }
         (Some(t), _) | (None, Some(t)) => Ok(t),
-        (None, None) => bail!("the reply names no task; pass one (expand or verify)"),
+        (None, None) => bail!("the reply names no task; pass one (expand, verify or consolidate)"),
     }
 }
 
@@ -235,19 +276,29 @@ pub fn submit(store: &mut MemoryStore, task: WorkTask, reply: &Value) -> Result<
     let mut report = SubmitReport::default();
     let mut seen = std::collections::HashSet::new();
     for r in results {
-        let Some(id) = r.get("id").and_then(Value::as_str) else {
+        // Expand and verify results are keyed by "id"; consolidate results by "pair", shown
+        // as "a + b" with the smaller id first.
+        let key = match task {
+            WorkTask::Consolidate => result_pair(r).map(|(a, b)| format!("{a} + {b}")),
+            _ => r.get("id").and_then(Value::as_str).map(str::to_string),
+        };
+        let Some(id) = key else {
             report.skipped += 1;
-            report.lines.push("result without an id".into());
+            report.lines.push(match task {
+                WorkTask::Consolidate => "result without a pair of two different ids".into(),
+                _ => "result without an id".into(),
+            });
             continue;
         };
-        if !seen.insert(id) {
+        if !seen.insert(id.clone()) {
             report.skipped += 1;
             report.lines.push(format!("{id}: duplicate answer ignored"));
             continue;
         }
         let outcome = match task {
-            WorkTask::Expand => apply_keywords(store, id, r),
-            WorkTask::Verify => apply_verdict(store, id, r),
+            WorkTask::Expand => apply_keywords(store, &id, r),
+            WorkTask::Verify => apply_verdict(store, &id, r),
+            WorkTask::Consolidate => apply_pair(store, r),
         };
         match outcome {
             Ok(Outcome::Applied(line)) => {
@@ -385,6 +436,111 @@ fn apply_verdict(store: &mut MemoryStore, id: &str, r: &Value) -> Result<Outcome
     }
 }
 
+/// The two ids of a consolidate result, smaller first, or None unless "pair" holds two
+/// different ids.
+fn result_pair(r: &Value) -> Option<(String, String)> {
+    let pair = r.get("pair")?.as_array()?;
+    let [a, b] = pair.as_slice() else {
+        return None;
+    };
+    let (a, b) = (a.as_str()?.trim(), b.as_str()?.trim());
+    if a.is_empty() || b.is_empty() || a == b {
+        return None;
+    }
+    Some(if a < b {
+        (a.to_string(), b.to_string())
+    } else {
+        (b.to_string(), a.to_string())
+    })
+}
+
+fn apply_pair(store: &mut MemoryStore, r: &Value) -> Result<Outcome> {
+    let (a_id, b_id) = result_pair(r).context("missing 'pair'")?;
+    let verdict = r
+        .get("verdict")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .context("missing 'verdict'")?;
+    if !["duplicate", "conflict", "related", "distinct"].contains(&verdict) {
+        bail!("unknown verdict '{}'", truncate(verdict, 30));
+    }
+    let reason = r.get("reason").and_then(Value::as_str).unwrap_or("").trim();
+    // Only a pair a consolidate batch could contain right now may change anything: an
+    // invented, already judged or late answer (one of them resolved since) does nothing.
+    if let Some(v) = store.pair_review(&a_id, &b_id)? {
+        bail!("already reviewed ({v})");
+    }
+    let fetch = |id: &str| -> Result<Memory> {
+        Ok(store
+            .get_memory(id)?
+            .with_context(|| format!("memory '{id}' not found"))?
+            .0)
+    };
+    let (a, b) = (fetch(&a_id)?, fetch(&b_id)?);
+    if !store.is_consolidation_candidate(&a, &b)? {
+        bail!(
+            "not a consolidation candidate (both must be active decisions, invariants or learnings with similar titles)"
+        );
+    }
+    let line = match verdict {
+        "duplicate" => {
+            let keep = r
+                .get("keep")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .context("verdict 'duplicate' needs 'keep'")?;
+            let drop = if keep == a.id {
+                &b.id
+            } else if keep == b.id {
+                &a.id
+            } else {
+                bail!("'keep' must be one of the pair");
+            };
+            let note = if reason.is_empty() {
+                format!("Duplicate of {keep} (found by a worker model)")
+            } else {
+                format!("Duplicate of {keep} (found by a worker model: {reason})")
+            };
+            store.resolve_memory(drop, Some(&note))?;
+            store.link_entities(drop, keep, RelationType::References)?;
+            format!("duplicate; resolved {drop} as duplicate of {keep}")
+        }
+        "conflict" => {
+            let mut body = format!(
+                "A worker model found that these memories contradict each other:\n\n\
+                 - {}: {}\n- {}: {}\n",
+                a.id, a.title, b.id, b.title
+            );
+            if !reason.is_empty() {
+                body.push_str(&format!("\nWorker's reason: {reason}\n"));
+            }
+            body.push_str("\nDecide which one is current, then supersede or resolve the other.");
+            let task = store.record_memory(RecordOptions {
+                id: None,
+                kind: MemoryKind::Task,
+                title: format!("Reconcile conflicting memories {} and {}", a.id, b.id),
+                body,
+                tags: Some("worker-conflict".into()),
+                supersedes_id: None,
+                session_id: None,
+                embedding: None,
+                paths: Vec::new(),
+                commit: None,
+            })?;
+            store.link_entities(&task.id, &a.id, RelationType::References)?;
+            store.link_entities(&task.id, &b.id, RelationType::References)?;
+            format!("conflict; recorded task {}", task.id)
+        }
+        "related" => {
+            store.link_entities(&a.id, &b.id, RelationType::References)?;
+            format!("related; linked {} to {}", a.id, b.id)
+        }
+        _ => "distinct; nothing to do".to_string(),
+    };
+    store.mark_pair_reviewed(&a.id, &b.id, verdict)?;
+    Ok(Outcome::Applied(line))
+}
+
 /// An MCP prompt / slash command that drives one task end to end from the host agent.
 pub struct HostPrompt {
     pub name: &'static str,
@@ -402,6 +558,11 @@ pub const HOST_PROMPTS: &[HostPrompt] = &[
         name: "verify_stale",
         task: WorkTask::Verify,
         description: "Have a cheap model (Haiku/Flash) check STALE memories against the code they cite, then confirm or correct them.",
+    },
+    HostPrompt {
+        name: "consolidate_memories",
+        task: WorkTask::Consolidate,
+        description: "Have a cheap model (Haiku/Flash) find duplicate or conflicting memories: duplicates are resolved, conflicts become tasks, related ones are linked.",
     },
 ];
 
@@ -422,6 +583,11 @@ pub fn host_prompt_text(task: WorkTask, rounds: usize) -> String {
             "check memories marked STALE against the files they cite",
             "\n   Before submitting, review every \"outdated\" verdict. If its correction changes what a decision means, open the cited file and confirm it, or change the verdict to \"unsure\". The worker needs read access to the repository.",
             " Corrections it submits become new memories that supersede the old ones (the old text stays in history); list any it reports so the user can check them.",
+        ),
+        WorkTask::Consolidate => (
+            "find duplicate or conflicting memories",
+            "\n   Before submitting, review every \"duplicate\" verdict: if the two entries differ in substance, change it to \"related\".",
+            " Conflicts it reports become tasks (\"Reconcile conflicting memories ...\"); mention each one so the user can decide which memory is current.",
         ),
     };
     format!(
