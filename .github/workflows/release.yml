@@ -96,6 +96,9 @@ jobs:
           sudo apt-get install -y -q musl-tools
           target_env="${{ matrix.target }}"
           echo "CC_${target_env//-/_}=musl-gcc" >> "$GITHUB_ENV"
+          # sqlite-vec.c uses the BSD types u_int8_t/u_int16_t/u_int64_t without including
+          # <sys/types.h>; glibc's headers pull it in indirectly, musl's don't.
+          echo "CFLAGS_${target_env//-/_}=-include sys/types.h" >> "$GITHUB_ENV"
 
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
