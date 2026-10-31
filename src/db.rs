@@ -24,7 +24,7 @@ PRAGMA synchronous = NORMAL;
 "#;
 
 /// Bump when the schema changes; `init_pragmas_and_schema` migrates older databases up to it.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// `CREATE TABLE` for the core memories table, parameterised on its name so the v1
 /// migration can build a replacement table before swapping it in.
@@ -118,6 +118,21 @@ WHEN old.title IS NOT new.title
 END;
 "#;
 
+/// v5: which checkouts (worktrees) contain the source of an imported or note-backed row. A
+/// row stays while any worktree still has its note, ADR or commit; an import only drops its
+/// own worktree's claim. v3 recorded the importing checkout in `origin_repo`, so that becomes
+/// the first owner.
+const V5_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS memory_owners (
+    id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    worktree TEXT NOT NULL,
+    PRIMARY KEY (id, worktree)
+);
+CREATE INDEX IF NOT EXISTS idx_memory_owners_worktree ON memory_owners(worktree);
+INSERT OR IGNORE INTO memory_owners (id, worktree)
+    SELECT id, origin_repo FROM memories WHERE source IS NOT NULL AND origin_repo IS NOT NULL;
+"#;
+
 /// The FTS index. `keywords` holds search terms an LLM worker generated for the memory
 /// (see `work.rs`); it lives in the same index so one query can match body and keywords.
 const FTS_TABLE_SQL: &str = r#"
@@ -190,7 +205,7 @@ DELETE FROM memories_vec WHERE id NOT IN (SELECT id FROM memories);
 /// The full schema for a fresh database.
 pub fn ddl_sql() -> String {
     format!(
-        "{}{}{MEMORIES_DEPENDENTS_SQL}{VEC_TRIGGERS_SQL}{V1_DDL_SQL}{V3_SQL}",
+        "{}{}{MEMORIES_DEPENDENTS_SQL}{VEC_TRIGGERS_SQL}{V1_DDL_SQL}{V3_SQL}{V5_SQL}",
         memories_table_sql("memories"),
         REST_DDL_SQL.replace("{FTS_TABLE_SQL}", FTS_TABLE_SQL)
     )
@@ -270,6 +285,9 @@ fn init_pragmas_and_schema(conn: &Connection) -> Result<()> {
     }
     if version < 4 {
         migrate_to_v4(conn).context("Failed to migrate memdag schema to v4")?;
+    }
+    if version < 5 {
+        migrate_simple(conn, 5, V5_SQL).context("Failed to migrate memdag schema to v5")?;
     }
     Ok(())
 }
@@ -354,6 +372,109 @@ fn migrate_to_v3(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// A migration that is one idempotent SQL batch, run under the write lock with the version
+/// re-checked (another process may have migrated while we waited).
+fn migrate_simple(conn: &Connection, to: i64, sql: &str) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let step = (|| -> Result<()> {
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < to {
+            conn.execute_batch(sql)?;
+            conn.execute_batch(&format!("PRAGMA user_version = {to};"))?;
+        }
+        Ok(())
+    })();
+    match step {
+        Ok(()) => conn.execute_batch("COMMIT;")?,
+        Err(e) => {
+            conn.execute_batch("ROLLBACK;").ok();
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// Columns copied when merging an old per-worktree database (see [`merge_legacy_db`]).
+const MERGE_COLS: &str = "id, kind, title, body, tags, status, session_id, created_at, updated_at, \
+     paths, commit_sha, fingerprints, source, origin_repo, keywords";
+
+/// Merge an old per-worktree database into the repository's shared one: the memories that
+/// were recorded directly (tasks, blockers, local decisions; `source IS NULL`) and the
+/// relations between memories that exist in the shared database afterwards. Imported rows
+/// are not copied; they are rebuilt from git. The old file is renamed `*.merged`, so this
+/// happens once. Returns how many memories were added.
+///
+/// The old file is claimed by renaming it first, so two processes starting at the same time
+/// can't both merge it.
+pub fn merge_legacy_db(shared: &Connection, legacy: &Path) -> Result<usize> {
+    // Bring the old database to the current schema and flush its WAL into the main file, so
+    // renaming the file alone moves everything.
+    {
+        let old = open_connection(legacy)?;
+        old.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    }
+    let name = legacy
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let claimed = legacy.with_file_name(format!("{name}.merging-{}", std::process::id()));
+    std::fs::rename(legacy, &claimed)
+        .with_context(|| format!("claiming {} for merging", legacy.display()))?;
+    for suffix in ["-wal", "-shm"] {
+        std::fs::remove_file(legacy.with_file_name(format!("{name}{suffix}"))).ok();
+    }
+
+    let merged = (|| -> Result<usize> {
+        shared.execute("ATTACH DATABASE ?1 AS legacy", [claimed.to_string_lossy()])?;
+        let copy = (|| -> Result<usize> {
+            shared.execute_batch("BEGIN IMMEDIATE;")?;
+            let step = (|| -> Result<usize> {
+                let n = shared.execute(
+                    &format!(
+                        "INSERT OR IGNORE INTO main.memories ({MERGE_COLS})
+                         SELECT {MERGE_COLS} FROM legacy.memories WHERE source IS NULL"
+                    ),
+                    [],
+                )?;
+                shared.execute(
+                    "INSERT OR IGNORE INTO main.memory_relations
+                         (source_id, target_id, relation_type, created_at)
+                     SELECT r.source_id, r.target_id, r.relation_type, r.created_at
+                     FROM legacy.memory_relations r
+                     WHERE EXISTS (SELECT 1 FROM main.memories m WHERE m.id = r.source_id)
+                       AND EXISTS (SELECT 1 FROM main.memories m WHERE m.id = r.target_id)",
+                    [],
+                )?;
+                Ok(n)
+            })();
+            match step {
+                Ok(n) => {
+                    shared.execute_batch("COMMIT;")?;
+                    Ok(n)
+                }
+                Err(e) => {
+                    shared.execute_batch("ROLLBACK;").ok();
+                    Err(e)
+                }
+            }
+        })();
+        shared.execute_batch("DETACH DATABASE legacy;").ok();
+        copy
+    })();
+
+    match &merged {
+        Ok(_) => {
+            std::fs::rename(&claimed, legacy.with_file_name(format!("{name}.merged"))).ok();
+        }
+        // Put it back so the next start retries.
+        Err(_) => {
+            std::fs::rename(&claimed, legacy).ok();
+        }
+    }
+    merged
+}
+
 /// v3 -> v4: add `memories.keywords` and rebuild the FTS index with a `keywords` column (an
 /// FTS5 table can't gain a column in place). The index is derived data, so dropping and
 /// rebuilding it loses nothing.
@@ -429,8 +550,8 @@ pub fn default_db_path() -> PathBuf {
     if let Ok(path) = std::env::var("MEMDAG_DB") {
         return PathBuf::from(path);
     }
-    if let Some(root) = find_project_root(&std::env::current_dir().unwrap_or_default()) {
-        return root.join(".memdag").join("memdag.db");
+    if let Some(path) = project_db_path(&std::env::current_dir().unwrap_or_default()) {
+        return path;
     }
     if let Some(proj_dirs) = directories::ProjectDirs::from("com", "memdag", "memdag") {
         let data_dir = proj_dirs.data_dir();
@@ -438,6 +559,27 @@ pub fn default_db_path() -> PathBuf {
         return data_dir.join("memdag.db");
     }
     PathBuf::from("memdag.db")
+}
+
+/// The project database for `start`: the shared database of the repository it is in (one for
+/// all of its worktrees, see [`crate::checkout::shared_db_path`]), or `<dir>/.memdag/memdag.db`
+/// for the nearest directory that has a `.memdag/` of its own.
+pub fn project_db_path(start: &Path) -> Option<PathBuf> {
+    let root = find_project_root(start)?;
+    if root.join(".git").exists()
+        && let Some(shared) = crate::checkout::shared_db_path(&root)
+    {
+        return Some(shared);
+    }
+    Some(root.join(".memdag").join("memdag.db"))
+}
+
+/// A database that a linked worktree used before worktrees shared one (memdag ≤ 0.3 kept a
+/// database per checkout), if it still needs merging into `shared`.
+pub fn legacy_worktree_db(start: &Path, shared: &Path) -> Option<PathBuf> {
+    let root = find_project_root(start)?;
+    let old = root.join(".memdag").join("memdag.db");
+    (crate::checkout::is_linked_worktree(&root) && old.is_file() && old != shared).then_some(old)
 }
 
 // ponytail: walk up for a repo root (existing .memdag/ wins over .git so nested

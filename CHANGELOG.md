@@ -36,6 +36,15 @@ Planned as 0.4.0 (new features and a schema bump, no breaking CLI/MCP changes). 
   `<!-- handoff -->` issue comments. Re-running an import never duplicates. The index refreshes
   when `HEAD` moves: on every CLI `search`, and in a running `serve` before each read tool (at
   most every 2 s).
+- **Worktrees share one database.** All worktrees of a repository use
+  `<main checkout>/.memdag/memdag.db`, so agents in different worktrees see the same tasks,
+  blockers and links. Imported rows record which worktrees contain their source (schema v5,
+  `memory_owners`). An import only drops its own worktree's claim, a row goes once no worktree
+  has it, and claims of removed worktrees are cleaned up. A memory found only on another
+  worktree's branch is labelled `only in another worktree` and isn't STALE-checked against
+  this checkout. Before, worktrees each had their own database, and with a shared `MEMDAG_DB`
+  a branch's note edits were refused and its deletions ignored. An old per-worktree database
+  is merged into the shared one on first use and kept as `memdag.db.merged`.
 - **Cheap-model workers.** memdag hands out bulk upkeep as batches with instructions, for the
   calling agent to run on a Haiku/Flash-class subagent. memdag still never calls a model. New
   MCP tools `get_work`/`submit_work`, MCP prompts `expand_keywords`/`verify_stale`, and CLI

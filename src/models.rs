@@ -212,6 +212,10 @@ pub struct MemorySearchResult {
     /// Cited paths that changed since the memory's commit (empty = fresh or unknown).
     #[serde(default)]
     pub stale_paths: Vec<String>,
+    /// The memory's source exists only in another worktree of the repository (e.g. a note
+    /// on a branch that isn't checked out here).
+    #[serde(default)]
+    pub other_checkout: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

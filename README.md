@@ -286,15 +286,46 @@ there's no importer, so treat it as read-only output.
 `default_db_path()` resolves, in order:
 
 1. `$MEMDAG_DB`, if set.
-2. `<repo>/.memdag/memdag.db`, where `<repo>` is the nearest ancestor directory (walking up from
-   the current working directory) containing a `.memdag/` or `.git`. This keeps each project's
-   memories, tasks, and `list_ready` queue isolated from every other project on the machine.
+2. The project's database, found by walking up from the current directory:
+   - In a git repository, one database for the whole repository:
+     `<main checkout>/.memdag/memdag.db`, or `<repo>.git/memdag/memdag.db` for a bare
+     repository. Every worktree uses the same one (see below).
+   - A directory with its own `.memdag/` (for example a nested crate) uses
+     `<dir>/.memdag/memdag.db`.
+
+   Projects stay isolated from each other: each has its own memories, tasks and `list_ready`
+   queue.
 3. The OS-standard application data directory (e.g. `~/.local/share/memdag/memdag.db` on Linux),
    if no project root is found.
 
 `.memdag/` is gitignored by default — the database itself isn't meant to be committed. If you
 want a project's memory to travel with the repo (code review, cross-machine sync), commit the
 output of `memdag export` instead of the SQLite file.
+
+### Several agents, several worktrees
+
+All worktrees of a repository share one database, so agents working in different worktrees
+(`git worktree add`) see the same tasks, blockers and links, and `list_ready` covers all of
+them.
+
+What comes from git-tracked files (notes, ADRs, `Decision:` commits) differs per branch.
+memdag records which worktrees' checkouts contain each imported memory:
+
+- An import only drops its own worktree's claim on a memory. The memory goes once no worktree
+  has its source any more, so a branch that deletes a note doesn't remove it for the others.
+- A memory whose note exists only on another worktree's branch is still found, but labelled
+  `only in another worktree` (its branch may never be merged). It isn't checked for staleness
+  against this checkout's files, and `verify` workers don't get it.
+- When a worktree is removed (`git worktree remove`), its claims go with it on the next
+  import.
+- A note edited differently on two branches is stored once, so the version from the most
+  recent import is the one shown. Notes are append-only, so this only happens with hand
+  edits.
+
+Before 0.4, memdag kept a separate database in each linked worktree. The first time a worktree
+opens the shared database, memdag merges the memories recorded there (tasks, blockers, links)
+into it and renames the old file to `memdag.db.merged`. Imported rows are rebuilt from git. Set
+`MEMDAG_DB` to opt out of all of this and use one explicit file.
 
 Existing databases from before this project-scoping change (anywhere under the old global data
 directory) are **not** auto-migrated — copy the file into `<repo>/.memdag/memdag.db` manually if

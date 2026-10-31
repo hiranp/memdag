@@ -1,3 +1,4 @@
+pub mod checkout;
 pub mod db;
 pub mod embed;
 pub mod harness;

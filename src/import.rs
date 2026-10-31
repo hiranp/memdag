@@ -246,14 +246,39 @@ fn is_ancestor(repo: &Path, ancestor: &str, head: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Canonical path of `repo`: the key for per-repo import state and `memories.origin_repo`.
-pub fn repo_key(repo: &Path) -> String {
-    let path = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
-    path.display().to_string()
+/// The last imported HEAD is per checkout: every worktree has its own HEAD.
+fn head_meta_key(repo: &Path) -> String {
+    format!("last_import_head:{}", crate::checkout::worktree_key(repo))
 }
 
-fn head_meta_key(repo: &Path) -> String {
-    format!("last_import_head:{}", repo_key(repo))
+/// Who an import is for: the repository (shared by its worktrees) and this checkout.
+struct Checkout {
+    /// `memories.origin_repo`: rows of other repositories sharing the database are never
+    /// touched.
+    repo: String,
+    /// `memory_owners.worktree` for rows this checkout's files produce.
+    worktree: String,
+    /// Every checkout of the repository git still knows about. Also accepted as an
+    /// `origin_repo`, which held a checkout path before schema v5.
+    worktrees: Vec<String>,
+    /// Whether `worktrees` came from git's metadata (so claims of checkouts not in it can be
+    /// dropped as removed worktrees).
+    known: bool,
+}
+
+impl Checkout {
+    fn of(repo: &Path) -> Self {
+        Self {
+            repo: crate::checkout::repository_key(repo),
+            worktree: crate::checkout::worktree_key(repo),
+            worktrees: crate::checkout::worktree_keys(repo),
+            known: crate::checkout::common_dir(repo).is_some(),
+        }
+    }
+
+    fn is_same_repo(&self, origin: Option<&str>) -> bool {
+        origin.is_none_or(|o| o == self.repo || self.worktrees.iter().any(|w| w == o))
+    }
 }
 
 /// A ref that names another memory (ADR-0003, DEC-..., GIT-abc1234) rather than an issue
@@ -740,7 +765,7 @@ pub fn import_repo(
         }
     }
 
-    apply(store, &batch, &mut report, &repo_key(repo))?;
+    apply(store, &batch, &mut report, &Checkout::of(repo))?;
 
     if opts.record_head
         && let Some(head) = &report.head
@@ -763,8 +788,9 @@ fn apply(
     store: &mut MemoryStore,
     batch: &Batch,
     report: &mut ImportReport,
-    repo: &str,
+    checkout: &Checkout,
 ) -> Result<()> {
+    let repo = checkout.repo.as_str();
     let tx = store
         .connection_mut()
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -808,7 +834,7 @@ fn apply(
             .optional()?;
         if let Some((src, kind, origin)) = &existing {
             let same_source = src.as_deref() == Some(item.source);
-            let same_repo = origin.as_deref().is_none_or(|o| o == repo);
+            let same_repo = checkout.is_same_repo(origin.as_deref());
             let adoptable = src.is_none() && item.source == "note" && is_note_kind(kind);
             if !(same_source && same_repo) && !adoptable {
                 let owner = match (src.as_deref(), same_source) {
@@ -884,6 +910,11 @@ fn apply(
                 repo,
                 item.resolved,
             ],
+        )?;
+        // This checkout's files contain the item's source.
+        tx.execute(
+            "INSERT OR IGNORE INTO memory_owners (id, worktree) VALUES (?1, ?2)",
+            params![item.id, checkout.worktree],
         )?;
         applied.push(item);
         // A changed title/body drops the stored vector via a trigger; `memdag embed`
@@ -970,8 +1001,10 @@ fn apply(
         )?;
     }
 
-    // Prune: a fully scanned source owns its rows in this repo, so a row it no longer
-    // produced (deleted note/ADR, amended or rebased-away commit, deleted comment) goes.
+    // Prune: a fully scanned source tells us which of its rows this checkout no longer has
+    // (deleted note/ADR, amended or rebased-away commit, deleted comment). Only this
+    // checkout's claim goes; the row itself goes once no worktree of the repository has it,
+    // so one worktree never removes what exists on another's branch.
     for &source in &batch.prune {
         let mut keep: HashSet<&str> = batch
             .items
@@ -982,25 +1015,64 @@ fn apply(
         if let Some(k) = batch.keep.get(source) {
             keep.extend(k.iter().map(String::as_str));
         }
-        let owned: Vec<String> = tx
-            .prepare("SELECT id FROM memories WHERE source = ?1 AND origin_repo = ?2")?
-            .query_map(params![source, repo], |r| r.get(0))?
+        let claimed: Vec<String> = tx
+            .prepare(
+                "SELECT m.id FROM memories m JOIN memory_owners o ON o.id = m.id
+                 WHERE m.source = ?1 AND o.worktree = ?2",
+            )?
+            .query_map(params![source, checkout.worktree], |r| r.get(0))?
             .collect::<Result<_, _>>()?;
-        for id in owned.iter().filter(|id| !keep.contains(id.as_str())) {
-            let targets: Vec<String> = tx
-                .prepare(
-                    "SELECT target_id FROM memory_relations WHERE source_id = ?1 AND relation_type = ?2",
-                )?
-                .query_map(params![id, supersedes], |r| r.get(0))?
-                .collect::<Result<_, _>>()?;
-            unsuperseded.extend(targets);
+        for id in claimed.iter().filter(|id| !keep.contains(id.as_str())) {
             tx.execute(
-                "DELETE FROM pending_relations WHERE source_id = ?1",
-                params![id],
+                "DELETE FROM memory_owners WHERE id = ?1 AND worktree = ?2",
+                params![id, checkout.worktree],
             )?;
-            // Relations cascade; FTS and vector rows go via triggers.
-            report.pruned += tx.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
         }
+    }
+    // Claims of worktrees git no longer knows about (removed with `git worktree remove`, or
+    // deleted by hand) are dropped too, or their rows would stay forever.
+    if checkout.known {
+        let stale: Vec<String> = tx
+            .prepare(
+                "SELECT DISTINCT o.worktree FROM memory_owners o JOIN memories m ON m.id = o.id
+                 WHERE m.origin_repo = ?1",
+            )?
+            .query_map(params![repo], |r| r.get(0))?
+            .collect::<Result<Vec<String>, _>>()?
+            .into_iter()
+            .filter(|w| !checkout.worktrees.contains(w))
+            .collect();
+        for w in stale {
+            tx.execute(
+                "DELETE FROM memory_owners WHERE worktree = ?1
+                   AND id IN (SELECT id FROM memories WHERE origin_repo = ?2)",
+                params![w, repo],
+            )?;
+        }
+    }
+    // Rows of this repository that no checkout contains any more.
+    let orphans: Vec<String> = tx
+        .prepare(
+            "SELECT m.id FROM memories m
+             WHERE m.source IS NOT NULL AND m.origin_repo = ?1
+               AND NOT EXISTS (SELECT 1 FROM memory_owners o WHERE o.id = m.id)",
+        )?
+        .query_map(params![repo], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    for id in &orphans {
+        let targets: Vec<String> = tx
+            .prepare(
+                "SELECT target_id FROM memory_relations WHERE source_id = ?1 AND relation_type = ?2",
+            )?
+            .query_map(params![id, supersedes], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        unsuperseded.extend(targets);
+        tx.execute(
+            "DELETE FROM pending_relations WHERE source_id = ?1",
+            params![id],
+        )?;
+        // Relations and owners cascade; FTS and vector rows go via triggers.
+        report.pruned += tx.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
     }
 
     // A row superseded only by an edge that is now gone becomes current again, as does an

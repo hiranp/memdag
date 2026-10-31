@@ -203,7 +203,19 @@ incoming `supersedes` edge. Resolutions of note-backed memories live in append-o
 `memdag_meta` key `embedder` records the embed command behind `memories_vec`; a different
 command clears the table. See ADR 0003.
 
-### 4.1.3 Schema v4: worker keywords
+### 4.1.3 Schema v5: worktree ownership
+
+`memory_owners(id, worktree)` lists the checkouts whose files contain the source of an
+imported or note-backed row. `memories.origin_repo` became the repository key (the canonical
+git common dir, `checkout::repository_key`), shared by all worktrees. Pruning deletes this
+checkout's claim; rows of the repository with no claims left are deleted. Claims of worktrees
+missing from `<common dir>/worktrees/` are dropped. `MemoryStore::only_in_other_checkout`
+labels rows claimed only by other worktrees and turns off their STALE check. The default
+database is per repository (`checkout::shared_db_path`); `db::merge_legacy_db` folds an old
+per-worktree database into it (local rows and the relations between rows that exist
+afterwards). See ADR 0005.
+
+### 4.1.4 Schema v4: worker keywords
 
 `memories.keywords` holds search terms written by a cheap-model worker (`src/work.rs`). It is
 the fifth column of `memories_fts`, weighted 0.5 in `bm25()` against 1.0 for the memory's own

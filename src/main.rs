@@ -19,6 +19,7 @@ fn main() -> anyhow::Result<()> {
         return handle_mcp_action(action, args.db.clone());
     }
 
+    let explicit_db = args.db.is_some() || std::env::var_os("MEMDAG_DB").is_some();
     let db_path = args.db.unwrap_or_else(default_db_path);
 
     if let Some(parent) = db_path.parent() {
@@ -26,6 +27,24 @@ fn main() -> anyhow::Result<()> {
     }
 
     let conn = open_connection(&db_path)?;
+    // memdag used to keep one database per worktree; all worktrees of a repository now share
+    // one. Fold an old worktree database into it the first time that worktree opens it.
+    if !explicit_db
+        && let Some(old) = memdag::db::legacy_worktree_db(&std::env::current_dir()?, &db_path)
+    {
+        match memdag::db::merge_legacy_db(&conn, &old) {
+            Ok(n) => eprintln!(
+                "[memdag] merged {n} memories from this worktree's old database ({}) into the \
+                 repository's shared one ({}); the old file is kept as *.merged",
+                old.display(),
+                db_path.display()
+            ),
+            Err(e) => eprintln!(
+                "[memdag] could not merge the old worktree database {} (will retry): {e:#}",
+                old.display()
+            ),
+        }
+    }
     let mut store = MemoryStore::new(conn);
 
     // Sweep ephemeral memories left behind by sessions that crashed before consolidating.
@@ -152,6 +171,11 @@ fn main() -> anyhow::Result<()> {
                 }
                 if let Some(c) = &mem.commit {
                     println!("As of:       {c}");
+                }
+                if store.only_in_other_checkout(&mem) {
+                    println!(
+                        "Checkout:    only in another worktree; its branch may not be merged yet"
+                    );
                 }
                 let stale = store.stale_paths(&mem);
                 if !stale.is_empty() {

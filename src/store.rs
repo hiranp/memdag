@@ -179,10 +179,40 @@ impl MemoryStore {
         Ok(())
     }
 
-    /// Canonical key of the repo note-backed rows belong to (see `memories.origin_repo`).
+    /// Key of the repository note-backed rows belong to (see `memories.origin_repo`); shared
+    /// by all of its worktrees.
     fn origin_for(&self, source: Option<&str>) -> Option<String> {
         source?;
-        self.repo_root.as_deref().map(crate::import::repo_key)
+        self.repo_root
+            .as_deref()
+            .map(crate::checkout::repository_key)
+    }
+
+    /// Key of this checkout, which owns the note-backed rows it writes.
+    fn owner_for(&self, source: Option<&str>) -> Option<String> {
+        source?;
+        self.repo_root.as_deref().map(crate::checkout::worktree_key)
+    }
+
+    /// True for an imported or note-backed memory whose source exists only in other worktrees
+    /// of the repository (a note on a branch that isn't checked out here). Its cited paths
+    /// describe that branch, so it is never STALE-checked against this checkout's files.
+    pub fn only_in_other_checkout(&self, memory: &Memory) -> bool {
+        if memory.source.is_none() {
+            return false;
+        }
+        let Some(here) = self.repo_root.as_deref().map(crate::checkout::worktree_key) else {
+            return false;
+        };
+        self.conn
+            .query_row(
+                "SELECT count(*) > 0 AND sum(worktree = ?2) = 0 FROM memory_owners WHERE id = ?1",
+                params![memory.id, here],
+                |r| r.get::<_, Option<bool>>(0),
+            )
+            .ok()
+            .flatten()
+            .unwrap_or(false)
     }
 
     pub fn has_embedder(&self) -> bool {
@@ -427,6 +457,7 @@ impl MemoryStore {
         };
 
         let origin = self.origin_for(source);
+        let owner = self.owner_for(source);
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -494,6 +525,13 @@ impl MemoryStore {
                 params![new_id, embedding_to_json(&emb)],
             )
             .context("Failed to insert vector embedding into memories_vec")?;
+        }
+
+        if let Some(w) = &owner {
+            tx.execute(
+                "INSERT OR IGNORE INTO memory_owners (id, worktree) VALUES (?1, ?2)",
+                params![new_id, w],
+            )?;
         }
 
         // Fetch the recorded memory row
@@ -693,6 +731,7 @@ impl MemoryStore {
             .into_iter()
             .map(|(memory, rank)| {
                 Ok(MemorySearchResult {
+                    other_checkout: self.only_in_other_checkout(&memory),
                     relations: self.get_memory_relations(&memory.id)?,
                     stale_paths: self.stale_paths(&memory),
                     memory,
@@ -712,6 +751,9 @@ impl MemoryStore {
         let Some(root) = self.repo_root.as_deref() else {
             return Vec::new();
         };
+        if memory.paths.is_empty() || self.only_in_other_checkout(memory) {
+            return Vec::new();
+        }
         if memory.paths.is_empty() || !memory.paths.iter().all(|p| is_valid_repo_path(p)) {
             return Vec::new();
         }
@@ -866,6 +908,7 @@ impl MemoryStore {
         purge_ephemeral: bool,
     ) -> Result<ConsolidationResult> {
         let origin = self.origin_for(Some("note"));
+        let owner = self.owner_for(Some("note"));
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -893,6 +936,14 @@ impl MemoryStore {
                 ],
             )
             .context("Failed to insert consolidated session learning")?;
+            if p.source.is_some()
+                && let Some(w) = &owner
+            {
+                tx.execute(
+                    "INSERT OR IGNORE INTO memory_owners (id, worktree) VALUES (?1, ?2)",
+                    params![p.id, w],
+                )?;
+            }
 
             recorded_ids.push(p.id.clone());
         }
@@ -1667,11 +1718,15 @@ fn render_result(index: usize, res: &MemorySearchResult, body_chars: Option<usiz
     let mem = &res.memory;
     // Imported rows come from files and comments anyone with repo access can write, so say
     // where they came from and keep their text from forging result blocks.
-    let source = mem
+    let mut source = mem
         .source
         .as_deref()
         .map(|s| format!(", source: {s}"))
         .unwrap_or_default();
+    // A decision on another worktree's branch may never be merged; say so.
+    if res.other_checkout {
+        source.push_str(", only in another worktree");
+    }
     let mut out = format!(
         "### {}. [{}] {} (kind: {}, status: {}{source}, score: {:.4})\n",
         index,

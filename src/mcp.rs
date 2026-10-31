@@ -563,6 +563,9 @@ impl McpServer {
                             out.push_str(&format!("- **Tags**: {tags}\n"));
                         }
                         out.push_str(&format_provenance(&mem, &store.stale_paths(&mem)));
+                        if store.only_in_other_checkout(&mem) {
+                            out.push_str("- **Checkout**: only in another worktree; its branch may not be merged yet\n");
+                        }
                         if !rels.is_empty() {
                             out.push_str("- **Relations (1-Hop DAG)**:\n");
                             out.push_str(&format_relations(&rels));
