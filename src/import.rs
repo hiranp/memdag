@@ -745,7 +745,9 @@ fn collect_notes(dir: &Path, batch: &mut Batch, report: &mut ImportReport) -> bo
             // are aligned with paths, so they survive only if every path does.
             fingerprints: if note.paths.iter().all(|p| is_valid_repo_path(p))
                 // A repeated path would be stored once, misaligning the fingerprints.
-                && note.paths.iter().collect::<HashSet<_>>().len() == note.paths.len()
+                // Trimmed, as join_paths trims before it deduplicates.
+                && note.paths.iter().map(|p| p.trim()).collect::<HashSet<_>>().len()
+                    == note.paths.len()
                 && note.fingerprints.len() == note.paths.len()
                 && note.fingerprints.iter().all(|f| is_valid_fingerprint(f))
             {

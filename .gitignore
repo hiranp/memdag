@@ -5,3 +5,5 @@
 *.db-shm
 .memdag/
 .DS_Store
+# Local cargo settings (e.g. build.jobs) stay per machine.
+/.cargo/config.toml

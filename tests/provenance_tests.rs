@@ -268,6 +268,38 @@ fn imported_note_with_hostile_provenance_is_sanitised() {
 }
 
 #[test]
+fn imported_note_repeating_a_path_with_spaces_drops_its_fingerprints() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let fp = "a".repeat(40);
+    write(
+        tmp.path(),
+        "docs/memory/DEC-dup.md",
+        &format!(
+            "---\nid: DEC-dup\nkind: decision\ntags: []\nsupersedes:\nrefs: []\npaths: [\"src/a.rs\", \"src/a.rs \"]\nfingerprints: [\"{fp}\", \"-\"]\n---\n# Dup\n\nbody\n"
+        ),
+    );
+    commit_all(tmp.path(), "dup note");
+    let mut store = MemoryStore::new(open_in_memory().unwrap());
+    import_repo(
+        &mut store,
+        tmp.path(),
+        &ImportOptions {
+            git: false,
+            adr: false,
+            notes: true,
+            gh: false,
+            ..ImportOptions::all()
+        },
+        &GhCli,
+    )
+    .unwrap();
+    let (mem, _) = store.get_memory("DEC-dup").unwrap().unwrap();
+    assert_eq!(mem.paths, vec!["src/a.rs"]);
+    assert!(mem.fingerprints.is_empty(), "{:?}", mem.fingerprints);
+}
+
+#[test]
 fn v1_database_migrates_to_v2_and_keeps_data() {
     use rusqlite::Connection;
     let dir = tempfile::tempdir().unwrap();
