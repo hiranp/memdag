@@ -338,6 +338,32 @@ fn strip_trailers(body: &str) -> String {
 const FIELD: char = '\x1f';
 const MULTI: char = '\x1d';
 
+/// Split a raw commit message (`%B`) into what git prints as `%s` and `%b`: the subject is
+/// the first paragraph with its lines joined by single spaces, the body everything after the
+/// blank line(s) that end it.
+fn split_message(msg: &str) -> (String, &str) {
+    let is_blank = |l: &str| l.trim_end().is_empty();
+    let mut rest = msg;
+    let mut subject: Vec<&str> = Vec::new();
+    // Leading blank lines, then the subject paragraph, then the blank lines after it.
+    for phase in 0..3 {
+        while !rest.is_empty() {
+            let (line, next) = match rest.find('\n') {
+                Some(i) => (&rest[..i], &rest[i + 1..]),
+                None => (rest, ""),
+            };
+            if (phase == 1) == is_blank(line) {
+                break;
+            }
+            if phase == 1 {
+                subject.push(line.trim_end());
+            }
+            rest = next;
+        }
+    }
+    (subject.join(" "), rest)
+}
+
 fn collect_git(
     repo: &Path,
     since: Option<&str>,
@@ -359,9 +385,10 @@ fn collect_git(
         Some(s) => format!("{s}..{head}"),
         None => head.clone(),
     };
-    let format = "--format=%H%x1f%cI%x1f%s%x1f%b%x1f\
+    // The raw message goes last so a 0x1f inside it can't shift the fields before it.
+    let format = "--format=%H%x1f%cI%x1f\
                   %(trailers:key=Decision,valueonly,separator=%x1d)%x1f\
-                  %(trailers:key=Refs,valueonly,separator=%x1d)";
+                  %(trailers:key=Refs,valueonly,separator=%x1d)%x1f%B";
     let out = git(
         repo,
         &[
@@ -383,12 +410,12 @@ fn collect_git(
     }
     let raw = String::from_utf8_lossy(&out.stdout);
     for record in raw.split('\0') {
-        let f: Vec<&str> = record.split(FIELD).collect();
-        if f.len() < 6 {
+        let f: Vec<&str> = record.splitn(5, FIELD).collect();
+        if f.len() < 5 {
             continue;
         }
         let sha = f[0].trim();
-        let decisions: Vec<&str> = f[4]
+        let decisions: Vec<&str> = f[2]
             .split(MULTI)
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -400,10 +427,11 @@ fn collect_git(
             continue;
         }
         let id = format!("GIT-{}", &sha[..7]);
-        let refs: Vec<String> = f[5].split(MULTI).flat_map(split_refs).collect();
+        let refs: Vec<String> = f[3].split(MULTI).flat_map(split_refs).collect();
 
-        let mut body = f[2].trim().to_string();
-        let rest = strip_trailers(f[3]);
+        let (subject, rest) = split_message(f[4]);
+        let mut body = subject.trim().to_string();
+        let rest = strip_trailers(rest);
         if !rest.trim().is_empty() {
             body.push_str("\n\n");
             body.push_str(rest.trim());
@@ -1207,6 +1235,19 @@ mod tests {
             "Why.\n\nMore prose here."
         );
         assert_eq!(strip_trailers("Refs: #1"), "");
+    }
+
+    #[test]
+    fn split_message_matches_git_subject_and_body() {
+        assert_eq!(
+            split_message("\n\nline one  \nline two\n\n\nbody\n\nmore\n"),
+            ("line one line two".to_string(), "body\n\nmore\n")
+        );
+        assert_eq!(split_message("only\n"), ("only".to_string(), ""));
+        assert_eq!(
+            split_message("a\x1fb\n \nc\x1fd"),
+            ("a\x1fb".to_string(), "c\x1fd")
+        );
     }
 
     #[test]

@@ -220,6 +220,40 @@ fn adr_supersession_edges_and_status() {
 }
 
 #[test]
+fn unit_separator_in_a_commit_message_does_not_shift_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    init_repo(&repo);
+    let msg = tmp.path().join("msg.txt");
+    std::fs::write(
+        &msg,
+        "feat: odd\x1fsubject\nwrapped line\n\nbody has \x1f a separator\n\nRefs: ADR-0009\nDecision: Keep the unit separator",
+    )
+    .unwrap();
+    git(
+        &repo,
+        &["commit", "-q", "--allow-empty", "-F", msg.to_str().unwrap()],
+    );
+    let sha = git(&repo, &["rev-parse", "HEAD"]);
+    let mut store = store_at(&tmp.path().join("m.db"));
+    let r = import_repo(&mut store, &repo, &ImportOptions::local(), &BrokenGh).unwrap();
+    assert_eq!(r.git, 1, "{:?}", r.warnings);
+
+    let (m, _) = store
+        .get_memory(&format!("GIT-{}", &sha[..7]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(m.title, "Keep the unit separator");
+    assert_eq!(
+        m.body,
+        "feat: odd\x1fsubject wrapped line\n\nbody has \x1f a separator"
+    );
+    assert_eq!(m.tags.as_deref(), Some("ADR-0009 git"));
+    assert!(m.created_at.starts_with("20"), "{}", m.created_at);
+}
+
+#[test]
 fn rebuild_from_scratch_reproduces_db_including_write_through() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
