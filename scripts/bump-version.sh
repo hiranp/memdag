@@ -30,13 +30,24 @@ esac
 new="$major.$minor.$patch"
 echo "Bumping $current -> $new"
 
-sed -i.bak "0,/^version = \"$current\"/s//version = \"$new\"/" Cargo.toml
-rm -f Cargo.toml.bak
+# First `version = ` line only (the [package] one). perl, not `sed 0,/re/`, which is GNU-only.
+perl -0pi -e "s/^version = \"\Q$current\E\"/version = \"$new\"/m" Cargo.toml
+
+# The release notes are CHANGELOG.md's section for this version (release.yml fails without
+# one), so turn the [Unreleased] section into it and start a new, empty [Unreleased].
+if grep -q '^## \[Unreleased\]' CHANGELOG.md; then
+    today=$(date -u +%Y-%m-%d)
+    perl -0pi -e "s/^## \[Unreleased\]\n/## [Unreleased]\n\n## [$new] - $today\n/m" CHANGELOG.md
+elif ! grep -q "^## \[$new\]" CHANGELOG.md; then
+    echo "error: CHANGELOG.md has neither an [Unreleased] nor a [$new] section" >&2
+    git checkout -- Cargo.toml
+    exit 1
+fi
 
 # Refresh Cargo.lock's recorded version for this package (deps untouched).
 cargo check -q
 
-git add Cargo.toml Cargo.lock
+git add Cargo.toml Cargo.lock CHANGELOG.md
 git commit -m "chore: release v$new"
 git tag "v$new"
 

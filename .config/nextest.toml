@@ -1,0 +1,9 @@
+# cargo-nextest settings (CI and scripts/local-ci/ci.sh).
+#
+# No global retries: a retry would hide real nondeterminism. 60 s marks a
+# test SLOW; after 3 slow periods (180 s) it is killed and fails the run, so
+# one hung test can't park the suite until the job timeout.
+[profile.default]
+retries = 0
+slow-timeout = { period = "60s", terminate-after = 3 }
+fail-fast = false

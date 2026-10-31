@@ -1,7 +1,11 @@
 name: Bump Version
 
-# Manually triggered: bumps Cargo.toml's version, commits, and pushes a tag.
-# Pushing the tag kicks off .github/workflows/release.yml to build binaries.
+# Manually triggered: bumps Cargo.toml's version, turns CHANGELOG.md's [Unreleased] section
+# into the release's section, commits, tags, and starts the release.
+#
+# A tag pushed with GITHUB_TOKEN does not trigger other workflows, so pushing it alone would
+# never run release.yml. This workflow therefore starts the release explicitly
+# (workflow_dispatch is the exception GitHub allows), which needs `actions: write`.
 on:
   workflow_dispatch:
     inputs:
@@ -12,16 +16,24 @@ on:
 
 permissions:
   contents: write
+  actions: write
+
+concurrency:
+  group: bump-version
+  cancel-in-progress: false
 
 jobs:
   bump:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: stable
 
       - name: Configure git identity
         run: |
@@ -31,7 +43,11 @@ jobs:
       - name: Bump version, commit, and tag
         run: ./scripts/bump-version.sh "${{ inputs.bump }}"
 
-      - name: Push commit and tag
+      - name: Push commit and tag, start the release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          tag="$(git describe --tags --abbrev=0)"
           git push origin HEAD
-          git push origin "$(git describe --tags --abbrev=0)"
+          git push origin "$tag"
+          gh workflow run release.yml -f tag="$tag"

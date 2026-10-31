@@ -1,0 +1,146 @@
+name: CI
+
+# Cost and time rules, the same ones hiranp/hief uses (from hiranp/email-agent):
+#
+# 1. One Rust job on Linux, not several. Clippy, tests and doctests run in sequence on one
+#    runner and share one build of the dependencies (bundled SQLite and sqlite-vec are most
+#    of it).
+# 2. `concurrency`: a newer push to the same PR cancels the older run. Runs on main are never
+#    cancelled, because main warms the cache.
+# 3. `paths-ignore`: a docs-only change builds nothing.
+# 4. Only main saves the cache. PRs restore it but never upload, so a PR can't evict main's
+#    entry.
+# 5. CARGO_INCREMENTAL=0 and line-tables-only debug info: CI never reuses an incremental
+#    build, and full debug info is most of target/.
+# 6. Each job has a timeout. The GitHub default is 360 minutes.
+# 7. Actions are pinned to a commit SHA, with the version in a comment.
+#
+# memdag ships Windows and macOS binaries, so those platforms run the tests too, but only on
+# main, by hand, and before every release (the release workflow calls this one), not on
+# every PR push: their runners cost several times a Linux one.
+#
+# Run the same steps locally (or on a remote Mac) without spending Actions minutes:
+# scripts/local-ci/ci.sh (see scripts/local-ci/README.md).
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**", "LICENSE*"]
+  pull_request:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**", "LICENSE*"]
+  workflow_dispatch: {}
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit, branch or tag to test (default: the caller's ref)"
+        type: string
+        default: ""
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  RUST_BACKTRACE: short
+
+jobs:
+  # Seconds, with no compile, so a formatting miss fails before the build starts.
+  fmt:
+    name: Format
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: stable
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  rust:
+    name: Rust (clippy, test)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: stable
+          components: clippy
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: ci-linux
+          add-job-id-key: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Pinned version and SHA-256 instead of `curl | sh` or a slow `cargo install`.
+      - name: Install cargo-nextest
+        run: ./scripts/ci/install-tool.sh cargo-nextest
+
+      # The tests create throwaway git repositories and commit to them.
+      - name: Git identity for test repositories
+        run: |
+          git config --global user.email ci@example.com
+          git config --global user.name CI
+          git config --global init.defaultBranch main
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # nextest runs each test as its own process at full parallelism.
+      # .config/nextest.toml sets the hang backstop. It can't run doctests, hence the
+      # second line.
+      - name: Test
+        run: |
+          cargo nextest run --locked --no-fail-fast
+          cargo test --locked --doc
+
+  portability:
+    name: Test (${{ matrix.os }})
+    # Not on PR pushes (see the header); always before a release.
+    if: github.event_name != 'pull_request'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: ci-${{ matrix.os }}
+          add-job-id-key: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Git identity for test repositories
+        run: |
+          git config --global user.email ci@example.com
+          git config --global user.name CI
+          git config --global init.defaultBranch main
+
+      # Plain cargo test: the pinned nextest installer is Linux-only, and these runs are rare.
+      - name: Test
+        run: cargo test --locked --no-fail-fast

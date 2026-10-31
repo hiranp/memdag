@@ -1,18 +1,51 @@
 name: Release
 
-# Builds memdag for macOS (Intel + Apple Silicon), Linux, and Windows, then
-# attaches the binaries to the GitHub Release for the pushed tag.
+# Builds memdag for Linux, macOS (Intel + Apple Silicon) and Windows, after the full CI
+# (including the macOS and Windows tests) passes on the tagged commit, then publishes a
+# GitHub Release whose notes are the version's CHANGELOG.md section, with a SHA256SUMS file.
+#
+# No build cache here: releases are rare, and caches saved on a tag ref can't be restored by
+# any other ref.
+
 on:
   push:
     tags:
       - "v*.*.*"
+  # Re-run a release for an existing tag with the CURRENT workflow file. "Re-run failed
+  # jobs" on a tag reuses the workflow as it was at the tag, so a broken workflow could
+  # otherwise only be fixed by moving the tag. bump-version.yml also starts releases this
+  # way, because a tag pushed with GITHUB_TOKEN doesn't trigger workflows.
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish, e.g. v0.4.0"
+        required: true
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
 
 jobs:
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ inputs.tag || github.ref_name }}
+
   build:
+    name: Build (${{ matrix.target }})
+    needs: ci
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -23,33 +56,29 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             ext: zip
+          # Both macOS builds run on Apple Silicon; Xcode's toolchain cross-compiles Intel.
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
             ext: tar.gz
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-latest
             ext: tar.gz
-
-    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: stable
           targets: ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
 
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package (unix)
         if: matrix.ext == 'tar.gz'
-        run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../memdag-${{ matrix.target }}.tar.gz memdag
+        run: tar czf "memdag-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" memdag
 
       - name: Package (windows)
         if: matrix.ext == 'zip'
@@ -58,7 +87,55 @@ jobs:
           Compress-Archive -Path target/${{ matrix.target }}/release/memdag.exe `
             -DestinationPath memdag-${{ matrix.target }}.zip
 
-      - name: Upload release asset
-        uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          files: memdag-${{ matrix.target }}.${{ matrix.ext }}
+          name: memdag-${{ matrix.target }}
+          path: memdag-${{ matrix.target }}.${{ matrix.ext }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      # The release body is this version's CHANGELOG.md section, so the notes say what
+      # changed, not just a list of commit titles.
+      - name: Release notes from CHANGELOG.md
+        run: |
+          version="${RELEASE_TAG#v}"
+          awk -v v="$version" '
+            index($0, "## [" v "]") == 1 {on=1; next}
+            on && /^## \[/ {exit}
+            on {print}
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "::error::CHANGELOG.md has no section for $version"; exit 1
+          fi
+          cat notes.md
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          pattern: memdag-*
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum memdag-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          body_path: notes.md
+          files: dist/*
+          fail_on_unmatched_files: true
