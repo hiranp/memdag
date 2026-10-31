@@ -185,6 +185,13 @@ pub enum Commands {
         path: Option<PathBuf>,
     },
 
+    /// Bulk memory upkeep for a cheap worker model (keyword expansion, STALE checks).
+    /// memdag never calls a model: it prints the work, you run it on e.g. Haiku or Flash.
+    Work {
+        #[command(subcommand)]
+        action: WorkAction,
+    },
+
     /// Rebuild/refresh the index from git-tracked sources (idempotent upsert by stable id).
     /// With no source flags, imports the local sources (git, adr, notes); GitHub comments need --gh.
     Import {
@@ -267,4 +274,67 @@ pub enum McpAction {
         #[arg(long)]
         key: Option<String>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum WorkAction {
+    /// Print the next batch as a prompt for a worker model (or as JSON with --json)
+    Next {
+        /// expand (search keywords) or verify (check STALE memories)
+        task: String,
+        /// Items in the batch
+        #[arg(long, default_value_t = memdag::work::DEFAULT_BATCH)]
+        limit: usize,
+        /// Print the raw batch JSON instead of a ready-to-send prompt
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply a worker's reply (JSON, code fences and stray prose tolerated)
+    Submit {
+        /// File with the reply; reads stdin if omitted or "-"
+        file: Option<PathBuf>,
+        /// Task, if the reply doesn't name one
+        #[arg(long)]
+        task: Option<String>,
+    },
+    /// Install the `memdag-worker` subagent (cheap model) and a marked memdag block in the
+    /// harness's instructions file (CLAUDE.md / AGENTS.md)
+    Install {
+        #[arg(long, value_enum, default_value = "claude-code")]
+        client: WorkerClient,
+        /// User-global files instead of the project's
+        #[arg(long)]
+        global: bool,
+        /// Model for the worker. Claude Code: an alias such as haiku (default) or a model id.
+        /// OpenCode: provider/model (no default; the worker then inherits the session's model).
+        #[arg(long)]
+        model: Option<String>,
+        /// Don't touch CLAUDE.md / AGENTS.md
+        #[arg(long)]
+        no_instructions: bool,
+    },
+    /// Remove what `work install` wrote (only files and blocks memdag marked as its own)
+    Uninstall {
+        #[arg(long, value_enum, default_value = "claude-code")]
+        client: WorkerClient,
+        #[arg(long)]
+        global: bool,
+    },
+    /// Print the instructions an agent follows to run a task on a cheap subagent
+    Prompt {
+        /// expand_keywords or verify_stale
+        name: String,
+        /// Maximum batches
+        #[arg(long, default_value_t = memdag::work::DEFAULT_ROUNDS)]
+        rounds: usize,
+    },
+}
+
+/// Harnesses `memdag work install` can add the worker subagent to.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerClient {
+    /// `.claude/agents/memdag-worker.md` + CLAUDE.md
+    ClaudeCode,
+    /// `.opencode/agents/memdag-worker.md` + AGENTS.md
+    Opencode,
 }

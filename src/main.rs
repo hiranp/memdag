@@ -1,7 +1,7 @@
 mod cli;
 
 use clap::Parser;
-use cli::{Cli, Commands, McpAction, McpClient};
+use cli::{Cli, Commands, McpAction, McpClient, WorkAction};
 use memdag::db::{default_db_path, open_connection};
 use memdag::import::{GhCli, ImportOptions, ImportReport, find_repo_root, import_repo};
 use memdag::mcp::McpServer;
@@ -141,6 +141,9 @@ fn main() -> anyhow::Result<()> {
                 if let Some(tags) = &mem.tags {
                     println!("Tags:        {}", tags);
                 }
+                if let Some(kw) = store.get_keywords(&mem.id)? {
+                    println!("Keywords:    {kw}");
+                }
                 if let Some(sess) = &mem.session_id {
                     println!("Session:     {}", sess);
                 }
@@ -263,6 +266,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Some(Commands::Work { action }) => run_work(&mut store, action, repo.as_deref(), &config)?,
         Some(Commands::Embed) => {
             let n = store.embed_missing()?;
             println!("Embedded {n} memories.");
@@ -367,8 +371,107 @@ fn print_report(r: &ImportReport) {
     }
 }
 
-/// Re-import local git sources if HEAD moved since the last import. Never fatal: a broken
-/// import must not stop search or the MCP server, so failures are only logged to stderr.
+/// `memdag work ...`: hand out, apply, and install bulk upkeep for a cheap worker model.
+fn run_work(
+    store: &mut MemoryStore,
+    action: WorkAction,
+    repo: Option<&Path>,
+    config: &RepoConfig,
+) -> anyhow::Result<()> {
+    use memdag::work::{self, WorkTask};
+    let parse = |t: &str| t.parse::<WorkTask>().map_err(|e| anyhow::anyhow!(e));
+    match action {
+        WorkAction::Next { task, limit, json } => {
+            let task = parse(&task)?;
+            if task == WorkTask::Verify && repo.is_none() {
+                anyhow::bail!("Not inside a git repository, so staleness can't be checked");
+            }
+            auto_refresh(store, repo, config);
+            let batch = work::next_batch(store, task, limit)?;
+            let n = batch["items"].as_array().map_or(0, Vec::len);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&batch)?);
+            } else if n == 0 {
+                eprintln!("Nothing to do for '{task}'.");
+            } else {
+                print!("{}", work::batch_as_prompt(&batch));
+            }
+            eprintln!(
+                "[memdag] {n} items in this batch, {} more waiting",
+                batch["remaining"]
+            );
+        }
+        WorkAction::Submit { file, task } => {
+            let text = match file.filter(|f| f.as_os_str() != "-") {
+                Some(f) => std::fs::read_to_string(&f)
+                    .map_err(|e| anyhow::anyhow!("{}: {e}", f.display()))?,
+                None => std::io::read_to_string(std::io::stdin())?,
+            };
+            let reply = work::parse_reply(&text)?;
+            let task = work::reply_task(&reply, task.as_deref().map(parse).transpose()?)?;
+            print!("{}", work::submit(store, task, &reply)?);
+        }
+        WorkAction::Install {
+            client,
+            global,
+            model,
+            no_instructions,
+        } => {
+            let (harness, scope) = worker_target(client, global, repo)?;
+            let r = memdag::harness::install(harness, &scope, model.as_deref(), !no_instructions)?;
+            print_harness_report(&r);
+            if harness == memdag::harness::Harness::Opencode && model.is_none() {
+                eprintln!(
+                    "note: no --model given, so the OpenCode worker uses the session's model. \
+                     Re-run with --model <provider>/<model> to pin a Haiku- or Flash-class one."
+                );
+            }
+        }
+        WorkAction::Uninstall { client, global } => {
+            let (harness, scope) = worker_target(client, global, repo)?;
+            print_harness_report(&memdag::harness::uninstall(harness, &scope)?);
+        }
+        WorkAction::Prompt { name, rounds } => {
+            let p = work::host_prompt(&name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown prompt '{name}' (expected expand_keywords or verify_stale)"
+                )
+            })?;
+            println!("{}", work::host_prompt_text(p.task, rounds.clamp(1, 50)));
+        }
+    }
+    Ok(())
+}
+
+fn worker_target(
+    client: cli::WorkerClient,
+    global: bool,
+    repo: Option<&Path>,
+) -> anyhow::Result<(memdag::harness::Harness, memdag::harness::Scope)> {
+    use memdag::harness::{Harness, Scope};
+    let harness = match client {
+        cli::WorkerClient::ClaudeCode => Harness::ClaudeCode,
+        cli::WorkerClient::Opencode => Harness::Opencode,
+    };
+    let scope = if global {
+        Scope::Global { home: home_dir()? }
+    } else {
+        Scope::Project(match repo {
+            Some(r) => r.to_path_buf(),
+            None => std::env::current_dir()?,
+        })
+    };
+    Ok((harness, scope))
+}
+
+fn print_harness_report(r: &memdag::harness::InstallReport) {
+    let (path, change) = &r.worker;
+    println!("{change:?}: {}", path.display());
+    if let Some((path, change)) = &r.instructions {
+        println!("{change:?}: {} (memdag block)", path.display());
+    }
+}
+
 /// Run the stdio MCP server. The index is refreshed at startup and, while the server runs,
 /// before read tools whenever HEAD has moved.
 fn serve(mut store: MemoryStore, repo: Option<PathBuf>, config: &RepoConfig) -> anyhow::Result<()> {
@@ -384,6 +487,8 @@ fn serve(mut store: MemoryStore, repo: Option<PathBuf>, config: &RepoConfig) -> 
     mcp.run_stdio()
 }
 
+/// Re-import local git sources if HEAD moved since the last import. Never fatal: a broken
+/// import must not stop search or the MCP server, so failures are only logged to stderr.
 fn auto_refresh(store: &mut MemoryStore, repo: Option<&Path>, config: &RepoConfig) {
     if let Some(repo) = repo {
         memdag::import::auto_refresh(store, repo, &config.notes_dir());

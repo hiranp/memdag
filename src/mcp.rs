@@ -48,7 +48,8 @@ const AGENT_INSTRUCTIONS: &str = "memdag is your durable project memory and ligh
 - Track work items as kind='task'. When something blocks a task, record it as kind='blocker' and call link_entities(blocker_id, task_id, 'blocks'); call list_ready to find claimable, unblocked work before starting on something, especially when other agents may be working on the same project.\n\
 - When one memory depends on, blocks, or references another, call link_entities to keep the DAG connected.\n\
 - Call resolve_memory when a task or blocker is done, with a short note on how it was resolved.\n\
-- Before ending a session, call consolidate_session to promote durable learnings and purge scratch/ephemeral notes.";
+- Before ending a session, call consolidate_session to promote durable learnings and purge scratch/ephemeral notes.\n\
+- Bulk upkeep (search keywords for memories; checking STALE memories against the code) is work for a cheap model: call get_work, hand the batch to a low-cost subagent (e.g. Claude Haiku or Gemini Flash), then submit_work its JSON. The prompts expand_keywords and verify_stale run this end to end.";
 
 /// A JSON array of strings, or a single comma/newline separated string.
 fn string_list(value: Option<&Value>) -> Vec<String> {
@@ -92,6 +93,7 @@ const READ_TOOLS: &[&str] = &[
     "get_memory",
     "list_memories",
     "list_ready",
+    "get_work",
 ];
 
 impl McpServer {
@@ -194,6 +196,9 @@ impl McpServer {
                     "capabilities": {
                         "tools": {
                             "listChanged": false
+                        },
+                        "prompts": {
+                            "listChanged": false
                         }
                     },
                     "serverInfo": {
@@ -215,6 +220,72 @@ impl McpServer {
                 result: Some(json!({})),
                 error: None,
             }),
+            "prompts/list" => {
+                let prompts: Vec<Value> = crate::work::HOST_PROMPTS
+                    .iter()
+                    .map(|p| {
+                        json!({
+                            "name": p.name,
+                            "description": p.description,
+                            "arguments": [{
+                                "name": "rounds",
+                                "description": format!("Maximum batches to process (default {})", crate::work::DEFAULT_ROUNDS),
+                                "required": false
+                            }]
+                        })
+                    })
+                    .collect();
+                Some(JsonRpcResponse {
+                    jsonrpc: "2.0",
+                    id: req_id,
+                    result: Some(json!({ "prompts": prompts })),
+                    error: None,
+                })
+            }
+            "prompts/get" => {
+                let params = req.params.unwrap_or(json!({}));
+                let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let Some(prompt) = crate::work::host_prompt(name) else {
+                    // A notification (no id) never gets a reply, not even an error.
+                    req_id.as_ref()?;
+                    return Some(JsonRpcResponse {
+                        jsonrpc: "2.0",
+                        id: req_id,
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32602,
+                            message: format!("Unknown prompt: {name}"),
+                            data: None,
+                        }),
+                    });
+                };
+                // Arguments arrive as strings; ignore anything that isn't a small number.
+                let rounds = params
+                    .pointer("/arguments/rounds")
+                    .and_then(|v| {
+                        v.as_str()
+                            .map(str::to_string)
+                            .or_else(|| v.as_u64().map(|n| n.to_string()))
+                    })
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .filter(|n| (1..=50).contains(n))
+                    .unwrap_or(crate::work::DEFAULT_ROUNDS);
+                Some(JsonRpcResponse {
+                    jsonrpc: "2.0",
+                    id: req_id,
+                    result: Some(json!({
+                        "description": prompt.description,
+                        "messages": [{
+                            "role": "user",
+                            "content": {
+                                "type": "text",
+                                "text": crate::work::host_prompt_text(prompt.task, rounds)
+                            }
+                        }]
+                    })),
+                    error: None,
+                })
+            }
             "tools/list" => {
                 let tools = self.get_tool_definitions();
                 Some(JsonRpcResponse {
@@ -580,6 +651,41 @@ impl McpServer {
                 let results = store.search_vector(&embedding, limit)?;
                 Ok(format_search_results_for_llm(&results))
             }
+            "get_work" => {
+                let task: crate::work::WorkTask = args
+                    .get("task")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'task' (expand or verify)"))?
+                    .parse()
+                    .map_err(|e: String| anyhow::anyhow!(e))?;
+                let limit = args
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .map_or(crate::work::DEFAULT_BATCH, |n| n as usize);
+                let batch = crate::work::next_batch(&store, task, limit)?;
+                Ok(serde_json::to_string_pretty(&batch)?)
+            }
+            "submit_work" => {
+                let reply = match (args.get("results"), args.get("reply")) {
+                    (Some(r @ Value::Array(_)), _) => json!({ "results": r }),
+                    (Some(Value::Object(o)), _) => Value::Object(o.clone()),
+                    // Some clients send arrays as JSON text.
+                    (Some(Value::String(text)), _) => crate::work::parse_reply(text)?,
+                    (_, Some(Value::String(text))) => crate::work::parse_reply(text)?,
+                    _ => anyhow::bail!(
+                        "Provide 'results' (the worker's results array) or 'reply' (its raw text)"
+                    ),
+                };
+                let default = args
+                    .get("task")
+                    .and_then(|v| v.as_str())
+                    .map(str::parse)
+                    .transpose()
+                    .map_err(|e: String| anyhow::anyhow!(e))?;
+                let task = crate::work::reply_task(&reply, default)?;
+                let report = crate::work::submit(&mut store, task, &reply)?;
+                Ok(report.to_string())
+            }
             unknown => anyhow::bail!("Unknown tool: '{}'", unknown),
         }
     }
@@ -798,6 +904,30 @@ impl McpServer {
                 }
             }),
         ];
+        tools.push(json!({
+            "name": "get_work",
+            "description": "Get a batch of bulk memory upkeep for a cheap worker model: task 'expand' (write search keywords for memories that have none) or 'verify' (check STALE memories against the code they cite). Returns {instructions, items, remaining}. Hand instructions + items to a low-cost subagent (e.g. Claude Haiku, Gemini Flash), then pass its JSON to submit_work.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task": { "type": "string", "enum": ["expand", "verify"] },
+                    "limit": { "type": "integer", "description": "Items per batch (default 20, max 50)." }
+                },
+                "required": ["task"]
+            }
+        }));
+        tools.push(json!({
+            "name": "submit_work",
+            "description": "Apply a worker's answers to a get_work batch. Each item is validated on its own; keywords are stored for search, 'valid' verdicts re-baseline a STALE memory, 'outdated' ones record the correction as a new memory superseding the old.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task": { "type": "string", "enum": ["expand", "verify"] },
+                    "results": { "type": "array", "items": { "type": "object" }, "description": "The worker's results array." },
+                    "reply": { "type": "string", "description": "Alternative to results: the worker's raw reply text (JSON is extracted)." }
+                }
+            }
+        }));
         // Only advertise vector search when it can work: a model cannot produce a 384-float
         // embedding itself, so without an embedder the tool would be unusable.
         if self.store.borrow().has_embedder() {

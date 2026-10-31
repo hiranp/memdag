@@ -22,6 +22,12 @@ const MEMORY_COLS: &str = "id, kind, title, body, tags, status, session_id, crea
 /// Index of the extra score column (BM25 rank / vector distance) selected after the memory
 /// columns.
 const SCORE_COL: usize = 13;
+/// Memories waiting for worker keywords.
+const NEEDS_KEYWORDS: &str = "keywords IS NULL AND kind != 'ephemeral' AND status != 'superseded'";
+/// BM25 column weights for (id, title, body, tags, keywords). Worker-generated keywords are
+/// guesses about how someone might search, so a match there counts half as much as one in
+/// the memory's own text.
+const BM25_WEIGHTS: &str = "1.0, 1.0, 1.0, 1.0, 0.5";
 /// Reciprocal Rank Fusion constant (Cormack et al.; also what Hindsight uses).
 const RRF_K: f64 = 60.0;
 /// Default output budget for search results, in estimated tokens.
@@ -621,7 +627,7 @@ impl MemoryStore {
     ) -> Result<Vec<(Memory, f64)>> {
         let mut stmt = self.conn.prepare(&format!(
             r#"
-            SELECT m.{MEMORY_COLS_M}, bm25(memories_fts) AS rank
+            SELECT m.{MEMORY_COLS_M}, bm25(memories_fts, {BM25_WEIGHTS}) AS rank
             FROM memories_fts f
             JOIN memories m ON f.rowid = m.rowid
             WHERE memories_fts MATCH :query
@@ -1011,6 +1017,128 @@ impl MemoryStore {
     }
 
     /// Mark a memory as resolved, appending an optional resolution note to the body.
+    /// Memories with no worker-generated keywords yet, newest first, plus how many are
+    /// waiting in total. Ephemeral and superseded memories are never expanded.
+    pub fn memories_needing_keywords(&self, limit: usize) -> Result<(Vec<Memory>, usize)> {
+        const WHERE: &str = NEEDS_KEYWORDS;
+        let total: i64 = self.conn.query_row(
+            &format!("SELECT count(*) FROM memories WHERE {WHERE}"),
+            [],
+            |r| r.get(0),
+        )?;
+        let items = self
+            .conn
+            .prepare(&format!(
+                "SELECT {MEMORY_COLS} FROM memories WHERE {WHERE} ORDER BY updated_at DESC LIMIT ?1"
+            ))?
+            .query_map(params![limit as i64], row_to_memory)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((items, total as usize))
+    }
+
+    /// Whether `id` is in the keyword queue (see [`Self::memories_needing_keywords`]).
+    pub fn needs_keywords(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!("SELECT 1 FROM memories WHERE id = ?1 AND {NEEDS_KEYWORDS}"),
+                params![id],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+
+    /// Store search keywords for a memory (replacing any). An empty list marks it as done so
+    /// it isn't queued again. Keywords live only in the index: they are dropped when the
+    /// memory's title or body is rewritten, and a rebuild from git starts without them.
+    pub fn set_keywords(&mut self, id: &str, keywords: &[String]) -> Result<()> {
+        let joined = keywords.join(", ");
+        check_for_secrets("", &joined, None)?;
+        let n = self.conn.execute(
+            "UPDATE memories SET keywords = ?2
+             WHERE id = ?1 AND kind != 'ephemeral' AND status != 'superseded'",
+            params![id, joined],
+        )?;
+        if n == 0 {
+            bail!("Memory '{id}' not found, or ephemeral/superseded");
+        }
+        Ok(())
+    }
+
+    /// Worker-generated keywords for a memory, if any.
+    pub fn get_keywords(&self, id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT keywords FROM memories WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .filter(|k| !k.is_empty()))
+    }
+
+    /// Someone checked a STALE memory against the current code and it still holds: take the
+    /// current content of its cited paths as the new baseline. A write-through note is
+    /// append-only, so for one of those a new note with the same content and fresh
+    /// fingerprints supersedes it (and survives a rebuild); other memories are re-stamped in
+    /// place. Returns the memory that now carries the claim.
+    pub fn confirm_memory(&mut self, id: &str) -> Result<Memory> {
+        let (mem, _) = self
+            .get_memory(id)?
+            .ok_or_else(|| anyhow::anyhow!("Memory '{id}' not found"))?;
+        if mem.status != MemoryStatus::Active {
+            bail!("Memory '{id}' is {}, not active", mem.status);
+        }
+        if mem.paths.is_empty() {
+            bail!("Memory '{id}' cites no paths, so there is nothing to re-baseline");
+        }
+        let note_backed = mem.source.as_deref() == Some("note")
+            && self
+                .write_through
+                .as_deref()
+                .is_some_and(|d| d.join(format!("{id}.md")).is_file());
+        if note_backed {
+            return self.record_memory(RecordOptions {
+                id: None,
+                kind: mem.kind,
+                title: mem.title,
+                body: mem.body,
+                tags: mem.tags,
+                supersedes_id: Some(id.to_string()),
+                session_id: None,
+                embedding: None,
+                paths: mem.paths,
+                commit: None,
+            });
+        }
+        // An imported row is rewritten from its source on the next import, so a re-baseline in
+        // the database alone would be undone and the memory would turn stale again.
+        if let Some(src) = mem.source.as_deref() {
+            bail!(
+                "Memory '{id}' is imported from {src}; it can only be re-baselined through its \
+                 source (for notes, enable write-through so a superseding note can be written)"
+            );
+        }
+        let (mut paths, mut commit, mut fingerprints) = (mem.paths.clone(), None, Vec::new());
+        self.stamp_provenance(&mut paths, &mut commit, &mut fingerprints)?;
+        if fingerprints.is_empty() {
+            bail!("Could not fingerprint the cited paths of '{id}' (is this a git repository?)");
+        }
+        self.conn
+            .query_row(
+                &format!(
+                    "UPDATE memories SET fingerprints = ?2, commit_sha = ?3,
+                     updated_at = CURRENT_TIMESTAMP WHERE id = ?1 RETURNING {MEMORY_COLS}"
+                ),
+                params![id, join_paths(&fingerprints), commit],
+                row_to_memory,
+            )
+            .context("Failed to re-baseline memory")
+    }
+
     pub fn resolve_memory(&mut self, id: &str, note: Option<&str>) -> Result<Memory> {
         let note = note.map(str::trim).filter(|n| !n.is_empty());
         if let Some(n) = note {

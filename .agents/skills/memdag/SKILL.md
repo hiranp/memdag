@@ -42,6 +42,13 @@ Use it proactively — don't wait to be asked.
 | `resolve_memory` | Mark a task/blocker resolved, with a note. |
 | `consolidate_session` | Promote session learnings, purge/archive ephemeral notes. |
 
+| `get_work` / `submit_work` | Bulk upkeep (search keywords, checking STALE memories) for a cheap model. |
+
+**Bulk upkeep goes to a cheap model, not you.** When memdag offers work through `get_work`
+(or the `expand_keywords` / `verify_stale` prompts), start the `memdag-worker` subagent if it
+exists (installed by `memdag work install`). Otherwise hand the batch's `instructions` and
+`items` to a subagent on a Haiku/Flash-class model and `submit_work` its JSON.
+
 If memdag is exposed as an MCP server, call these tools directly. If only the CLI is
 available, the same operations exist as `memdag record|link|search|get|list|ready|resolve|consolidate`
 (see the project's `README.md` for exact flags).

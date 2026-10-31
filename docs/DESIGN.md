@@ -203,6 +203,16 @@ incoming `supersedes` edge. Resolutions of note-backed memories live in append-o
 `memdag_meta` key `embedder` records the embed command behind `memories_vec`; a different
 command clears the table. See ADR 0003.
 
+### 4.1.3 Schema v4: worker keywords
+
+`memories.keywords` holds search terms written by a cheap-model worker (`src/work.rs`). It is
+the fifth column of `memories_fts`, weighted 0.5 in `bm25()` against 1.0 for the memory's own
+text. A single FTS row is needed because the sanitized query is an implicit AND: a query whose
+terms are split between the body and the keywords must still match. The importer's upsert
+clears `keywords` when the title changes or the body is rewritten (appending, as a resolution
+does, keeps them). `NULL` means "queue for expansion"; an empty string means "done, nothing to
+add". See ADR 0004.
+
 ### 4.2 Memory Kinds & Lifecycle States
 
 | Kind | Description | Default Status | Eviction Policy |

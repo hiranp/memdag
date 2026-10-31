@@ -70,6 +70,12 @@ memdag exposes a standard Model Context Protocol (MCP) surface over stdio:
 | `list_ready` | `limit` | Lists claimable tasks/blockers: active, with no incoming active `blocks` edge. |
 | `resolve_memory` | `id`, `note` | Marks tasks or blockers as resolved with a completion note. |
 | `consolidate_session` | `session_id`, `learnings`, `purge_ephemeral` | Promotes session learnings and prunes ephemeral scratchpads. |
+| `get_work` | `task` (`expand` or `verify`), `limit` | Hands out a batch of bulk upkeep, with the instructions for it, to run on a cheap model. See [Cheap-model workers](#cheap-model-workers). |
+| `submit_work` | `task`, `results` or `reply` | Applies the worker's answers: search keywords, or confirm/correct STALE memories. |
+
+MCP prompts (slash commands in clients that support them, e.g. `/mcp__memdag__verify_stale` in
+Claude Code, `/memdag:verify_stale` in OpenCode): `expand_keywords` and `verify_stale` run those
+tasks end to end on a cheap subagent.
 
 ---
 
@@ -367,6 +373,65 @@ If the command is missing or failing, search falls back to BM25. The command is 
 environment only, so a cloned repository can't make memdag run anything. memdag records which
 command produced the stored vectors; if you switch to a different command, the old vectors are
 dropped (vectors from two models can't be compared) and `memdag embed` recomputes them.
+
+### Cheap-model workers
+
+Some upkeep is bulk text work that a small, cheap model does well. memdag never calls a model
+itself and needs no API key. It hands out batches of work, with the instructions for them,
+and your agent runs them on a Claude Haiku, Gemini Flash or similar subagent. Two tasks exist:
+
+- **`expand`: search keywords.** For each memory, the worker writes the synonyms, related
+  terms, abbreviations and error codes someone might search for. They go into the full-text
+  index at half the weight of the memory's own text. So `lock contention` finds "Use WAL
+  journal mode" with no embedding model. This is the lightweight alternative to
+  `MEMDAG_EMBED_CMD`; you can use both.
+- **`verify`: check STALE memories.** The worker reads the cited files that changed and answers
+  for each memory:
+  - `valid`: the files become the new baseline, so the memory is no longer stale. A
+    write-through note gets a new note with the same content that supersedes it. A memory
+    imported from a file without write-through is refused, because the next import would undo
+    the change.
+  - `outdated`, with a correction: the correction is recorded as a new memory that supersedes
+    the old one, tagged `worker-corrected` with the worker's reason appended. The old text stays
+    in history.
+  - `unsure`: the memory stays flagged.
+
+  Only active memories that are stale at submit time can change, and each id counts once per
+  reply, so a repeated, late or invented answer does nothing. Likewise, keywords can only be
+  written for memories still waiting for them.
+
+**With an MCP client**, install the worker subagent once, then run the prompt:
+
+```bash
+memdag work install --client claude-code              # .claude/agents/memdag-worker.md (model: haiku) + CLAUDE.md block
+memdag work install --client opencode --model <provider>/<haiku-or-flash-model>   # .opencode/agents/ + AGENTS.md block
+# add --global for ~/.claude or ~/.config/opencode; `memdag work uninstall` removes only what memdag wrote
+```
+
+Then run `/mcp__memdag__expand_keywords` (Claude Code) or `/memdag:expand_keywords` (OpenCode),
+or just ask for memdag upkeep. The agent hands the task to `memdag-worker`, which calls
+`get_work` and `submit_work` itself, so your main model never reads the batch. The install also
+adds a short block between `<!-- MEMDAG_START -->` and `<!-- MEMDAG_END -->` to `CLAUDE.md` or
+`AGENTS.md`. Subagents read those files but not the instructions an MCP server sends when it
+connects, so the block is how they learn to delegate.
+
+**Headless, from the shell** (any model CLI that takes a prompt and prints the reply):
+
+```bash
+memdag work next expand | claude -p --model haiku | memdag work submit
+memdag work next verify > batch.txt && claude -p "$(cat batch.txt)" --model haiku --allowedTools=Read | memdag work submit
+```
+
+`memdag work next` prints a ready-to-send prompt (`--json` for the raw batch). `memdag work
+submit` accepts the reply as it comes back: code fences and stray prose around the JSON are
+fine. Each item is validated on its own, so one bad answer is skipped without losing the rest.
+Worker output gets the same secret check as any write, and keywords are cut down to short plain
+terms. `memdag work prompt verify_stale` prints the full delegation prompt for clients without
+MCP prompt support.
+
+Keywords live only in the index. They are dropped when a memory's text is rewritten (which
+puts it back in the queue) and are not part of a rebuild from git. Rerun `expand` after
+rebuilding. See [ADR 0004](docs/adr/0004-cheap-model-workers.md).
 
 ### The index follows git
 

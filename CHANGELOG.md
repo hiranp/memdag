@@ -36,6 +36,21 @@ Planned as 0.4.0 (new features and a schema bump, no breaking CLI/MCP changes). 
   `<!-- handoff -->` issue comments. Re-running an import never duplicates. The index refreshes
   when `HEAD` moves: on every CLI `search`, and in a running `serve` before each read tool (at
   most every 2 s).
+- **Cheap-model workers.** memdag hands out bulk upkeep as batches with instructions, for the
+  calling agent to run on a Haiku/Flash-class subagent. memdag still never calls a model. New
+  MCP tools `get_work`/`submit_work`, MCP prompts `expand_keywords`/`verify_stale`, and CLI
+  `memdag work next|submit|prompt|install|uninstall`.
+  - `expand`: the worker writes search keywords, indexed for full-text search at half weight.
+    An alternative to an embedding model.
+  - `verify`: the worker checks STALE memories against the code. It confirms them
+    (re-baseline), corrects them (a new memory supersedes the old one), or leaves them flagged.
+  - `memdag work install --client claude-code|opencode [--global] [--model]` writes a
+    `memdag-worker` subagent (Claude Code default `model: haiku`) and a `<!-- MEMDAG_START -->`
+    block in `CLAUDE.md`/`AGENTS.md`. Uninstall removes only what memdag wrote.
+  - Worker output is treated as untrusted. It is secret-checked and length-capped. The
+    requested task wins over the reply. A verdict applies only to an active memory that is
+    stale right now, once per id. Corrections are tagged `worker-corrected` and carry the
+    worker's reason.
 - **Imports prune.** A deleted note or ADR, an amended or rebased-away `Decision:` commit, or a
   deleted handoff comment is removed from the index on the next import (`N removed` in the
   report). Files that fail to parse keep their row. Removing a `supersedes:` line, or the
@@ -54,6 +69,7 @@ Planned as 0.4.0 (new features and a schema bump, no breaking CLI/MCP changes). 
 
 ### Changed
 
+- **Schema v4** adds `memories.keywords` and rebuilds the FTS index with a `keywords` column.
 - **Schema v3** adds `origin_repo`, so rows are owned per repository: an import never prunes or
   overwrites rows from another repo sharing the database. The migration also drops orphaned
   vectors.

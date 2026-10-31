@@ -24,7 +24,7 @@ PRAGMA synchronous = NORMAL;
 "#;
 
 /// Bump when the schema changes; `init_pragmas_and_schema` migrates older databases up to it.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// `CREATE TABLE` for the core memories table, parameterised on its name so the v1
 /// migration can build a replacement table before swapping it in.
@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS {name} (
     commit_sha TEXT,
     fingerprints TEXT,
     source TEXT,
-    origin_repo TEXT
+    origin_repo TEXT,
+    keywords TEXT
 );
 "#
     )
@@ -58,19 +59,45 @@ CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories(kind);
 CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);
 
 CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
-    INSERT INTO memories_fts(rowid, id, title, body, tags) 
+    INSERT INTO memories_fts(rowid, id, title, body, tags, keywords)
+    VALUES (new.rowid, new.id, new.title, new.body, new.tags, new.keywords);
+END;
+
+CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, id, title, body, tags, keywords)
+    VALUES ('delete', old.rowid, old.id, old.title, old.body, old.tags, old.keywords);
+END;
+
+CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, id, title, body, tags, keywords)
+    VALUES ('delete', old.rowid, old.id, old.title, old.body, old.tags, old.keywords);
+    INSERT INTO memories_fts(rowid, id, title, body, tags, keywords)
+    VALUES (new.rowid, new.id, new.title, new.body, new.tags, new.keywords);
+END;
+"#;
+
+/// The v1 indexes and FTS triggers, frozen: v1 still has the four-column FTS table, so a
+/// database left at v1..v3 (e.g. by a crash mid-upgrade) must keep triggers that match it.
+/// `migrate_to_v4` replaces them along with the table.
+const V1_DEPENDENTS_SQL: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status);
+CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories(kind);
+CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);
+
+CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+    INSERT INTO memories_fts(rowid, id, title, body, tags)
     VALUES (new.rowid, new.id, new.title, new.body, new.tags);
 END;
 
 CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
-    INSERT INTO memories_fts(memories_fts, rowid, id, title, body, tags) 
+    INSERT INTO memories_fts(memories_fts, rowid, id, title, body, tags)
     VALUES ('delete', old.rowid, old.id, old.title, old.body, old.tags);
 END;
 
 CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
-    INSERT INTO memories_fts(memories_fts, rowid, id, title, body, tags) 
+    INSERT INTO memories_fts(memories_fts, rowid, id, title, body, tags)
     VALUES ('delete', old.rowid, old.id, old.title, old.body, old.tags);
-    INSERT INTO memories_fts(rowid, id, title, body, tags) 
+    INSERT INTO memories_fts(rowid, id, title, body, tags)
     VALUES (new.rowid, new.id, new.title, new.body, new.tags);
 END;
 "#;
@@ -91,6 +118,21 @@ WHEN old.title IS NOT new.title
 END;
 "#;
 
+/// The FTS index. `keywords` holds search terms an LLM worker generated for the memory
+/// (see `work.rs`); it lives in the same index so one query can match body and keywords.
+const FTS_TABLE_SQL: &str = r#"
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+    id UNINDEXED,
+    title,
+    body,
+    tags,
+    keywords,
+    content='memories',
+    content_rowid='rowid',
+    tokenize='porter unicode61'
+);
+"#;
+
 const REST_DDL_SQL: &str = r#"
 -- Relational Directed Graph (Supersession, Dependency, Blocking)
 CREATE TABLE IF NOT EXISTS memory_relations (
@@ -105,15 +147,7 @@ CREATE INDEX IF NOT EXISTS idx_memory_relations_source ON memory_relations(sourc
 CREATE INDEX IF NOT EXISTS idx_memory_relations_target ON memory_relations(target_id);
 
 -- FTS5 Virtual Table for BM25 Search
-CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-    id UNINDEXED,
-    title,
-    body,
-    tags,
-    content='memories',
-    content_rowid='rowid',
-    tokenize='porter unicode61'
-);
+{FTS_TABLE_SQL}
 
 -- Optional Vector Table for Dense Semantic Search
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_vec USING vec0(
@@ -156,8 +190,9 @@ DELETE FROM memories_vec WHERE id NOT IN (SELECT id FROM memories);
 /// The full schema for a fresh database.
 pub fn ddl_sql() -> String {
     format!(
-        "{}{REST_DDL_SQL}{MEMORIES_DEPENDENTS_SQL}{VEC_TRIGGERS_SQL}{V1_DDL_SQL}{V3_SQL}",
-        memories_table_sql("memories")
+        "{}{}{MEMORIES_DEPENDENTS_SQL}{VEC_TRIGGERS_SQL}{V1_DDL_SQL}{V3_SQL}",
+        memories_table_sql("memories"),
+        REST_DDL_SQL.replace("{FTS_TABLE_SQL}", FTS_TABLE_SQL)
     )
 }
 
@@ -232,6 +267,9 @@ fn init_pragmas_and_schema(conn: &Connection) -> Result<()> {
     }
     if version < 3 {
         migrate_to_v3(conn).context("Failed to migrate memdag schema to v3")?;
+    }
+    if version < 4 {
+        migrate_to_v4(conn).context("Failed to migrate memdag schema to v4")?;
     }
     Ok(())
 }
@@ -316,6 +354,40 @@ fn migrate_to_v3(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v3 -> v4: add `memories.keywords` and rebuild the FTS index with a `keywords` column (an
+/// FTS5 table can't gain a column in place). The index is derived data, so dropping and
+/// rebuilding it loses nothing.
+fn migrate_to_v4(conn: &Connection) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let step = (|| -> Result<()> {
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < 4 {
+            if !has_column(conn, "memories", "keywords")? {
+                conn.execute_batch("ALTER TABLE memories ADD COLUMN keywords TEXT;")?;
+            }
+            conn.execute_batch(&format!(
+                "DROP TRIGGER IF EXISTS memories_ai;
+                 DROP TRIGGER IF EXISTS memories_ad;
+                 DROP TRIGGER IF EXISTS memories_au;
+                 DROP TABLE IF EXISTS memories_fts;
+                 {FTS_TABLE_SQL}
+                 {MEMORIES_DEPENDENTS_SQL}
+                 INSERT INTO memories_fts(memories_fts) VALUES ('rebuild');
+                 PRAGMA user_version = 4;"
+            ))?;
+        }
+        Ok(())
+    })();
+    match step {
+        Ok(()) => conn.execute_batch("COMMIT;")?,
+        Err(e) => {
+            conn.execute_batch("ROLLBACK;").ok();
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
 /// v0 -> v1: widen the `kind` CHECK constraint to allow `learning` (SQLite can't ALTER a
 /// CHECK, so rebuild the table preserving rowids, which keeps the external-content FTS index
 /// valid) and add the importer's meta/pending tables.
@@ -336,7 +408,7 @@ fn migrate_to_v1(conn: &Connection) -> Result<()> {
                 SELECT rowid, id, kind, title, body, tags, status, session_id, created_at, updated_at FROM memories;
             DROP TABLE memories;
             ALTER TABLE memories_v1 RENAME TO memories;
-            {MEMORIES_DEPENDENTS_SQL}
+            {V1_DEPENDENTS_SQL}
             INSERT INTO memories_fts(memories_fts) VALUES ('rebuild');
             {V1_DDL_SQL}
             PRAGMA user_version = 1;
@@ -502,6 +574,11 @@ INSERT INTO memory_relations (source_id, target_id, relation_type) VALUES ('TSK-
         conn.execute_batch(
             "DROP INDEX idx_memories_origin;
              ALTER TABLE memories DROP COLUMN origin_repo;
+             DROP TRIGGER memories_ai; DROP TRIGGER memories_ad; DROP TRIGGER memories_au;
+             DROP TABLE memories_fts;
+             CREATE VIRTUAL TABLE memories_fts USING fts5(id UNINDEXED, title, body, tags,
+                 content='memories', content_rowid='rowid', tokenize='porter unicode61');
+             ALTER TABLE memories DROP COLUMN keywords;
              PRAGMA user_version = 2;",
         )
         .unwrap();
@@ -516,8 +593,9 @@ INSERT INTO memory_relations (source_id, target_id, relation_type) VALUES ('TSK-
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, SCHEMA_VERSION);
         assert!(has_column(&conn, "memories", "origin_repo").unwrap());
+        assert!(has_column(&conn, "memories", "keywords").unwrap());
         let orphans: i64 = conn
             .query_row("SELECT count(*) FROM memories_vec", [], |r| r.get(0))
             .unwrap();

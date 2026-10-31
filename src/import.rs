@@ -846,6 +846,11 @@ fn apply(
                 fingerprints = excluded.fingerprints,
                 source = excluded.source,
                 origin_repo = excluded.origin_repo,
+                -- Worker keywords describe the old text; keep them only if it was appended to.
+                keywords = CASE
+                    WHEN memories.title IS NOT excluded.title
+                      OR substr(excluded.body, 1, length(memories.body)) IS NOT memories.body
+                    THEN NULL ELSE memories.keywords END,
                 status = CASE
                     WHEN ?8 THEN 'superseded'
                     WHEN ?14 AND memories.status IS NOT 'superseded' THEN 'resolved'
