@@ -551,27 +551,31 @@ fn test_mcp_expanded_tools() {
         .to_string();
     assert!(text3.contains("Successfully resolved memory [TSK-001]"));
 
-    // 4. Test search_vector tool
-    let vec_req = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 13,
-        "method": "tools/call",
-        "params": {
-            "name": "search_vector",
-            "arguments": {
-                "embedding": vec![0.2f32; 384],
-                "limit": 1
+    // 4. Test search_vector tool: TSK-001 is resolved now, so it needs include_resolved.
+    let vector_search = |id: u64, include_resolved: bool| {
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": "search_vector",
+                "arguments": {
+                    "embedding": vec![0.2f32; 384],
+                    "limit": 1,
+                    "include_resolved": include_resolved
+                }
             }
-        }
-    });
-    let resp4 = mcp
-        .handle_request(serde_json::from_value(vec_req).unwrap())
-        .expect("resp");
-    let text4 = resp4.result.unwrap()["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert!(text4.contains("TSK-001"));
+        });
+        let resp = mcp
+            .handle_request(serde_json::from_value(req).unwrap())
+            .expect("resp");
+        resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert!(!vector_search(13, false).contains("TSK-001"));
+    assert!(vector_search(14, true).contains("TSK-001"));
 }
 
 #[test]

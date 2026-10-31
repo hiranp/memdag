@@ -22,9 +22,23 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 /// Text sent to the embedder is capped; embedding models truncate long inputs anyway.
 const MAX_INPUT_CHARS: usize = 8000;
 
+/// Optional name of the model behind [`EMBED_CMD_ENV`]. When set it, not the command
+/// string, identifies the vector space, so a command that picks its model from elsewhere
+/// (a config file, a default that changed) can still be told apart.
+pub const EMBED_MODEL_ENV: &str = "MEMDAG_EMBED_MODEL";
+
 /// The configured embed command, if any.
 pub fn command_from_env() -> Option<String> {
-    std::env::var(EMBED_CMD_ENV)
+    non_empty_env(EMBED_CMD_ENV)
+}
+
+/// The configured embed model name, if any (environment only, like the command).
+pub fn model_from_env() -> Option<String> {
+    non_empty_env(EMBED_MODEL_ENV)
+}
+
+fn non_empty_env(key: &str) -> Option<String> {
+    std::env::var(key)
         .ok()
         .map(|c| c.trim().to_string())
         .filter(|c| !c.is_empty())
