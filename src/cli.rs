@@ -312,6 +312,11 @@ pub enum WorkAction {
         /// Don't touch CLAUDE.md / AGENTS.md
         #[arg(long)]
         no_instructions: bool,
+        /// Don't auto-approve the worker's two memdag tools (get_work, submit_work). Claude
+        /// Code: `permissions.allow` in .claude/settings.json; OpenCode: rules in the worker
+        /// file itself.
+        #[arg(long)]
+        no_permissions: bool,
     },
     /// Remove what `work install` wrote (only files and blocks memdag marked as its own)
     Uninstall {

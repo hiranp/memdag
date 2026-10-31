@@ -31,6 +31,12 @@ pub struct Paths {
     pub instructions: PathBuf,
 }
 
+/// The worker's MCP tools, auto-approved so a background worker isn't stopped for approval
+/// on every call. Nothing else is approved: reads, edits and shell keep the user's rules.
+pub const CLAUDE_ALLOW: [&str; 2] = ["mcp__memdag__get_work", "mcp__memdag__submit_work"];
+/// OpenCode V2 permission actions for the same tools (`<server>_<tool>`).
+const OPENCODE_ALLOW: [&str; 2] = ["memdag_get_work", "memdag_submit_work"];
+
 impl Harness {
     pub fn paths(self, scope: &Scope) -> Paths {
         match (self, scope) {
@@ -57,6 +63,19 @@ impl Harness {
         }
     }
 
+    /// Where tool approvals are written, for harnesses that keep them outside the agent file.
+    /// OpenCode applies an agent's own permission rules last, so its worker file carries the
+    /// approvals itself and no config file is edited.
+    pub fn settings_path(self, scope: &Scope) -> Option<PathBuf> {
+        match (self, scope) {
+            (Harness::ClaudeCode, Scope::Project(p)) => Some(p.join(".claude/settings.json")),
+            (Harness::ClaudeCode, Scope::Global { home }) => {
+                Some(home.join(".claude/settings.json"))
+            }
+            (Harness::Opencode, _) => None,
+        }
+    }
+
     /// The worker subagent definition. The Claude Code tool names (`mcp__memdag__*`) assume the
     /// MCP server is registered as `memdag`, which is what `memdag mcp install` does.
     /// Claude Code accepts model aliases (`haiku`); OpenCode
@@ -79,8 +98,12 @@ impl Harness {
                 } else {
                     ""
                 };
+                let allow: String = OPENCODE_ALLOW
+                    .iter()
+                    .map(|a| format!("  - action: {a}\n    resource: \"*\"\n    effect: allow\n"))
+                    .collect();
                 format!(
-                    "---\ndescription: {description}\nmode: subagent\n{model_line}permissions:\n  - action: edit\n    resource: \"*\"\n    effect: deny\n  - action: shell\n    resource: \"*\"\n    effect: deny\n---\n{WORKER_MARKER}\n\n{WORKER_BODY}{pin}"
+                    "---\ndescription: {description}\nmode: subagent\n{model_line}permissions:\n  - action: edit\n    resource: \"*\"\n    effect: deny\n  - action: shell\n    resource: \"*\"\n    effect: deny\n{allow}---\n{WORKER_MARKER}\n\n{WORKER_BODY}{pin}"
                 )
             }
         }
@@ -256,16 +279,131 @@ pub fn remove_block(path: &Path) -> Result<Change> {
     Ok(Change::Removed)
 }
 
+/// Load a settings file as a JSON object; a missing file is None. Anything that doesn't parse
+/// is refused rather than rewritten, so a hand-edited file is never damaged.
+fn load_settings(path: &Path) -> Result<Option<serde_json::Map<String, serde_json::Value>>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(serde_json::Value::Object(o)) => Ok(Some(o)),
+        Ok(_) => bail!("{} is not a JSON object; left unchanged", path.display()),
+        Err(e) => bail!(
+            "{} is not valid JSON ({e}); left unchanged. Fix it, or pass --no-permissions",
+            path.display()
+        ),
+    }
+}
+
+fn save_settings(path: &Path, root: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
+    let mut text = serde_json::to_string_pretty(root)?;
+    text.push('\n');
+    replace_file(path, &text)
+}
+
+/// Add the worker's tools to Claude Code's `permissions.allow`, keeping every other key, rule
+/// and the key order as they are.
+pub fn allow_worker_tools(path: &Path) -> Result<Change> {
+    let existing = load_settings(path)?;
+    let existed = existing.is_some();
+    let mut root = existing.unwrap_or_default();
+    let permissions = root
+        .entry("permissions")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .with_context(|| format!("`permissions` in {} is not an object", path.display()))?;
+    let allow = permissions
+        .entry("allow")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .with_context(|| format!("`permissions.allow` in {} is not a list", path.display()))?;
+    let mut added = false;
+    for rule in CLAUDE_ALLOW {
+        if !allow.iter().any(|r| r.as_str() == Some(rule)) {
+            allow.push(serde_json::json!(rule));
+            added = true;
+        }
+    }
+    if !added {
+        return Ok(Change::Unchanged);
+    }
+    save_settings(path, &root)?;
+    Ok(if existed {
+        Change::Updated
+    } else {
+        Change::Created
+    })
+}
+
+/// Remove exactly the rules [`allow_worker_tools`] adds, then any container left empty (and
+/// the file, if nothing else was in it).
+pub fn remove_worker_tools(path: &Path) -> Result<Change> {
+    let Some(mut root) = load_settings(path)? else {
+        return Ok(Change::NotFound);
+    };
+    let Some(permissions) = root
+        .get_mut("permissions")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return Ok(Change::NotFound);
+    };
+    let Some(allow) = permissions
+        .get_mut("allow")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return Ok(Change::NotFound);
+    };
+    let before = allow.len();
+    allow.retain(|r| !r.as_str().is_some_and(|s| CLAUDE_ALLOW.contains(&s)));
+    if allow.len() == before {
+        return Ok(Change::NotFound);
+    }
+    if allow.is_empty() {
+        permissions.remove("allow");
+    }
+    if permissions.is_empty() {
+        root.remove("permissions");
+    }
+    if root.is_empty() {
+        std::fs::remove_file(path)?;
+    } else {
+        save_settings(path, &root)?;
+    }
+    Ok(Change::Removed)
+}
+
 pub struct InstallReport {
     pub worker: (PathBuf, Change),
     pub instructions: Option<(PathBuf, Change)>,
+    /// Tool approvals for the worker (Claude Code `settings.json`).
+    pub permissions: Option<(PathBuf, Change)>,
+}
+
+/// What to write besides the worker file.
+#[derive(Debug, Clone, Copy)]
+pub struct InstallOptions {
+    /// The marked block in CLAUDE.md / AGENTS.md.
+    pub instructions: bool,
+    /// Auto-approve the worker's two memdag tools.
+    pub permissions: bool,
+}
+
+impl Default for InstallOptions {
+    fn default() -> Self {
+        Self {
+            instructions: true,
+            permissions: true,
+        }
+    }
 }
 
 pub fn install(
     harness: Harness,
     scope: &Scope,
     model: Option<&str>,
-    instructions: bool,
+    opts: InstallOptions,
 ) -> Result<InstallReport> {
     // The model goes into YAML front matter verbatim, so allow only id characters.
     if let Some(m) = model
@@ -285,8 +423,17 @@ pub fn install(
             paths.worker.display()
         );
     }
+    // Settings first: it's the step most likely to refuse (an unparseable file), and
+    // refusing before anything was written leaves nothing half-installed.
+    let permissions = match harness.settings_path(scope) {
+        Some(p) if opts.permissions => {
+            let change = allow_worker_tools(&p)?;
+            Some((p, change))
+        }
+        _ => None,
+    };
     let worker = write_if_changed(&paths.worker, &harness.worker_file(model))?;
-    let instructions = if instructions {
+    let instructions = if opts.instructions {
         Some((
             paths.instructions.clone(),
             upsert_block(&paths.instructions)?,
@@ -297,11 +444,19 @@ pub fn install(
     Ok(InstallReport {
         worker: (paths.worker, worker),
         instructions,
+        permissions,
     })
 }
 
 pub fn uninstall(harness: Harness, scope: &Scope) -> Result<InstallReport> {
     let paths = harness.paths(scope);
+    let permissions = match harness.settings_path(scope) {
+        Some(p) => {
+            let change = remove_worker_tools(&p)?;
+            Some((p, change))
+        }
+        None => None,
+    };
     let worker = match std::fs::read_to_string(&paths.worker) {
         Ok(t) if t.contains(WORKER_MARKER) => {
             std::fs::remove_file(&paths.worker)?;
@@ -318,12 +473,113 @@ pub fn uninstall(harness: Harness, scope: &Scope) -> Result<InstallReport> {
     Ok(InstallReport {
         worker: (paths.worker, worker),
         instructions: Some((paths.instructions, instructions)),
+        permissions,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const NO_EXTRAS: InstallOptions = InstallOptions {
+        instructions: false,
+        permissions: false,
+    };
+
+    #[test]
+    fn claude_permissions_are_added_once_kept_in_order_and_removed_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(".claude/settings.json");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(
+            &p,
+            r#"{"model": "opus", "permissions": {"deny": ["Bash(rm *)"], "allow": ["Bash(ls)", "mcp__memdag__get_work"]}, "env": {"A": "1"}}"#,
+        )
+        .unwrap();
+        assert_eq!(allow_worker_tools(&p).unwrap(), Change::Updated);
+        assert_eq!(allow_worker_tools(&p).unwrap(), Change::Unchanged);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["model", "permissions", "env"], "key order kept");
+        assert_eq!(
+            v["permissions"]["allow"],
+            serde_json::json!([
+                "Bash(ls)",
+                "mcp__memdag__get_work",
+                "mcp__memdag__submit_work"
+            ])
+        );
+
+        assert_eq!(remove_worker_tools(&p).unwrap(), Change::Removed);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(v["permissions"]["allow"], serde_json::json!(["Bash(ls)"]));
+        assert_eq!(v["permissions"]["deny"], serde_json::json!(["Bash(rm *)"]));
+        assert_eq!(remove_worker_tools(&p).unwrap(), Change::NotFound);
+    }
+
+    #[test]
+    fn a_settings_file_memdag_created_is_deleted_again_and_bad_json_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        assert_eq!(allow_worker_tools(&p).unwrap(), Change::Created);
+        assert_eq!(remove_worker_tools(&p).unwrap(), Change::Removed);
+        assert!(!p.exists());
+
+        let commented = "{ \"permissions\": { // comment\n } }";
+        std::fs::write(&p, commented).unwrap();
+        assert!(allow_worker_tools(&p).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            commented,
+            "left untouched"
+        );
+        std::fs::write(&p, r#"{"permissions": {"allow": "not a list"}}"#).unwrap();
+        assert!(allow_worker_tools(&p).is_err());
+    }
+
+    #[test]
+    fn install_refuses_up_front_when_settings_are_unparseable() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope = Scope::Project(dir.path().to_path_buf());
+        let settings = dir.path().join(".claude/settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(&settings, "not json").unwrap();
+        assert!(install(Harness::ClaudeCode, &scope, None, InstallOptions::default()).is_err());
+        assert!(
+            !dir.path().join(".claude/agents").exists(),
+            "nothing half-installed"
+        );
+        let opts = InstallOptions {
+            permissions: false,
+            ..InstallOptions::default()
+        };
+        let r = install(Harness::ClaudeCode, &scope, None, opts).unwrap();
+        assert!(r.permissions.is_none());
+    }
+
+    #[test]
+    fn install_and_uninstall_manage_claude_approvals() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope = Scope::Project(dir.path().to_path_buf());
+        let r = install(Harness::ClaudeCode, &scope, None, InstallOptions::default()).unwrap();
+        assert_eq!(r.permissions.unwrap().1, Change::Created);
+        let u = uninstall(Harness::ClaudeCode, &scope).unwrap();
+        assert_eq!(u.permissions.unwrap().1, Change::Removed);
+        assert!(!dir.path().join(".claude/settings.json").exists());
+    }
+
+    #[test]
+    fn opencode_worker_allows_only_its_two_tools() {
+        let text = Harness::Opencode.worker_file(None);
+        for a in ["memdag_get_work", "memdag_submit_work"] {
+            let rule = format!("  - action: {a}\n    resource: \"*\"\n    effect: allow\n");
+            assert!(text.contains(&rule), "{text}");
+        }
+        assert_eq!(text.matches("effect: allow").count(), 2);
+        assert_eq!(text.matches("effect: deny").count(), 2);
+    }
 
     #[test]
     fn block_is_added_refreshed_and_removed_without_touching_other_text() {
@@ -407,36 +663,50 @@ mod tests {
     fn worker_files_install_idempotently_and_never_clobber_user_agents() {
         let dir = tempfile::tempdir().unwrap();
         let scope = Scope::Project(dir.path().to_path_buf());
-        let r = install(Harness::ClaudeCode, &scope, None, true).unwrap();
+        let r = install(Harness::ClaudeCode, &scope, None, InstallOptions::default()).unwrap();
         assert_eq!(r.worker.1, Change::Created);
         let text = std::fs::read_to_string(&r.worker.0).unwrap();
         assert!(text.starts_with("---\nname: memdag-worker\n"));
         assert!(text.contains("\nmodel: haiku\n") && text.contains("mcp__memdag__submit_work"));
         assert_eq!(
-            install(Harness::ClaudeCode, &scope, None, true)
+            install(Harness::ClaudeCode, &scope, None, InstallOptions::default())
                 .unwrap()
                 .worker
                 .1,
             Change::Unchanged
         );
         assert_eq!(
-            install(Harness::ClaudeCode, &scope, Some("sonnet"), false)
+            install(Harness::ClaudeCode, &scope, Some("sonnet"), NO_EXTRAS)
                 .unwrap()
                 .worker
                 .1,
             Change::Updated
         );
 
-        assert!(install(Harness::ClaudeCode, &scope, Some("haiku\nevil: yes"), false).is_err());
-        assert!(install(Harness::ClaudeCode, &scope, Some("a: b"), false).is_err());
-        let oc = install(Harness::Opencode, &scope, Some("google/gemini-flash"), true).unwrap();
+        assert!(
+            install(
+                Harness::ClaudeCode,
+                &scope,
+                Some("haiku\nevil: yes"),
+                NO_EXTRAS
+            )
+            .is_err()
+        );
+        assert!(install(Harness::ClaudeCode, &scope, Some("a: b"), NO_EXTRAS).is_err());
+        let oc = install(
+            Harness::Opencode,
+            &scope,
+            Some("google/gemini-flash"),
+            InstallOptions::default(),
+        )
+        .unwrap();
         let text = std::fs::read_to_string(&oc.worker.0).unwrap();
         assert!(text.contains("mode: subagent\nmodel: google/gemini-flash\n"));
         assert!(dir.path().join("AGENTS.md").is_file());
 
         let mine = dir.path().join(".claude/agents/memdag-worker.md");
         std::fs::write(&mine, "---\nname: memdag-worker\n---\nmy own agent\n").unwrap();
-        assert!(install(Harness::ClaudeCode, &scope, None, false).is_err());
+        assert!(install(Harness::ClaudeCode, &scope, None, NO_EXTRAS).is_err());
         let u = uninstall(Harness::ClaudeCode, &scope).unwrap();
         assert_eq!(u.worker.1, Change::Kept);
         assert!(mine.exists());

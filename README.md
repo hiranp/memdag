@@ -408,6 +408,13 @@ memdag work install --client opencode --model <provider>/<haiku-or-flash-model> 
 # add --global for ~/.claude or ~/.config/opencode; `memdag work uninstall` removes only what memdag wrote
 ```
 
+The install also auto-approves the worker's two tools, `get_work` and `submit_work`, so a
+background worker isn't stopped for approval on every call. In Claude Code that means
+`mcp__memdag__get_work` and `mcp__memdag__submit_work` in `permissions.allow` of
+`.claude/settings.json`. In OpenCode it is two `allow` rules in the worker file itself; agent
+rules apply last, so they override an `ask` in your config for just those tools. Nothing else
+is approved: reads, edits and shell keep your own rules. Use `--no-permissions` to skip this.
+
 Then run `/mcp__memdag__expand_keywords` (Claude Code) or `/memdag:expand_keywords` (OpenCode),
 or just ask for memdag upkeep. The agent hands the task to `memdag-worker`, which calls
 `get_work` and `submit_work` itself, so your main model never reads the batch. The install also

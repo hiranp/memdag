@@ -416,9 +416,18 @@ fn run_work(
             global,
             model,
             no_instructions,
+            no_permissions,
         } => {
             let (harness, scope) = worker_target(client, global, repo)?;
-            let r = memdag::harness::install(harness, &scope, model.as_deref(), !no_instructions)?;
+            let r = memdag::harness::install(
+                harness,
+                &scope,
+                model.as_deref(),
+                memdag::harness::InstallOptions {
+                    instructions: !no_instructions,
+                    permissions: !no_permissions,
+                },
+            )?;
             print_harness_report(&r);
             if harness == memdag::harness::Harness::Opencode && model.is_none() {
                 eprintln!(
@@ -469,6 +478,13 @@ fn print_harness_report(r: &memdag::harness::InstallReport) {
     println!("{change:?}: {}", path.display());
     if let Some((path, change)) = &r.instructions {
         println!("{change:?}: {} (memdag block)", path.display());
+    }
+    if let Some((path, change)) = &r.permissions {
+        println!(
+            "{change:?}: {} (auto-approve {})",
+            path.display(),
+            memdag::harness::CLAUDE_ALLOW.join(", ")
+        );
     }
 }
 

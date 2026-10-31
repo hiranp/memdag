@@ -100,6 +100,12 @@ Option 3.
   terms per memory, and searches such as "lock contention" and "zlib backup" then found the
   intended memories. A `verify` batch correctly marked a 5 s → 8 s timeout change `outdated`
   with an accurate correction, and answered `unsure` where the code didn't settle the claim.
+- Approvals: the install auto-approves exactly `get_work` and `submit_work`, the worker's
+  only memdag tools. Without that, Claude Code asks before every call, which stalls a
+  background worker. Claude Code allow rules accept `mcp__<server>__<tool>`; an unanchored
+  glob like `mcp__*` is ignored. OpenCode V2 allows everything by default, but agent rules
+  apply last, so the worker file's `allow` rules also override a user's `ask` rule. A broad
+  `read` allow was deliberately left out, because it would override OpenCode's default `ask`
+  for `.env` files.
 - Not done yet: MCP sampling as a third path; worker files for Codex, Cursor and Gemini;
-  Claude Code `permissions.allow` for the worker's tools, without which each call may ask for
-  approval; consolidation of duplicate memories as a third task.
+  consolidation of duplicate memories as a third task.

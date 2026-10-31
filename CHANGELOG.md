@@ -46,7 +46,10 @@ Planned as 0.4.0 (new features and a schema bump, no breaking CLI/MCP changes). 
     (re-baseline), corrects them (a new memory supersedes the old one), or leaves them flagged.
   - `memdag work install --client claude-code|opencode [--global] [--model]` writes a
     `memdag-worker` subagent (Claude Code default `model: haiku`) and a `<!-- MEMDAG_START -->`
-    block in `CLAUDE.md`/`AGENTS.md`. Uninstall removes only what memdag wrote.
+    block in `CLAUDE.md`/`AGENTS.md`. It also auto-approves the worker's two tools
+    (Claude Code `permissions.allow` in `.claude/settings.json`; OpenCode `allow` rules in
+    the worker file), so a background worker doesn't stop for approval on every call.
+    `--no-permissions` skips this. Uninstall removes only what memdag wrote.
   - Worker output is treated as untrusted. It is secret-checked and length-capped. The
     requested task wins over the reply. A verdict applies only to an active memory that is
     stale right now, once per id. Corrections are tagged `worker-corrected` and carry the
