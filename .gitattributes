@@ -1,0 +1,4 @@
+# LF everywhere, including Windows checkouts: the memdag skill is embedded in the binary with
+# include_str!, and release builds on every platform must ship the same bytes.
+* text=auto eol=lf
+*.ps1 text eol=crlf

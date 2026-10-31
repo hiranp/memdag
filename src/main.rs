@@ -766,11 +766,12 @@ fn unstable_binary_reason(exe: &Path, path_dirs: &[PathBuf]) -> Option<&'static 
         return Some("not on PATH");
     }
 
-    let path_str = exe.to_string_lossy().to_lowercase();
+    // One separator, so Windows paths (C:\Users\me\Downloads\memdag.exe) match too.
+    let path_str = exe.to_string_lossy().to_lowercase().replace('\\', "/");
     let looks_ephemeral = [
         "/downloads/",
         "/tmp/",
-        "\\temp\\",
+        "/temp/",
         "/target/debug/",
         "/target/release/",
     ]
@@ -867,6 +868,16 @@ mod unstable_path_tests {
         assert_eq!(
             unstable_binary_reason(&exe, &[PathBuf::from("/usr/bin")]),
             Some("not on PATH")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_are_checked_too() {
+        let dir = PathBuf::from(r"C:\Users\me\Downloads");
+        assert_eq!(
+            unstable_binary_reason(&PathBuf::from(r"C:\Users\me\Downloads\memdag.exe"), &[dir]),
+            Some("a temp/build/downloads directory")
         );
     }
 
