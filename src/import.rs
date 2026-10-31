@@ -7,8 +7,9 @@
 
 use crate::models::{MemoryKind, RelationType};
 use crate::notes::{
-    RESOLVED_SUFFIX, is_valid_commit, is_valid_note_id, is_valid_repo_path, join_paths, join_tags,
-    parse_note, parse_resolution, resolution_suffix, split_front_matter, split_title,
+    RESOLVED_SUFFIX, is_valid_commit, is_valid_note_id, is_valid_recorded, is_valid_repo_path,
+    is_valid_session_id, join_paths, join_tags, parse_note, parse_resolution, resolution_suffix,
+    split_front_matter, split_title,
 };
 use crate::provenance::is_valid_fingerprint;
 use crate::store::MemoryStore;
@@ -223,6 +224,8 @@ struct Item {
     body: String,
     tags: Vec<String>,
     created_at: Option<String>,
+    /// Session that recorded the item (notes only); set on insert, never overwritten.
+    session_id: Option<String>,
     /// The source itself says it's superseded (e.g. an ADR's Status line).
     superseded: bool,
     /// A `<id>.resolved.md` sidecar says this note was resolved.
@@ -510,6 +513,7 @@ fn collect_git(
             body,
             tags,
             created_at: Some(f[1].trim().to_string()),
+            session_id: None,
             superseded: false,
             resolved: false,
             paths: Vec::new(),
@@ -588,6 +592,7 @@ fn parse_adr(num: &str, text: &str, batch: &mut Batch) {
         body,
         tags,
         created_at: adr_field(text, "Date").map(str::to_string),
+        session_id: None,
         superseded,
         resolved: false,
         paths: Vec::new(),
@@ -715,7 +720,8 @@ fn collect_notes(dir: &Path, batch: &mut Batch, report: &mut ImportReport) -> bo
             title: note.title,
             body: note.body,
             tags,
-            created_at: None,
+            created_at: note.recorded.filter(|r| is_valid_recorded(r)),
+            session_id: note.session.filter(|s| is_valid_session_id(s)),
             superseded: false,
             resolved: false,
             // Note files come from the repo, so re-validate before trusting them. Fingerprints
@@ -810,6 +816,7 @@ fn collect_gh(comments: Vec<GhComment>, batch: &mut Batch, report: &mut ImportRe
             body,
             tags,
             created_at: c.created_at,
+            session_id: None,
             superseded: false,
             resolved: false,
             paths: Vec::new(),
@@ -990,8 +997,8 @@ fn apply(
         };
         report.changed += tx.execute(
             r#"
-            INSERT INTO memories (id, kind, title, body, tags, status, created_at, updated_at, paths, commit_sha, fingerprints, source, origin_repo)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, COALESCE(datetime(?7), CURRENT_TIMESTAMP), CURRENT_TIMESTAMP, ?9, ?10, ?11, ?12, ?13)
+            INSERT INTO memories (id, kind, title, body, tags, status, created_at, updated_at, paths, commit_sha, fingerprints, source, origin_repo, session_id)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, COALESCE(datetime(?7), CURRENT_TIMESTAMP), CURRENT_TIMESTAMP, ?9, ?10, ?11, ?12, ?13, ?15)
             ON CONFLICT(id) DO UPDATE SET
                 kind = excluded.kind,
                 title = excluded.title,
@@ -1039,6 +1046,7 @@ fn apply(
                 item.source,
                 repo,
                 item.resolved,
+                item.session_id,
             ],
         )?;
         // This checkout's files contain the item's source.

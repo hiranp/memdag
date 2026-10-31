@@ -53,13 +53,16 @@ fn write_through_writes_contract_note_then_indexes_it() {
     let path = dir.join(format!("{}.md", mem.id));
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(text.starts_with(&format!("---\nid: {}\nkind: decision\n", mem.id)));
-    assert!(
-        text.contains("tags: [sqlite, wal, sync]\nsupersedes: \nrefs: []\n---\n# Use WAL mode\n")
-    );
+    assert!(text.contains(&format!(
+        "tags: [sqlite, wal, sync]\nsupersedes: \nrefs: []\nrecorded: {}\n---\n# Use WAL mode\n",
+        mem.created_at
+    )));
+    assert!(!text.contains("session:"), "no session id was given");
 
     // DB row equals what the file parses to.
     let note = parse_note(&text, "x").unwrap();
     assert_eq!(mem.title, note.title);
+    assert_eq!(note.recorded.as_deref(), Some(mem.created_at.as_str()));
     assert_eq!(mem.body, "Readers never block.");
     assert_eq!(mem.tags.as_deref(), Some("sqlite wal sync"));
 }

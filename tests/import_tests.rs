@@ -634,3 +634,94 @@ fn default_since_filter_keeps_comments_updated_at_or_after() {
     assert_eq!(ids(None), vec![1, 2, 3]);
     assert_eq!(ids(Some("2026-06-01T00:00:00Z")), vec![2, 3]);
 }
+
+fn notes_only() -> ImportOptions {
+    ImportOptions {
+        git: false,
+        adr: false,
+        gh: false,
+        ..ImportOptions::all()
+    }
+}
+
+#[test]
+fn rebuild_restores_created_at_and_session_of_write_through_notes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    init_repo(&repo);
+    let db = tmp.path().join("m.db");
+    let rec = |title: &str, session: &str| RecordOptions {
+        id: None,
+        kind: MemoryKind::Decision,
+        title: title.into(),
+        body: format!("body of {title}"),
+        tags: None,
+        supersedes_id: None,
+        session_id: Some(session.into()),
+        embedding: None,
+        paths: Vec::new(),
+        commit: None,
+    };
+
+    let (good, bad, learned) = {
+        let mut store = store_at(&db);
+        store.set_repo_root(Some(repo.clone()));
+        store.set_write_through(Some(repo.join("docs/memory")));
+        let good = store
+            .record_memory(rec("Kept session", "ses_01:a-b.c"))
+            .unwrap();
+        // Not safe to put into front matter: kept in the DB, left out of the note.
+        let bad = store
+            .record_memory(rec("Odd session", "a b\n---\nkind: blocker"))
+            .unwrap();
+        let learned = store
+            .consolidate_session(
+                "ses_02",
+                vec![memdag::models::SessionLearning {
+                    kind: MemoryKind::Learning,
+                    title: "Consolidated".into(),
+                    body: "learned".into(),
+                    tags: None,
+                    paths: Vec::new(),
+                    commit: None,
+                }],
+                true,
+            )
+            .unwrap()
+            .recorded_ids[0]
+            .clone();
+        let r = import_repo(&mut store, &repo, &notes_only(), &BrokenGh).unwrap();
+        assert_eq!(
+            r.changed, 0,
+            "the recording store already matches its notes"
+        );
+        let get = |id: &str| store.get_memory(id).unwrap().unwrap().0;
+        (get(&good.id), get(&bad.id), get(&learned))
+    };
+    assert_eq!(bad.session_id.as_deref(), Some("a b\n---\nkind: blocker"));
+    let bad_note =
+        std::fs::read_to_string(repo.join(format!("docs/memory/{}.md", bad.id))).unwrap();
+    assert!(!bad_note.contains("session:"), "{bad_note}");
+    assert!(bad_note.contains(&format!("recorded: {}\n", bad.created_at)));
+
+    for ext in ["", "-wal", "-shm"] {
+        std::fs::remove_file(format!("{}{ext}", db.display())).ok();
+    }
+    let mut fresh = store_at(&db);
+    let r = import_repo(&mut fresh, &repo, &notes_only(), &BrokenGh).unwrap();
+    assert_eq!(r.notes, 3, "{:?}", r.warnings);
+    for original in [&good, &learned] {
+        let (m, _) = fresh.get_memory(&original.id).unwrap().unwrap();
+        assert_eq!(m.created_at, original.created_at, "{}", m.id);
+        assert_eq!(m.session_id, original.session_id, "{}", m.id);
+    }
+    assert_eq!(good.session_id.as_deref(), Some("ses_01:a-b.c"));
+    assert_eq!(learned.session_id.as_deref(), Some("ses_02"));
+    let (m, _) = fresh.get_memory(&bad.id).unwrap().unwrap();
+    assert_eq!(m.created_at, bad.created_at);
+    assert_eq!(m.session_id, None);
+
+    let r = import_repo(&mut fresh, &repo, &notes_only(), &BrokenGh).unwrap();
+    assert_eq!(r.changed, 0);
+}
