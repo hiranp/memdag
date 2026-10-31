@@ -550,3 +550,34 @@ fn mcp_submit_accepts_results_sent_as_json_text() {
         "{out}"
     );
 }
+
+#[test]
+fn a_natural_phrase_finds_a_memory_that_contains_only_some_of_its_words() {
+    let mut store = MemoryStore::new(open_in_memory().unwrap());
+    let clock = store
+        .record_memory(opts(
+            MemoryKind::Invariant,
+            "Timestamps come from clock.now_utc()",
+            "Never call datetime.now(); naive local times broke the reports.",
+        ))
+        .unwrap();
+    let both = store
+        .record_memory(opts(
+            MemoryKind::Decision,
+            "Order timestamp column",
+            "orders store a timestamp",
+        ))
+        .unwrap();
+    store
+        .record_memory(opts(MemoryKind::Decision, "Unrelated", "nothing to see"))
+        .unwrap();
+    // The memory with every word ranks first; partial matches follow while there's room.
+    assert_eq!(hits(&store, "order timestamp")[0], both.id);
+    // A phrase with words the clock rule lacks still finds it, after the full match.
+    assert_eq!(
+        hits(&store, "order created_at timestamp"),
+        vec![both.id.clone(), clock.id.clone()]
+    );
+    // Filler words alone don't match everything.
+    assert!(hits(&store, "the and with").is_empty());
+}

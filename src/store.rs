@@ -713,11 +713,11 @@ impl MemoryStore {
         } else if let Some(emb) = query_embedding {
             // Over-fetch each channel so fusion has room to reorder.
             let pool = (limit * 3).min(300);
-            let bm25 = self.bm25_hits(&fts_query, &opts, pool)?;
+            let bm25 = self.lexical_hits(&opts, pool)?;
             let vector = self.vector_hits(&emb, &opts, pool)?;
             fuse_ranked(bm25, vector, limit)
         } else {
-            self.bm25_hits(&fts_query, &opts, limit)?
+            self.lexical_hits(&opts, limit)?
         };
 
         // ponytail: one relations query per hit (<=100). Single JOIN if that ever shows up in a profile.
@@ -742,6 +742,26 @@ impl MemoryStore {
                 None
             }
         }
+    }
+
+    /// Keyword hits in two tiers: memories containing every query word first, then, while
+    /// there's room, memories containing any of them, by BM25. Agents search with natural
+    /// phrases ("order created_at timestamp"), and requiring every word made those find
+    /// nothing at all whenever one word wasn't in the memory.
+    fn lexical_hits(&self, opts: &SearchOptions, limit: usize) -> Result<Vec<(Memory, f64)>> {
+        let mut hits = self.bm25_hits(&sanitize_fts5_query(&opts.query), opts, limit)?;
+        let any = sanitize_fts5_any(&opts.query);
+        if hits.len() < limit && !any.is_empty() {
+            let seen: std::collections::HashSet<String> =
+                hits.iter().map(|(m, _)| m.id.clone()).collect();
+            hits.extend(
+                self.bm25_hits(&any, opts, limit)?
+                    .into_iter()
+                    .filter(|(m, _)| !seen.contains(&m.id))
+                    .take(limit - hits.len()),
+            );
+        }
+        Ok(hits)
     }
 
     fn bm25_hits(
@@ -1888,6 +1908,29 @@ fn fuse_ranked(
 /// Rough token estimate (about 4 characters per token); no tokenizer dependency.
 pub fn estimate_tokens(text: &str) -> usize {
     text.chars().count().div_ceil(4)
+}
+
+/// Words too common to signal anything on their own in an any-word search.
+const STOPWORDS: &[&str] = &[
+    "the", "and", "for", "with", "from", "that", "this", "into", "when", "what", "how", "why",
+    "are", "was", "not", "but", "use", "add", "new", "should", "must", "make", "all", "any",
+];
+
+/// An any-word FTS5 query (terms joined with OR): words of three or more characters that
+/// aren't [`STOPWORDS`]. Empty when no word qualifies.
+pub fn sanitize_fts5_any(input: &str) -> String {
+    let mut terms: Vec<String> = Vec::new();
+    for word in input.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-')) {
+        let w = word.trim_matches('-').to_lowercase();
+        if w.chars().count() >= 3 && !STOPWORDS.contains(&w.as_str()) && !terms.contains(&w) {
+            terms.push(w);
+        }
+    }
+    terms
+        .iter()
+        .map(|t| format!("\"{t}\"*"))
+        .collect::<Vec<_>>()
+        .join(" OR ")
 }
 
 /// Sanitize search string into valid FTS5 tokens
