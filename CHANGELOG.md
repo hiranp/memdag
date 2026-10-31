@@ -7,6 +7,8 @@ versions follow [Semantic Versioning](https://semver.org/). Releases are cut wit
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-31
+
 ### Added
 
 - **Static Linux binaries.** Releases include `x86_64-unknown-linux-musl` and
