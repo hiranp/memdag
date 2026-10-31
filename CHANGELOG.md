@@ -105,9 +105,11 @@ Upgrading, in short:
 
 ### Changed
 
-- `memdag mcp install` writes OpenCode's V2 server shape (`mcp.servers.memdag`, with
-  `codemode: false` so the tools stay native) and migrates a V1 entry; `--opencode-v1` (on
-  `memdag install`) keeps V1. `mcp install --client` accepts every install target.
+- `memdag mcp install` writes OpenCode's V2 server shape for a new entry
+  (`mcp.servers.memdag`, with `codemode: false` so the tools stay native) and keeps an existing
+  entry's shape; `memdag install --opencode-format v2|v1` chooses explicitly.
+  `mcp install --client` accepts every install target. Re-running an install keeps what the
+  user added to the server entry (other env vars, a pinned `MEMDAG_DB`, timeouts, flags).
 - **Schema v6** adds `reviewed_pairs` for the `consolidate` task.
 - **Schema v5** adds `memory_owners` (worktree ownership of imported rows).
 - **Schema v4** adds `memories.keywords` and rebuilds the FTS index with a `keywords` column.

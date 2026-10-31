@@ -61,9 +61,10 @@ pub enum Commands {
         /// Also add a Claude Code SessionStart hook that mentions waiting upkeep
         #[arg(long)]
         hooks: bool,
-        /// OpenCode: write the V1 server shape (mcp.memdag) instead of V2 (mcp.servers.memdag)
-        #[arg(long)]
-        opencode_v1: bool,
+        /// OpenCode server shape: auto keeps an existing entry's shape (V2 for a new one), v2
+        /// migrates a V1 entry, v1 writes the shape OpenCode V1 can read
+        #[arg(long, value_enum, default_value = "auto")]
+        opencode_format: OpencodeFormatArg,
     },
 
     /// Remove everything `memdag install` wrote (only memdag's own files, blocks and keys)
@@ -422,4 +423,21 @@ pub enum WorkAction {
         #[arg(long, default_value_t = memdag::work::DEFAULT_ROUNDS)]
         rounds: usize,
     },
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpencodeFormatArg {
+    Auto,
+    V1,
+    V2,
+}
+
+impl From<OpencodeFormatArg> for memdag::install::OpencodeFormat {
+    fn from(a: OpencodeFormatArg) -> Self {
+        match a {
+            OpencodeFormatArg::Auto => Self::Auto,
+            OpencodeFormatArg::V1 => Self::V1,
+            OpencodeFormatArg::V2 => Self::V2,
+        }
+    }
 }

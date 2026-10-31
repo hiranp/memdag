@@ -268,11 +268,13 @@ struct Checkout {
 
 impl Checkout {
     fn of(repo: &Path) -> Self {
+        let worktree = crate::checkout::worktree_key(repo);
+        let listed = crate::checkout::worktree_keys(repo);
         Self {
             repo: crate::checkout::repository_key(repo),
-            worktree: crate::checkout::worktree_key(repo),
-            worktrees: crate::checkout::worktree_keys(repo),
-            known: crate::checkout::common_dir(repo).is_some(),
+            known: listed.is_some(),
+            worktrees: listed.unwrap_or_else(|| vec![worktree.clone()]),
+            worktree,
         }
     }
 
@@ -791,10 +793,23 @@ fn apply(
     checkout: &Checkout,
 ) -> Result<()> {
     let repo = checkout.repo.as_str();
+
     let tx = store
         .connection_mut()
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .context("Failed to begin import transaction")?;
+
+    // Before schema v5, `origin_repo` held the importing checkout's path. Move such rows to the
+    // repository key, or the pruning below (which matches the repository) would never reach
+    // one whose source was deleted before the upgrade.
+    for w in &checkout.worktrees {
+        if w != repo {
+            tx.execute(
+                "UPDATE memories SET origin_repo = ?1 WHERE origin_repo = ?2 AND source IS NOT NULL",
+                params![repo, w],
+            )?;
+        }
+    }
 
     // Ids whose import was refused; edges that start from them are dropped too, or a
     // refused item could still rewrite the graph through its `supersedes:` line.

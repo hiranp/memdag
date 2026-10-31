@@ -30,7 +30,7 @@ fn main() -> anyhow::Result<()> {
             no_skill,
             no_permissions,
             hooks,
-            opencode_v1,
+            opencode_format,
         }) => {
             let parts = memdag::install::Parts {
                 mcp: !no_mcp,
@@ -40,7 +40,12 @@ fn main() -> anyhow::Result<()> {
                 permissions: !no_permissions,
                 hooks: *hooks,
             };
-            let opts = install_options(parts, model.clone(), args.db.clone(), *opencode_v1)?;
+            let opts = install_options(
+                parts,
+                model.clone(),
+                args.db.clone(),
+                (*opencode_format).into(),
+            )?;
             return run_install(target, *global, *refresh, *print_config, &opts);
         }
         Some(Commands::Uninstall { target, global }) => {
@@ -493,7 +498,7 @@ fn run_work(
                 permissions: !no_permissions,
                 ..memdag::install::Parts::NONE
             };
-            let opts = install_options(parts, model, None, false)?;
+            let opts = install_options(parts, model, None, memdag::install::OpencodeFormat::Auto)?;
             let env = install_env(repo)?;
             let steps = memdag::install::install(client.target(), &env, location(global), &opts)?;
             print_steps(client.target(), &steps);
@@ -579,35 +584,39 @@ fn install_options(
     parts: memdag::install::Parts,
     model: Option<String>,
     db: Option<PathBuf>,
-    opencode_v1: bool,
+    opencode: memdag::install::OpencodeFormat,
 ) -> anyhow::Result<memdag::install::Options> {
-    let exe = std::env::current_exe()?;
-    let exe = exe.canonicalize().unwrap_or(exe);
+    let current = std::env::current_exe()?;
+    // Write the path PATH finds (e.g. ~/.local/bin/memdag), not wherever a symlink resolves
+    // to: a versioned install dir or build output can vanish on upgrade. Canonical paths are
+    // only compared, never written (on Windows they carry a \\?\ prefix).
+    let on_path = path_hit(&current);
+    let exe = on_path.clone().unwrap_or(current);
     warn_if_unstable_binary_path(&exe);
     Ok(memdag::install::Options {
         parts,
         model,
-        on_path: resolves_on_path(&exe),
+        on_path: on_path.is_some(),
         exe,
         db,
-        opencode_v1,
+        opencode,
     })
 }
 
-/// Whether running plain `memdag` would start this very binary.
-fn resolves_on_path(exe: &Path) -> bool {
+/// The `PATH` entry that plain `memdag` resolves to, if it is this very binary.
+fn path_hit(exe: &Path) -> Option<PathBuf> {
     let name = if cfg!(windows) {
         "memdag.exe"
     } else {
         "memdag"
     };
-    std::env::var_os("PATH").is_some_and(|path| {
-        std::env::split_paths(&path)
-            .map(|d| d.join(name))
-            .find(|c| c.is_file())
-            .and_then(|c| c.canonicalize().ok())
-            .is_some_and(|c| c == exe)
-    })
+    let canon = |p: &Path| p.canonicalize().ok();
+    let me = canon(exe)?;
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|d| d.join(name))
+        .find(|c| c.is_file())
+        .filter(|c| canon(c).as_ref() == Some(&me))
 }
 
 fn print_steps(t: memdag::install::Target, steps: &[memdag::install::Step]) {
@@ -633,10 +642,10 @@ fn run_install(
     print_config: bool,
     opts: &memdag::install::Options,
 ) -> anyhow::Result<()> {
-    use memdag::install::{self, Target};
+    use memdag::install::{self, Parts, Target};
     let env = install_env(None)?;
     let loc = location(global);
-    let mut targets = install::parse_targets(spec, &env)?;
+    let mut targets = install::parse_targets(spec, &env, loc)?;
     if refresh {
         let base = if spec == "auto" {
             Target::ALL.to_vec()
@@ -645,24 +654,45 @@ fn run_install(
         };
         targets = base
             .into_iter()
-            .filter(|t| install::is_configured(*t, &env, loc))
+            .filter(|t| install::is_installed(*t, &env, loc))
             .collect();
     }
     if targets.is_empty() {
-        anyhow::bail!(
-            "No harness {} (pass --target, e.g. --target claude-code,opencode)",
-            if refresh {
-                "has a memdag entry to refresh"
-            } else {
-                "detected"
-            }
-        );
+        let hint = match (refresh, loc) {
+            (true, _) => "has memdag installed to refresh".to_string(),
+            (false, memdag::install::Location::Project) => format!(
+                "uses this project yet ({}); pass --target (e.g. --target claude-code,opencode) or --global",
+                env.project.display()
+            ),
+            (false, memdag::install::Location::Global) => "is installed for this user".to_string(),
+        };
+        anyhow::bail!("No harness {hint}");
     }
     for t in targets {
-        if print_config {
-            println!("{}", install::print_config(t, &env, loc, opts)?);
+        // A refresh rewrites only what is already there, so it never adds files the user
+        // didn't ask for (e.g. to a harness that had only an MCP entry).
+        let opts = if refresh {
+            let have = install::installed_parts(t, &env, loc);
+            let want = opts.parts;
+            let parts = Parts {
+                mcp: have.mcp && want.mcp,
+                worker: have.worker && want.worker,
+                instructions: have.instructions && want.instructions,
+                skill: have.skill && want.skill,
+                permissions: have.permissions && want.permissions,
+                hooks: have.hooks,
+            };
+            install::Options {
+                parts,
+                ..opts.clone()
+            }
         } else {
-            print_steps(t, &install::install(t, &env, loc, opts)?);
+            opts.clone()
+        };
+        if print_config {
+            println!("{}", install::print_config(t, &env, loc, &opts)?);
+        } else {
+            print_steps(t, &install::install(t, &env, loc, &opts)?);
         }
     }
     Ok(())
@@ -672,12 +702,12 @@ fn run_uninstall(spec: &str, global: bool, parts: memdag::install::Parts) -> any
     use memdag::install::{self, Target};
     let env = install_env(None)?;
     let loc = location(global);
-    let targets = install::parse_targets(spec, &env)?;
+    let targets = install::parse_targets(spec, &env, loc)?;
     // Shared files (one AGENTS.md, one .agents/skills/memdag) stay while a harness that
-    // isn't being uninstalled still has memdag configured.
+    // isn't being uninstalled still has memdag installed.
     let remaining: Vec<Target> = Target::ALL
         .into_iter()
-        .filter(|t| !targets.contains(t) && install::is_configured(*t, &env, loc))
+        .filter(|t| !targets.contains(t) && install::is_installed(*t, &env, loc))
         .collect();
     for t in targets {
         print_steps(t, &install::uninstall(t, &env, loc, parts, &remaining)?);
@@ -765,7 +795,12 @@ fn handle_mcp_action(action: &McpAction, cli_db: Option<PathBuf>) -> anyhow::Res
             client,
             key,
         } => {
-            let opts = install_options(mcp_only, None, cli_db, false)?;
+            let opts = install_options(
+                mcp_only,
+                None,
+                cli_db,
+                memdag::install::OpencodeFormat::Auto,
+            )?;
             let t = client.target();
             let env = install_env(None)?;
             match (path, key) {

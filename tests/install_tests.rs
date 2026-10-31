@@ -2,8 +2,8 @@
 
 use memdag::harness::Change;
 use memdag::install::{
-    Env, Location, Options, Parts, SKILL_MD, Target, detect, install, is_configured, print_config,
-    uninstall,
+    Env, Location, OpencodeFormat, Options, Parts, SKILL_MD, Target, detect, install,
+    installed_parts, is_configured, print_config, uninstall,
 };
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -22,7 +22,7 @@ fn opts(parts: Parts) -> Options {
         exe: PathBuf::from("/opt/memdag/bin/memdag"),
         on_path: false,
         db: None,
-        opencode_v1: false,
+        opencode: OpencodeFormat::Auto,
     }
 }
 
@@ -128,7 +128,7 @@ fn opencode_jsonc_keeps_comments_and_other_servers_and_gets_the_v2_shape() {
 }
 
 #[test]
-fn an_opencode_v1_entry_is_migrated_and_v1_can_still_be_chosen() {
+fn an_opencode_v1_entry_is_kept_by_default_and_migrated_on_request() {
     let tmp = tempfile::tempdir().unwrap();
     let e = env(&tmp);
     let cfg = e.project.join("opencode.json");
@@ -137,16 +137,21 @@ fn an_opencode_v1_entry_is_migrated_and_v1_can_still_be_chosen() {
         r#"{"mcp": {"memdag": {"type": "local", "command": ["old", "serve"], "enabled": true}}}"#,
     )
     .unwrap();
-    let steps = install(
-        Target::Opencode,
-        &e,
-        Location::Project,
-        &opts(Parts {
-            mcp: true,
-            ..Parts::NONE
-        }),
-    )
-    .unwrap();
+    // A working V1 setup stays V1: OpenCode V1 can't read the V2 shape.
+    let mcp_only = opts(Parts {
+        mcp: true,
+        ..Parts::NONE
+    });
+    install(Target::Opencode, &e, Location::Project, &mcp_only).unwrap();
+    let v = read_json(&cfg);
+    assert_eq!(v["mcp"]["memdag"]["command"][0], "/opt/memdag/bin/memdag");
+    assert!(v["mcp"].get("servers").is_none());
+
+    let v2 = Options {
+        opencode: OpencodeFormat::V2,
+        ..mcp_only.clone()
+    };
+    let steps = install(Target::Opencode, &e, Location::Project, &v2).unwrap();
     assert!(
         steps
             .iter()
@@ -157,7 +162,7 @@ fn an_opencode_v1_entry_is_migrated_and_v1_can_still_be_chosen() {
     assert!(v["mcp"]["servers"]["memdag"].is_object());
 
     let v1 = Options {
-        opencode_v1: true,
+        opencode: OpencodeFormat::V1,
         ..opts(Parts {
             mcp: true,
             ..Parts::NONE
@@ -417,11 +422,20 @@ fn print_config_writes_nothing() {
 fn detection_follows_each_harness_config_dir() {
     let tmp = tempfile::tempdir().unwrap();
     let e = env(&tmp);
-    assert!(Target::ALL.iter().all(|t| !detect(*t, &e)));
+    let found = |loc| -> Vec<Target> {
+        Target::ALL
+            .into_iter()
+            .filter(|t| detect(*t, &e, loc))
+            .collect()
+    };
+    assert!(found(Location::Project).is_empty() && found(Location::Global).is_empty());
     std::fs::create_dir_all(e.home.join(".cursor")).unwrap();
     std::fs::create_dir_all(e.project.join(".kiro")).unwrap();
-    let found: Vec<Target> = Target::ALL.into_iter().filter(|t| detect(*t, &e)).collect();
-    assert_eq!(found, vec![Target::Cursor, Target::Kiro]);
+    std::fs::create_dir_all(e.project.join(".vscode")).unwrap();
+    // A harness installed on the machine is no reason to write into the project, and a bare
+    // .vscode/ doesn't mean Copilot's MCP support is in use.
+    assert_eq!(found(Location::Project), vec![Target::Kiro]);
+    assert_eq!(found(Location::Global), vec![Target::Cursor]);
 }
 
 #[test]
@@ -446,7 +460,7 @@ fn the_session_hook_is_added_once_and_removed_with_its_settings() {
     assert_eq!(groups.len(), 2);
     assert_eq!(
         groups[1]["hooks"][0]["command"],
-        "/opt/memdag/bin/memdag hook session-start"
+        "'/opt/memdag/bin/memdag' hook session-start"
     );
 
     uninstall(Target::ClaudeCode, &e, Location::Project, Parts::ALL, &[]).unwrap();
@@ -474,4 +488,268 @@ fn the_installed_skill_is_the_shipped_one() {
     let skill = std::fs::read_to_string(e.home.join(".agents/skills/memdag/SKILL.md")).unwrap();
     assert_eq!(skill, SKILL_MD);
     assert!(skill.starts_with("---\nname: memdag\n"));
+}
+
+// ------------------------------------------------------------- review regressions
+
+#[test]
+fn reinstalling_keeps_what_the_user_added_to_the_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let e = env(&tmp);
+    let mcp = e.project.join(".mcp.json");
+    std::fs::write(
+        &mcp,
+        r#"{"mcpServers": {"memdag": {"command": "old", "args": ["serve"],
+            "env": {"MEMDAG_DB": "/pinned.db", "FOO": "1"}, "timeout": 30}}}"#,
+    )
+    .unwrap();
+    install(
+        Target::ClaudeCode,
+        &e,
+        Location::Project,
+        &opts(Parts {
+            mcp: true,
+            ..Parts::NONE
+        }),
+    )
+    .unwrap();
+    let v = read_json(&mcp)["mcpServers"]["memdag"].clone();
+    assert_eq!(
+        v["command"], "/opt/memdag/bin/memdag",
+        "memdag's own key updated"
+    );
+    assert_eq!(
+        v["env"]["MEMDAG_DB"], "/pinned.db",
+        "a pinned database survives"
+    );
+    assert_eq!(v["env"]["FOO"], "1");
+    assert_eq!(v["timeout"], 30);
+
+    let codex = e.codex_home.join("config.toml");
+    std::fs::create_dir_all(codex.parent().unwrap()).unwrap();
+    std::fs::write(
+        &codex,
+        "[mcp_servers.memdag]\ncommand = \"old\"\nstartup_timeout_sec = 20 # mine\n\n[mcp_servers.memdag.env]\nFOO = \"1\"\n",
+    )
+    .unwrap();
+    let with_db = Options {
+        db: Some(PathBuf::from("/data/m.db")),
+        ..opts(Parts {
+            mcp: true,
+            ..Parts::NONE
+        })
+    };
+    install(Target::Codex, &e, Location::Global, &with_db).unwrap();
+    let text = std::fs::read_to_string(&codex).unwrap();
+    assert!(text.contains("startup_timeout_sec = 20 # mine"), "{text}");
+    let doc: toml_edit::DocumentMut = text.parse().unwrap();
+    assert_eq!(
+        doc["mcp_servers"]["memdag"]["env"]["FOO"].as_str(),
+        Some("1")
+    );
+    assert_eq!(
+        doc["mcp_servers"]["memdag"]["env"]["MEMDAG_DB"].as_str(),
+        Some("/data/m.db")
+    );
+    assert_eq!(
+        doc["mcp_servers"]["memdag"]["command"].as_str(),
+        Some("/opt/memdag/bin/memdag")
+    );
+
+    // Flags the user flipped stay flipped.
+    let oc = e.project.join("opencode.json");
+    std::fs::write(&oc, r#"{"mcp": {"servers": {"memdag": {"type": "local", "command": ["x"], "codemode": true, "disabled": true}}}}"#).unwrap();
+    install(
+        Target::Opencode,
+        &e,
+        Location::Project,
+        &opts(Parts {
+            mcp: true,
+            ..Parts::NONE
+        }),
+    )
+    .unwrap();
+    let v = read_json(&oc)["mcp"]["servers"]["memdag"].clone();
+    assert_eq!(
+        (v["codemode"].clone(), v["disabled"].clone()),
+        (Value::Bool(true), Value::Bool(true))
+    );
+}
+
+#[test]
+fn hooks_sharing_a_group_with_memdags_are_kept() {
+    let tmp = tempfile::tempdir().unwrap();
+    let e = env(&tmp);
+    let settings = e.project.join(".claude/settings.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(
+        &settings,
+        r#"{"hooks": {"SessionStart": [{"hooks": [
+            {"type": "command", "command": "mine"},
+            {"type": "command", "command": "/old/memdag hook session-start"}]}]}}"#,
+    )
+    .unwrap();
+    let o = opts(Parts {
+        hooks: true,
+        ..Parts::NONE
+    });
+    install(Target::ClaudeCode, &e, Location::Project, &o).unwrap();
+    let v = read_json(&settings);
+    let all: Vec<String> = v["hooks"]["SessionStart"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|g| g["hooks"].as_array().unwrap().clone())
+        .map(|h| h["command"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(all, ["mine", "'/opt/memdag/bin/memdag' hook session-start"]);
+    uninstall(Target::ClaudeCode, &e, Location::Project, Parts::ALL, &[]).unwrap();
+    let v = read_json(&settings);
+    assert_eq!(
+        v["hooks"]["SessionStart"][0]["hooks"],
+        serde_json::json!([{"type": "command", "command": "mine"}])
+    );
+}
+
+#[test]
+fn the_hook_command_survives_a_shell() {
+    let tmp = tempfile::tempdir().unwrap();
+    let e = env(&tmp);
+    let o = Options {
+        exe: PathBuf::from("/Users/Jane Doe/bin/it's/memdag"),
+        ..opts(Parts {
+            hooks: true,
+            ..Parts::NONE
+        })
+    };
+    install(Target::ClaudeCode, &e, Location::Project, &o).unwrap();
+    let v = read_json(&e.project.join(".claude/settings.json"));
+    let cmd = v["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    #[cfg(unix)]
+    {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("set -- {cmd}; printf '%s|' \"$@\""))
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "/Users/Jane Doe/bin/it's/memdag|hook|session-start|"
+        );
+    }
+    let _ = cmd;
+}
+
+#[test]
+fn a_reinstall_keeps_the_worker_model_unless_told_otherwise() {
+    let tmp = tempfile::tempdir().unwrap();
+    let e = env(&tmp);
+    let worker = |o: &Options| {
+        install(Target::Gemini, &e, Location::Project, o).unwrap();
+        std::fs::read_to_string(e.project.join(".gemini/agents/memdag-worker.md")).unwrap()
+    };
+    let pinned = Options {
+        model: Some("flash-1".into()),
+        ..opts(Parts {
+            worker: true,
+            ..Parts::NONE
+        })
+    };
+    assert!(worker(&pinned).contains("model: flash-1"));
+    assert!(
+        worker(&opts(Parts {
+            worker: true,
+            ..Parts::NONE
+        }))
+        .contains("model: flash-1")
+    );
+    let other = Options {
+        model: Some("flash-2".into()),
+        ..opts(Parts {
+            worker: true,
+            ..Parts::NONE
+        })
+    };
+    assert!(worker(&other).contains("model: flash-2"));
+}
+
+#[test]
+fn installed_parts_reports_what_is_there_so_refresh_adds_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let e = env(&tmp);
+    install(
+        Target::Cursor,
+        &e,
+        Location::Project,
+        &opts(Parts {
+            mcp: true,
+            ..Parts::NONE
+        }),
+    )
+    .unwrap();
+    let have = installed_parts(Target::Cursor, &e, Location::Project);
+    assert_eq!(
+        have,
+        Parts {
+            mcp: true,
+            ..Parts::NONE
+        }
+    );
+    install(Target::ClaudeCode, &e, Location::Project, &opts(Parts::ALL)).unwrap();
+    assert_eq!(
+        installed_parts(Target::ClaudeCode, &e, Location::Project),
+        Parts::ALL
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_claude_md_counts_as_the_shared_agents_md() {
+    let tmp = tempfile::tempdir().unwrap();
+    let e = env(&tmp);
+    std::fs::write(e.project.join("AGENTS.md"), "# Agents\n").unwrap();
+    std::os::unix::fs::symlink("AGENTS.md", e.project.join("CLAUDE.md")).unwrap();
+    let o = opts(Parts::DEFAULT);
+    install(Target::Codex, &e, Location::Project, &o).unwrap();
+    install(Target::ClaudeCode, &e, Location::Project, &o).unwrap();
+    uninstall(
+        Target::ClaudeCode,
+        &e,
+        Location::Project,
+        Parts::ALL,
+        &[Target::Codex],
+    )
+    .unwrap();
+    let text = std::fs::read_to_string(e.project.join("AGENTS.md")).unwrap();
+    assert!(
+        text.contains("MEMDAG_START"),
+        "Codex still needs it: {text}"
+    );
+}
+
+#[test]
+fn a_harness_with_only_a_worker_still_protects_shared_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let e = env(&tmp);
+    let no_mcp = opts(Parts {
+        mcp: false,
+        ..Parts::DEFAULT
+    });
+    install(Target::Codex, &e, Location::Project, &no_mcp).unwrap();
+    install(
+        Target::Opencode,
+        &e,
+        Location::Project,
+        &opts(Parts::DEFAULT),
+    )
+    .unwrap();
+    assert!(memdag::install::is_installed(
+        Target::Codex,
+        &e,
+        Location::Project
+    ));
+    assert!(!is_configured(Target::Codex, &e, Location::Project));
 }

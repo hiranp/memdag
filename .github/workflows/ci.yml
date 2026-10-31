@@ -7,7 +7,9 @@ name: CI
 #    of it).
 # 2. `concurrency`: a newer push to the same PR cancels the older run. Runs on main are never
 #    cancelled, because main warms the cache.
-# 3. `paths-ignore`: a docs-only change builds nothing.
+# 3. `paths-ignore`: a docs-only change builds nothing. (If you make these checks required in
+#    branch protection, a docs-only PR would wait for them forever; add a path filter job
+#    that always reports instead.)
 # 4. Only main saves the cache. PRs restore it but never upload, so a PR can't evict main's
 #    entry.
 # 5. CARGO_INCREMENTAL=0 and line-tables-only debug info: CI never reuses an incremental

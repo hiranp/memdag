@@ -445,22 +445,47 @@ const MERGE_COLS: &str = "id, kind, title, body, tags, status, session_id, creat
 /// The old file is claimed by renaming it first, so two processes starting at the same time
 /// can't both merge it.
 pub fn merge_legacy_db(shared: &Connection, legacy: &Path) -> Result<usize> {
-    // Bring the old database to the current schema and flush its WAL into the main file, so
-    // renaming the file alone moves everything.
+    // Bring the old database to the current schema and flush its WAL into the main file. A
+    // busy checkpoint means another process (e.g. a memdag 0.3 server still running in that
+    // worktree) is using it; merging now could miss its latest writes, so wait for a later
+    // start instead.
     {
         let old = open_connection(legacy)?;
-        old.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        let (busy, log, done): (i64, i64, i64) =
+            old.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+        if busy != 0 || log != done {
+            anyhow::bail!(
+                "{} is in use by another process (stop old memdag servers in that worktree); will retry",
+                legacy.display()
+            );
+        }
     }
     let name = legacy
         .file_name()
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned();
-    let claimed = legacy.with_file_name(format!("{name}.merging-{}", std::process::id()));
+    let claimed = legacy.with_file_name(format!("{name}{MERGING}{}", std::process::id()));
     std::fs::rename(legacy, &claimed)
         .with_context(|| format!("claiming {} for merging", legacy.display()))?;
+    // The WAL and shared-memory files move with it (never deleted: if anything was still
+    // writing, its data stays with the old database).
+    let claimed_name = claimed
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
     for suffix in ["-wal", "-shm"] {
-        std::fs::remove_file(legacy.with_file_name(format!("{name}{suffix}"))).ok();
+        let from = legacy.with_file_name(format!("{name}{suffix}"));
+        if from.exists() {
+            std::fs::rename(
+                &from,
+                claimed.with_file_name(format!("{claimed_name}{suffix}")),
+            )
+            .ok();
+        }
     }
 
     let merged = (|| -> Result<usize> {
@@ -501,15 +526,12 @@ pub fn merge_legacy_db(shared: &Connection, legacy: &Path) -> Result<usize> {
         copy
     })();
 
-    match &merged {
-        Ok(_) => {
-            std::fs::rename(&claimed, legacy.with_file_name(format!("{name}.merged"))).ok();
-        }
+    let target = match &merged {
+        Ok(_) => legacy.with_file_name(format!("{name}.merged")),
         // Put it back so the next start retries.
-        Err(_) => {
-            std::fs::rename(&claimed, legacy).ok();
-        }
-    }
+        Err(_) => legacy.to_path_buf(),
+    };
+    move_with_sidecars(&claimed, &target);
     merged
 }
 
@@ -604,20 +626,59 @@ pub fn default_db_path() -> PathBuf {
 /// for the nearest directory that has a `.memdag/` of its own.
 pub fn project_db_path(start: &Path) -> Option<PathBuf> {
     let root = find_project_root(start)?;
-    if root.join(".git").exists()
-        && let Some(shared) = crate::checkout::shared_db_path(&root)
-    {
+    if let Some(shared) = crate::checkout::shared_db_path(&root) {
         return Some(shared);
     }
+    let root = root.canonicalize().unwrap_or(root);
     Some(root.join(".memdag").join("memdag.db"))
 }
 
+/// Infix of a database file claimed for merging (`memdag.db.merging-<pid>`).
+const MERGING: &str = ".merging-";
+
+/// Rename a database file together with its `-wal` / `-shm` files.
+fn move_with_sidecars(from: &Path, to: &Path) {
+    let (Some(f), Some(t)) = (from.file_name(), to.file_name()) else {
+        return;
+    };
+    let (f, t) = (f.to_string_lossy(), t.to_string_lossy());
+    for suffix in ["-wal", "-shm"] {
+        let side = from.with_file_name(format!("{f}{suffix}"));
+        if side.exists() {
+            std::fs::rename(&side, to.with_file_name(format!("{t}{suffix}"))).ok();
+        }
+    }
+    std::fs::rename(from, to).ok();
+}
+
 /// A database that a linked worktree used before worktrees shared one (memdag ≤ 0.3 kept a
-/// database per checkout), if it still needs merging into `shared`.
+/// database per checkout), if it still needs merging into `shared`. A merge that a crashed
+/// process left half done (a `memdag.db.merging-<pid>` file older than a minute) is put back
+/// so it is retried.
 pub fn legacy_worktree_db(start: &Path, shared: &Path) -> Option<PathBuf> {
     let root = find_project_root(start)?;
-    let old = root.join(".memdag").join("memdag.db");
-    (crate::checkout::is_linked_worktree(&root) && old.is_file() && old != shared).then_some(old)
+    if !crate::checkout::is_linked_worktree(&root) {
+        return None;
+    }
+    let dir = root.join(".memdag");
+    let old = dir.join("memdag.db");
+    if !old.exists()
+        && let Ok(entries) = std::fs::read_dir(&dir)
+    {
+        let stranded = entries.flatten().map(|e| e.path()).find(|p| {
+            let name = p.file_name().unwrap_or_default().to_string_lossy();
+            name.starts_with(&format!("memdag.db{MERGING}"))
+                && !name.ends_with("-wal")
+                && !name.ends_with("-shm")
+                && std::fs::metadata(p)
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|t| t.elapsed().unwrap_or_default().as_secs() > 60)
+        });
+        if let Some(p) = stranded {
+            move_with_sidecars(&p, &old);
+        }
+    }
+    (old.is_file() && old != shared).then_some(old)
 }
 
 // ponytail: walk up for a repo root (existing .memdag/ wins over .git so nested

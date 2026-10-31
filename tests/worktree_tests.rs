@@ -255,3 +255,32 @@ fn an_old_per_worktree_database_is_merged_once() {
         "merged once"
     );
 }
+
+#[test]
+fn a_merge_a_crash_left_half_done_is_retried() {
+    let (_tmp, main, wt) = repo_with_worktree();
+    let old_path = wt.join(".memdag/memdag.db");
+    std::fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+    let task_id = {
+        let mut old = MemoryStore::new(open_connection(&old_path).unwrap());
+        old.record_memory(opts(MemoryKind::Task, "Survive a crash"))
+            .unwrap()
+            .id
+    };
+    // What a process that crashed right after claiming the file leaves behind.
+    let stranded = wt.join(".memdag/memdag.db.merging-99999");
+    std::fs::rename(&old_path, &stranded).unwrap();
+    let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&stranded)
+        .unwrap()
+        .set_modified(hour_ago)
+        .unwrap();
+
+    let shared = store_in(&main);
+    let shared_path = project_db_path(&wt).unwrap();
+    let legacy = legacy_worktree_db(&wt, &shared_path).expect("stranded merge picked up");
+    assert_eq!(merge_legacy_db(shared.connection(), &legacy).unwrap(), 1);
+    assert!(shared.get_memory(&task_id).unwrap().is_some());
+}

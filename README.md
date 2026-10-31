@@ -118,8 +118,8 @@ above) before running `memdag install`, rather than registering it straight out 
 ### Connect your agents: `memdag install`
 
 ```bash
-memdag install                 # every harness detected on this machine, for this project
-memdag install --global        # the same, in your user-level configs (all projects)
+memdag install                 # harnesses this project already uses (.claude/, opencode.json, .cursor/, ...)
+memdag install --global        # harnesses installed for your user, in their user-level configs
 memdag install --target claude-code,opencode --model <cheap model>
 memdag install --print-config  # show what would be written; change nothing
 memdag install --refresh       # after upgrading: update only harnesses already set up
@@ -158,8 +158,17 @@ Notes:
   Antigravity (whose macOS app doesn't see the shell's `PATH`), use the absolute path.
 - **Shared files.** Files several harnesses use (one `AGENTS.md`, one `.agents/skills/memdag`)
   are kept on uninstall while another harness still has memdag configured.
-- **OpenCode.** OpenCode V2 reads the V1 shape too, but V1 can't read V2's; use
-  `--opencode-v1` for V1. An existing V1 entry is migrated when V2 is written.
+- **Detection.** For a project, `--target auto` goes only by markers in the project (a
+  `.claude/` or `CLAUDE.md`, `opencode.json`, `.cursor/`, `.vscode/mcp.json`, ...), never by
+  what's installed on your machine, so it doesn't add files for harnesses your teammates
+  don't use. Name harnesses with `--target` to set up new ones.
+- **Re-running is safe.** memdag owns only `type`, `command`, `args` and its own environment
+  variable in a server entry; other variables (a pinned `MEMDAG_DB`), timeouts, flags you
+  turned off, and tool lists stay. A worker keeps its pinned model unless `--model` is given.
+  `--refresh` rewrites only the parts a harness already has.
+- **OpenCode.** OpenCode V2 reads the V1 shape too, but V1 can't read V2's. By default an
+  existing entry keeps its shape and a new one is V2; `--opencode-format v2` migrates a V1
+  entry, `--opencode-format v1` writes V1.
 - **Codex.** Codex reads a project's `.codex/config.toml` only once the project is trusted.
 - **Worker model.** Only Claude Code has a model alias to default to (`haiku`). Elsewhere,
   pass `--model` with a Haiku- or Flash-class model id, or the worker uses the harness's

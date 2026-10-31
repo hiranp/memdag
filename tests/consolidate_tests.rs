@@ -367,3 +367,66 @@ fn mcp_get_and_submit_consolidate_work() {
         "{out}"
     );
 }
+
+/// Two ADRs that say the same thing, plus a local decision that repeats them.
+fn adr_setup() -> (tempfile::TempDir, MemoryStore, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    git(repo, &["init", "-q"]);
+    for (n, title) in [
+        ("0001", "SQLite busy timeout is five seconds"),
+        ("0002", "Busy timeout for SQLite connections"),
+    ] {
+        let path = repo.join(format!("docs/adr/{n}-busy.md"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("# {n}. {title}\n- Status: accepted\n\nWe wait five seconds when SQLite is locked.\n")).unwrap();
+    }
+    let mut store = MemoryStore::new(open_in_memory().unwrap());
+    let files = ImportOptions {
+        git: false,
+        gh: false,
+        ..ImportOptions::all()
+    };
+    import_repo(&mut store, repo, &files, &NoGh).unwrap();
+    let local = record(
+        &mut store,
+        MemoryKind::Decision,
+        "SQLite busy timeout five seconds",
+        "Connections wait five seconds on a locked SQLite database.",
+    );
+    (tmp, store, local)
+}
+
+#[test]
+fn two_repository_backed_duplicates_become_a_task_not_a_hidden_adr() {
+    let (_tmp, mut store, _local) = adr_setup();
+    let (a, b) = ordered("ADR-0001", "ADR-0002");
+    let reply = json!({"results": [{"pair": [a, b], "verdict": "duplicate", "keep": "ADR-0001", "reason": "same"}]});
+    let r = work::submit(&mut store, WorkTask::Consolidate, &reply).unwrap();
+    assert_eq!(r.applied, 1, "{r}");
+    assert!(r.to_string().contains("recorded task"), "{r}");
+    for id in ["ADR-0001", "ADR-0002"] {
+        assert_eq!(
+            store.get_memory(id).unwrap().unwrap().0.status,
+            MemoryStatus::Active,
+            "{id}"
+        );
+    }
+}
+
+#[test]
+fn a_duplicate_of_an_adr_resolves_the_local_copy_whatever_keep_says() {
+    let (_tmp, mut store, local) = adr_setup();
+    let (a, b) = ordered("ADR-0001", &local);
+    let reply = json!({"results": [{"pair": [a, b], "verdict": "duplicate", "keep": local, "reason": "same"}]});
+    let r = work::submit(&mut store, WorkTask::Consolidate, &reply).unwrap();
+    assert_eq!(r.applied, 1, "{r}");
+    assert_eq!(
+        store.get_memory("ADR-0001").unwrap().unwrap().0.status,
+        MemoryStatus::Active
+    );
+    assert_eq!(
+        store.get_memory(&local).unwrap().unwrap().0.status,
+        MemoryStatus::Resolved
+    );
+}

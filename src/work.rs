@@ -489,13 +489,52 @@ fn apply_pair(store: &mut MemoryStore, r: &Value) -> Result<Outcome> {
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .context("verdict 'duplicate' needs 'keep'")?;
-            let drop = if keep == a.id {
-                &b.id
+            let (keep_mem, drop_mem) = if keep == a.id {
+                (&a, &b)
             } else if keep == b.id {
-                &a.id
+                (&b, &a)
             } else {
                 bail!("'keep' must be one of the pair");
             };
+            // Resolve only where it sticks. Hiding an ADR or commit the repository still says
+            // is current (or one that comes back on the next import) would be wrong, so prefer
+            // resolving the other one, or leave the call to a person.
+            let (keep_mem, drop_mem) = if store.resolution_persists(drop_mem) {
+                (keep_mem, drop_mem)
+            } else if store.resolution_persists(keep_mem) {
+                (drop_mem, keep_mem)
+            } else {
+                let task = store.record_memory(RecordOptions {
+                    id: None,
+                    kind: MemoryKind::Task,
+                    title: format!("Possible duplicate memories {} and {}", a.id, b.id),
+                    body: format!(
+                        "A worker model found that these say the same thing:\n\n- {}: {}\n- {}: {}\n\n\
+                         Both come from repository files, so memdag didn't hide either. Merge them \
+                         at the source (e.g. supersede one ADR with the other).{}",
+                        a.id,
+                        a.title,
+                        b.id,
+                        b.title,
+                        if reason.is_empty() { String::new() } else { format!("\n\nWorker's reason: {reason}") }
+                    ),
+                    tags: Some("worker-duplicate".into()),
+                    supersedes_id: None,
+                    session_id: None,
+                    embedding: None,
+                    paths: Vec::new(),
+                    commit: None,
+                })?;
+                for m in [&a.id, &b.id] {
+                    store.link_entities(&task.id, m, RelationType::References)?;
+                }
+                store.mark_pair_reviewed(&a.id, &b.id, "duplicate")?;
+                return Ok(Outcome::Applied(format!(
+                    "duplicate of two repository-backed memories; recorded task {}",
+                    task.id
+                )));
+            };
+            let (keep, drop) = (keep_mem.id.as_str(), drop_mem.id.as_str());
             let note = if reason.is_empty() {
                 format!("Duplicate of {keep} (found by a worker model)")
             } else {

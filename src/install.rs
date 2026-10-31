@@ -109,11 +109,11 @@ impl Target {
 }
 
 /// Parse `auto`, `all` or a comma-separated list of target ids.
-pub fn parse_targets(spec: &str, env: &Env) -> Result<Vec<Target>> {
+pub fn parse_targets(spec: &str, env: &Env, loc: Location) -> Result<Vec<Target>> {
     match spec.trim() {
         "auto" | "" => Ok(Target::ALL
             .into_iter()
-            .filter(|t| detect(*t, env))
+            .filter(|t| detect(*t, env, loc))
             .collect()),
         "all" => Ok(Target::ALL.to_vec()),
         list => list
@@ -242,8 +242,19 @@ pub struct Options {
     pub on_path: bool,
     /// Pin the database (`MEMDAG_DB`) in the server entry.
     pub db: Option<PathBuf>,
-    /// Write OpenCode's V1 server shape (`mcp.<name>`) instead of V2 (`mcp.servers.<name>`).
-    pub opencode_v1: bool,
+    /// Which OpenCode server shape to write.
+    pub opencode: OpencodeFormat,
+}
+
+/// OpenCode's server entry shape. V2 (`mcp.servers.<name>`) reads V1 (`mcp.<name>`), but V1
+/// can't read V2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpencodeFormat {
+    /// Keep the shape an existing memdag entry has; V2 for a new one.
+    Auto,
+    V1,
+    /// V2, migrating an existing V1 entry.
+    V2,
 }
 
 /// One file install/uninstall touched (or would touch).
@@ -525,33 +536,44 @@ fn claude_settings(env: &Env, loc: Location) -> PathBuf {
 
 // --------------------------------------------------------------------- detect
 
-/// Whether `t` looks installed on this machine or used by this project.
-pub fn detect(t: Target, env: &Env) -> bool {
+/// Whether `t` is in use at `loc`: for the project, only by markers in the project itself
+/// (a harness merely installed on this machine is no reason to add its files to a repository
+/// teammates share); globally, by its user config directory.
+pub fn detect(t: Target, env: &Env, loc: Location) -> bool {
     let (p, h) = (&env.project, &env.home);
     let any = |paths: &[PathBuf]| paths.iter().any(|x| x.exists());
-    match t {
-        Target::ClaudeCode => any(&[
-            h.join(".claude"),
-            h.join(".claude.json"),
-            p.join(".claude"),
-            p.join(".mcp.json"),
-        ]),
-        Target::Opencode => any(&[
-            env.config_home.join("opencode"),
+    match (t, loc) {
+        (Target::ClaudeCode, Location::Project) => {
+            any(&[p.join(".claude"), p.join(".mcp.json"), p.join("CLAUDE.md")])
+        }
+        (Target::ClaudeCode, Location::Global) => any(&[h.join(".claude"), h.join(".claude.json")]),
+        (Target::Opencode, Location::Project) => any(&[
             p.join(".opencode"),
             p.join("opencode.json"),
             p.join("opencode.jsonc"),
         ]),
-        Target::Codex => any(&[env.codex_home.clone(), p.join(".codex")]),
-        Target::Cursor => any(&[h.join(".cursor"), p.join(".cursor")]),
-        Target::Gemini => any(&[h.join(".gemini/settings.json"), p.join(".gemini")]),
-        Target::Vscode => any(&[env.vscode_user.clone(), p.join(".vscode")]),
-        Target::Kiro => any(&[h.join(".kiro"), p.join(".kiro")]),
-        Target::Antigravity => any(&[
-            h.join(".gemini/config"),
-            h.join(".gemini/antigravity"),
-            p.join(".agents/mcp_config.json"),
+        (Target::Opencode, Location::Global) => any(&[env.config_home.join("opencode")]),
+        (Target::Codex, Location::Project) => any(&[p.join(".codex")]),
+        (Target::Codex, Location::Global) => env.codex_home.exists(),
+        (Target::Cursor, Location::Project) => any(&[p.join(".cursor")]),
+        (Target::Cursor, Location::Global) => any(&[h.join(".cursor")]),
+        (Target::Gemini, Location::Project) => any(&[p.join(".gemini"), p.join("GEMINI.md")]),
+        (Target::Gemini, Location::Global) => any(&[h.join(".gemini/settings.json")]),
+        // Plenty of repositories have .vscode/ without using Copilot's MCP support.
+        (Target::Vscode, Location::Project) => any(&[
+            p.join(".vscode/mcp.json"),
+            p.join(".github/copilot-instructions.md"),
+            p.join(".github/agents"),
         ]),
+        (Target::Vscode, Location::Global) => env.vscode_user.exists(),
+        (Target::Kiro, Location::Project) => any(&[p.join(".kiro")]),
+        (Target::Kiro, Location::Global) => any(&[h.join(".kiro")]),
+        (Target::Antigravity, Location::Project) => {
+            any(&[p.join(".agents/mcp_config.json"), p.join(".agents/rules")])
+        }
+        (Target::Antigravity, Location::Global) => {
+            any(&[h.join(".gemini/config"), h.join(".gemini/antigravity")])
+        }
     }
 }
 
@@ -590,8 +612,23 @@ fn command(t: Target, loc: Location, opts: &Options) -> String {
     }
 }
 
+/// Which OpenCode shape to write at `loc`, and whether to remove the other one.
+fn opencode_shape(env: &Env, loc: Location, opts: &Options) -> (bool, bool) {
+    let path = opencode_config(env, loc);
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let has = |keys: &[&str]| json_lookup(&text, keys).is_some_and(|o| o.get(SERVER).is_some());
+    let (v1, v2) = (has(&["mcp"]), has(&["mcp", "servers"]));
+    match opts.opencode {
+        OpencodeFormat::V1 => (true, v2),
+        OpencodeFormat::V2 => (false, v1),
+        // Keep a working V1 entry as it is: V1 OpenCode can't read V2's shape.
+        OpencodeFormat::Auto if v1 && !v2 => (true, false),
+        OpencodeFormat::Auto => (false, v1),
+    }
+}
+
 /// The server entry in the shape each harness documents.
-fn mcp_entry(t: Target, loc: Location, opts: &Options) -> Value {
+fn mcp_entry(t: Target, loc: Location, opts: &Options, opencode_v1: bool) -> Value {
     let cmd = command(t, loc, opts);
     let env = opts
         .db
@@ -601,7 +638,7 @@ fn mcp_entry(t: Target, loc: Location, opts: &Options) -> Value {
         // https://opencode.ai/v2/docs/mcp-servers: one argv array; `codemode: false` keeps the
         // tools native instead of reachable only from Code Mode scripts, which a small worker
         // model handles poorly.
-        Target::Opencode if opts.opencode_v1 => {
+        Target::Opencode if opencode_v1 => {
             json!({ "type": "local", "command": [cmd, "serve"], "enabled": true })
         }
         Target::Opencode => {
@@ -743,15 +780,62 @@ fn parse_cst(path: &Path, text: &str) -> Result<CstRootNode> {
     Ok(root)
 }
 
-/// Set `keys.. -> name` to `value` in a JSON/JSONC file, keeping comments and formatting.
+/// memdag's server entry merged into the one already there. memdag owns `type`, `command`
+/// and `args` and its own environment variable; everything else the user added (other
+/// environment variables, timeouts, tool lists, a pinned `MEMDAG_DB` when `--db` isn't given)
+/// stays. Flags a user may have flipped on purpose (`enabled`, `disabled`, `codemode`) are
+/// only filled in when absent, and approval lists are extended, not replaced.
+fn merge_entry(existing: Option<&Value>, ours: &Value) -> Value {
+    let (Some(Value::Object(old)), Value::Object(new)) = (existing, ours) else {
+        return ours.clone();
+    };
+    let mut out = old.clone();
+    for (k, v) in new {
+        match k.as_str() {
+            "enabled" | "disabled" | "codemode" => {
+                out.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            "env" | "environment" => match (out.get_mut(k), v) {
+                (Some(Value::Object(dst)), Value::Object(src)) => {
+                    for (a, b) in src {
+                        dst.insert(a.clone(), b.clone());
+                    }
+                }
+                _ => {
+                    out.insert(k.clone(), v.clone());
+                }
+            },
+            "autoApprove" => match (out.get_mut(k), v) {
+                (Some(Value::Array(dst)), Value::Array(src)) => {
+                    for x in src {
+                        if !dst.contains(x) {
+                            dst.push(x.clone());
+                        }
+                    }
+                }
+                _ => {
+                    out.insert(k.clone(), v.clone());
+                }
+            },
+            _ => {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    Value::Object(out)
+}
+
+/// Set `keys.. -> name` to `value` merged into any existing entry (see [`merge_entry`]) in a
+/// JSON/JSONC file, keeping comments and formatting. Only the keys that change are touched,
+/// so comments inside the entry survive too.
 fn json_set(path: &Path, keys: &[&str], name: &str, value: &Value) -> Result<Change> {
     let old = read_optional(path)?;
-    if let Some(text) = &old
-        && json_lookup(text, keys)
-            .and_then(|o| o.get(name).cloned())
-            .as_ref()
-            == Some(value)
-    {
+    let existing = old
+        .as_deref()
+        .and_then(|t| json_lookup(t, keys))
+        .and_then(|o| o.get(name).cloned());
+    let merged = merge_entry(existing.as_ref(), value);
+    if existing.as_ref() == Some(&merged) {
         return Ok(Change::Unchanged);
     }
     let root = parse_cst(path, old.as_deref().unwrap_or(""))?;
@@ -764,11 +848,27 @@ fn json_set(path: &Path, keys: &[&str], name: &str, value: &Value) -> Result<Cha
             )
         })?;
     }
-    match obj.get(name) {
-        Some(prop) => prop.set_value(to_cst(value)),
-        None => {
-            obj.append(name, to_cst(value));
+    let prop = obj.get(name);
+    match (prop.as_ref().and_then(|p| p.object_value()), &existing) {
+        (Some(entry), Some(Value::Object(before))) => {
+            for (k, v) in merged.as_object().expect("merged an object") {
+                if before.get(k) == Some(v) {
+                    continue;
+                }
+                match entry.get(k) {
+                    Some(p) => p.set_value(to_cst(v)),
+                    None => {
+                        entry.append(k, to_cst(v));
+                    }
+                }
+            }
         }
+        _ => match prop {
+            Some(p) => p.set_value(to_cst(&merged)),
+            None => {
+                obj.append(name, to_cst(&merged));
+            }
+        },
     }
     let mut text = root.to_string();
     if !text.ends_with('\n') {
@@ -842,7 +942,56 @@ fn toml_set(path: &Path, value: &Value) -> Result<Change> {
     harness::write_if_changed(path, &text)
 }
 
-/// `text` with `[mcp_servers.memdag]` set to `value`.
+/// A TOML item as JSON, for the simple values memdag compares (strings, numbers, booleans,
+/// arrays and tables of them). None for anything else, which memdag never touches.
+fn toml_to_json(item: &toml_edit::Item) -> Option<Value> {
+    fn value(v: &toml_edit::Value) -> Option<Value> {
+        Some(match v {
+            toml_edit::Value::String(s) => json!(s.value()),
+            toml_edit::Value::Integer(i) => json!(i.value()),
+            toml_edit::Value::Float(f) => json!(f.value()),
+            toml_edit::Value::Boolean(b) => json!(b.value()),
+            toml_edit::Value::Array(a) => Value::Array(a.iter().map(value).collect::<Option<_>>()?),
+            toml_edit::Value::InlineTable(t) => Value::Object(
+                t.iter()
+                    .map(|(k, v)| Some((k.to_string(), value(v)?)))
+                    .collect::<Option<_>>()?,
+            ),
+            _ => return None,
+        })
+    }
+    match item {
+        toml_edit::Item::Value(v) => value(v),
+        toml_edit::Item::Table(t) => Some(Value::Object(
+            t.iter()
+                .filter_map(|(k, v)| Some((k.to_string(), toml_to_json(v)?)))
+                .collect(),
+        )),
+        _ => None,
+    }
+}
+
+fn json_to_toml(v: &Value) -> Option<toml_edit::Value> {
+    Some(match v {
+        Value::String(s) => s.as_str().into(),
+        Value::Bool(b) => (*b).into(),
+        Value::Number(n) => match n.as_i64() {
+            Some(i) => i.into(),
+            None => n.as_f64()?.into(),
+        },
+        Value::Array(a) => {
+            let mut arr = toml_edit::Array::new();
+            for x in a {
+                arr.push(json_to_toml(x)?);
+            }
+            arr.into()
+        }
+        _ => return None,
+    })
+}
+
+/// `text` with memdag's `[mcp_servers.memdag]` keys merged in (see [`merge_entry`]); the
+/// user's other keys, comments and formatting stay.
 fn toml_render(path: &Path, text: &str, value: &Value) -> Result<String> {
     let mut doc = toml_doc(path, text)?;
     let servers = doc
@@ -854,27 +1003,45 @@ fn toml_render(path: &Path, text: &str, value: &Value) -> Result<String> {
         })
         .as_table_mut()
         .with_context(|| format!("`mcp_servers` in {} is not a table", path.display()))?;
-    let mut entry = toml_edit::Table::new();
-    if let Some(cmd) = value["command"].as_str() {
-        entry["command"] = toml_edit::value(cmd);
-    }
-    if let Some(args) = value["args"].as_array() {
-        let mut a = toml_edit::Array::new();
-        for x in args.iter().filter_map(Value::as_str) {
-            a.push(x);
+    let existing = servers.get(SERVER).and_then(toml_to_json);
+    let merged = merge_entry(existing.as_ref(), value);
+    let entry = servers
+        .entry(SERVER)
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
+        .as_table_like_mut()
+        .with_context(|| {
+            format!(
+                "`mcp_servers.{SERVER}` in {} is not a table",
+                path.display()
+            )
+        })?;
+    for (k, v) in merged.as_object().expect("merged an object") {
+        if existing.as_ref().and_then(|e| e.get(k)) == Some(v) {
+            continue;
         }
-        entry["args"] = toml_edit::value(a);
-    }
-    if let Some(env) = value["env"].as_object() {
-        let mut t = toml_edit::Table::new();
-        for (k, v) in env {
-            if let Some(v) = v.as_str() {
-                t[k.as_str()] = toml_edit::value(v);
+        match v {
+            // Sub-tables (env): set memdag's keys inside, keep the user's.
+            Value::Object(map) => {
+                if entry.get(k).and_then(|i| i.as_table_like()).is_none() {
+                    entry.insert(k, toml_edit::Item::Table(toml_edit::Table::new()));
+                }
+                let sub = entry
+                    .get_mut(k)
+                    .and_then(|i| i.as_table_like_mut())
+                    .expect("just ensured");
+                for (sk, sv) in map {
+                    if let Some(tv) = json_to_toml(sv) {
+                        sub.insert(sk, toml_edit::Item::Value(tv));
+                    }
+                }
+            }
+            _ => {
+                if let Some(tv) = json_to_toml(v) {
+                    entry.insert(k, toml_edit::Item::Value(tv));
+                }
             }
         }
-        entry["env"] = toml_edit::Item::Table(t);
     }
-    servers[SERVER] = toml_edit::Item::Table(entry);
     Ok(doc.to_string())
 }
 
@@ -963,15 +1130,40 @@ fn remove_skill(dir: &Path) -> Result<Change> {
     Ok(Change::Removed)
 }
 
-/// The SessionStart hook command memdag adds to Claude Code settings.
+/// The SessionStart hook command memdag adds to Claude Code settings. Claude Code runs it
+/// through a shell (bash on Windows too), so a path is single-quoted and uses forward
+/// slashes; a path with spaces or backslashes would otherwise break.
 fn hook_command(cmd: &str) -> String {
-    format!("{cmd} hook session-start")
+    if cmd == "memdag" {
+        return "memdag hook session-start".into();
+    }
+    let path = if cfg!(windows) {
+        cmd.replace('\\', "/")
+    } else {
+        cmd.to_string()
+    };
+    format!("'{}' hook session-start", path.replace('\'', r"'\''"))
 }
 
 fn is_memdag_hook(v: &Value) -> bool {
     v.get("command")
         .and_then(Value::as_str)
         .is_some_and(|c| c.contains("memdag") && c.ends_with("hook session-start"))
+}
+
+/// Remove memdag's hooks from SessionStart groups, dropping a group only when nothing else is
+/// left in it. Returns whether anything was removed.
+fn strip_memdag_hooks(groups: &mut Vec<Value>) -> bool {
+    let mut removed = false;
+    for g in groups.iter_mut() {
+        if let Some(hs) = g.get_mut("hooks").and_then(Value::as_array_mut) {
+            let before = hs.len();
+            hs.retain(|h| !is_memdag_hook(h));
+            removed |= hs.len() != before;
+        }
+    }
+    groups.retain(|g| g["hooks"].as_array().is_none_or(|hs| !hs.is_empty()));
+    removed
 }
 
 fn edit_settings(
@@ -1019,12 +1211,9 @@ fn add_session_hook(path: &Path, cmd: &str) -> Result<Change> {
         if present {
             return false;
         }
-        // Replace an older memdag hook (e.g. a different binary path) rather than adding one.
-        groups.retain(|g| {
-            !g["hooks"]
-                .as_array()
-                .is_some_and(|hs| hs.iter().any(is_memdag_hook))
-        });
+        // Replace an older memdag hook (e.g. a different binary path) rather than adding one,
+        // without touching the user's hooks that share its group.
+        strip_memdag_hooks(groups);
         groups.push(json!({ "hooks": [wanted] }));
         true
     })
@@ -1041,13 +1230,7 @@ fn remove_session_hook(path: &Path) -> Result<Change> {
         let Some(groups) = hooks.get_mut("SessionStart").and_then(Value::as_array_mut) else {
             return false;
         };
-        let before = groups.len();
-        groups.retain(|g| {
-            !g["hooks"]
-                .as_array()
-                .is_some_and(|hs| hs.iter().any(is_memdag_hook))
-        });
-        if groups.len() == before {
+        if !strip_memdag_hooks(groups) {
             return false;
         }
         if groups.is_empty() {
@@ -1067,6 +1250,78 @@ fn remove_session_hook(path: &Path) -> Result<Change> {
 
 // --------------------------------------------------------------------- public
 
+/// The model an existing generated worker file pins, if any.
+fn existing_model(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    if !harness::is_generated(&text) {
+        return None;
+    }
+    text.lines().find_map(|l| {
+        let v = l
+            .strip_prefix("model:")
+            .or_else(|| l.strip_prefix("model ="))?
+            .trim()
+            .trim_matches(['[', ']', '\'', '"'])
+            .to_string();
+        // Claude Code's default and Cursor's "inherit" aren't pins.
+        (!v.is_empty() && v != "inherit").then_some(v)
+    })
+}
+
+/// Which parts of memdag `t` has at `loc` right now (what `--refresh` updates).
+pub fn installed_parts(t: Target, env: &Env, loc: Location) -> Parts {
+    let generated =
+        |p: &Path| std::fs::read_to_string(p).is_ok_and(|text| harness::is_generated(&text));
+    let worker = worker_path(t, env, loc).is_some_and(|p| generated(&p));
+    let instructions = instructions(t, env, loc).is_some_and(|i| match i {
+        Instructions::Block(p) => std::fs::read_to_string(p)
+            .is_ok_and(|text| text.lines().any(|l| l.trim_end() == harness::BLOCK_START)),
+        Instructions::File(p, _) => generated(&p),
+    });
+    let settings = std::fs::read_to_string(claude_settings(env, loc)).unwrap_or_default();
+    let (permissions, hooks) = match t {
+        Target::ClaudeCode => (
+            harness::CLAUDE_ALLOW.iter().all(|r| settings.contains(r)),
+            settings.contains("hook session-start"),
+        ),
+        Target::Opencode => (
+            worker_path(t, env, loc)
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .is_some_and(|w| w.contains("effect: allow")),
+            false,
+        ),
+        Target::Kiro => (
+            std::fs::read_to_string(mcp_spec(t, env, loc, false).path)
+                .is_ok_and(|c| c.contains("autoApprove")),
+            false,
+        ),
+        _ => (false, false),
+    };
+    Parts {
+        mcp: is_configured(t, env, loc),
+        worker,
+        instructions,
+        skill: skill_dir(t, env, loc).join(SKILL_STAMP).exists(),
+        permissions,
+        hooks,
+    }
+}
+
+/// Whether `t` has memdag at `loc` in a file of its own (its MCP entry, worker or own rule
+/// file). Shared files (`AGENTS.md`, `.agents/skills`) don't count, since they can't say
+/// which harness they are there for.
+pub fn is_installed(t: Target, env: &Env, loc: Location) -> bool {
+    let p = installed_parts(t, env, loc);
+    let own_rule =
+        matches!(instructions(t, env, loc), Some(Instructions::File(..))) && p.instructions;
+    p.mcp || p.worker || own_rule
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    canon(a) == canon(b)
+}
+
 /// Write the selected parts for `t`. The MCP entry goes first: it's the file most likely to
 /// be refused (unparseable), and refusing before anything else was written leaves nothing
 /// half-installed.
@@ -1076,8 +1331,13 @@ pub fn install(t: Target, env: &Env, loc: Location, opts: &Options) -> Result<Ve
     let mut steps = Vec::new();
 
     if parts.mcp {
-        let spec = mcp_spec(t, env, loc, opts.opencode_v1);
-        let entry = mcp_entry(t, loc, opts);
+        let (v1, migrate) = if t == Target::Opencode {
+            opencode_shape(env, loc, opts)
+        } else {
+            (false, false)
+        };
+        let spec = mcp_spec(t, env, loc, v1);
+        let entry = mcp_entry(t, loc, opts, v1);
         let change = match &spec.format {
             Format::Json(keys) => json_set(&spec.path, keys, SERVER, &entry)?,
             Format::Toml => toml_set(&spec.path, &entry)?,
@@ -1091,14 +1351,14 @@ pub fn install(t: Target, env: &Env, loc: Location, opts: &Options) -> Result<Ve
         }
         steps.push(s);
         // Move an OpenCode entry from the other shape, so it isn't defined twice.
-        if t == Target::Opencode {
-            let other = mcp_spec(t, env, loc, !opts.opencode_v1);
+        if t == Target::Opencode && migrate {
+            let other = mcp_spec(t, env, loc, !v1);
             if let Format::Json(keys) = &other.format
                 && other.path == spec.path
                 && json_remove(&other.path, keys, SERVER)? == Change::Removed
             {
                 let mut s = step("MCP server (old shape)", other.path, Change::Removed);
-                s.note = Some(if opts.opencode_v1 {
+                s.note = Some(if v1 {
                     "moved from mcp.servers.memdag (V2) to mcp.memdag (V1)".into()
                 } else {
                     "migrated mcp.memdag (V1) to mcp.servers.memdag (V2)".into()
@@ -1133,7 +1393,9 @@ pub fn install(t: Target, env: &Env, loc: Location, opts: &Options) -> Result<Ve
     if parts.worker {
         match (t.harness(), worker_path(t, env, loc)) {
             (Some(h), Some(path)) => {
-                let model = opts.model.as_deref();
+                // Keep a model the user pinned earlier unless --model says otherwise.
+                let kept = opts.model.is_none().then(|| existing_model(&path)).flatten();
+                let model = opts.model.as_deref().or(kept.as_deref());
                 let text = h.worker_file(model, parts.permissions);
                 let change = write_owned(&path, &text)?;
                 let mut s = step("worker subagent", path, change);
@@ -1199,7 +1461,7 @@ pub fn uninstall(
     let shared_with = |path: &Path, f: &dyn Fn(Target) -> Option<PathBuf>| {
         still_configured
             .iter()
-            .find(|o| **o != t && f(**o).as_deref() == Some(path))
+            .find(|o| **o != t && f(**o).is_some_and(|p| same_file(&p, path)))
             .copied()
     };
 
@@ -1294,9 +1556,10 @@ pub fn install_entry_at(
     path: Option<&Path>,
     key: Option<&str>,
 ) -> Result<(PathBuf, Change)> {
-    let spec = mcp_spec(t, env, loc, opts.opencode_v1);
+    let v1 = t == Target::Opencode && opencode_shape(env, loc, opts).0;
+    let spec = mcp_spec(t, env, loc, v1);
     let path = path.map(Path::to_path_buf).unwrap_or(spec.path);
-    let entry = mcp_entry(t, loc, opts);
+    let entry = mcp_entry(t, loc, opts, v1);
     let change = match (key, &spec.format) {
         (Some(k), _) => json_set(&path, &k.split('.').collect::<Vec<_>>(), SERVER, &entry)?,
         (None, Format::Json(keys)) => json_set(&path, keys, SERVER, &entry)?,
@@ -1337,8 +1600,9 @@ pub fn print_config(t: Target, env: &Env, loc: Location, opts: &Options) -> Resu
         }
     );
     if parts.mcp {
-        let spec = mcp_spec(t, env, loc, opts.opencode_v1);
-        let entry = mcp_entry(t, loc, opts);
+        let v1 = t == Target::Opencode && opencode_shape(env, loc, opts).0;
+        let spec = mcp_spec(t, env, loc, v1);
+        let entry = mcp_entry(t, loc, opts, v1);
         let shown = match &spec.format {
             Format::Json(keys) => {
                 let mut v = json!({ SERVER: entry });

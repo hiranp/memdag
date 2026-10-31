@@ -37,9 +37,16 @@ codegraph's installer source was available, that is noted in the code.
   - an opt-in Claude Code SessionStart hook (`--hooks`, running `memdag hook session-start`,
     which prints one line about waiting upkeep and never fails).
 
-  `--target auto` (the default) picks the harnesses whose config directories exist. Also
-  available: `--global` (user-level files), `--print-config` (show, write nothing) and
-  `--refresh` (only targets that already have a memdag entry).
+  `--target auto` (the default) picks the harnesses in use at that location: for a project,
+  only by markers in the project itself; with `--global`, by the user's config directories.
+  A harness merely installed on the machine is no reason to add its files to a repository.
+  Also available: `--print-config` (show, write nothing) and `--refresh` (rewrite only the
+  parts a harness already has).
+- **Merging, not replacing.** memdag owns `type`, `command`, `args` and its own environment
+  variable in a server entry. Everything else the user added stays: other variables, a pinned
+  `MEMDAG_DB`, timeouts, tool lists. Flags they may have flipped on purpose (`enabled`,
+  `disabled`, `codemode`) are only filled in when absent. A worker keeps its pinned model
+  unless `--model` is given.
 - **Editing.**
   - JSON and JSONC are edited through a concrete syntax tree (`jsonc-parser`), so comments,
     trailing commas, formatting and other servers survive.
@@ -56,8 +63,9 @@ codegraph's installer source was available, that is noted in the code.
 - **OpenCode** gets the V2 shape: `mcp.servers.memdag` with `type: local`, an argv `command`,
   `environment` and `codemode: false`. Without `codemode: false`, V2 exposes the tools only
   through Code Mode's JavaScript `execute` tool, which a small worker model handles badly. V2
-  still reads V1, but V1 can't read V2, so `--opencode-v1` writes the old shape. Writing
-  either shape migrates the other away.
+  still reads V1, but V1 can't read V2. So by default an existing entry keeps its shape, and
+  only a new one is V2. `--opencode-format v2` migrates a V1 entry; `--opencode-format v1`
+  writes V1.
 - **Command path.** Project configs say `memdag` when that resolves on `PATH` to the same
   binary, so a committed config works for every collaborator. Global configs use the absolute
   path, as does Antigravity (its macOS app doesn't inherit the shell `PATH`).

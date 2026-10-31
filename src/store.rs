@@ -1375,6 +1375,22 @@ impl MemoryStore {
         result
     }
 
+    /// Whether resolving `memory` would stick: true for a memory recorded directly, and for a
+    /// note memdag can mark resolved with a `.resolved.md` file. An ADR, commit or comment
+    /// (or a note without write-through) would come back active, or worse, stay hidden while
+    /// the repository still says it's current.
+    pub fn resolution_persists(&self, memory: &Memory) -> bool {
+        match memory.source.as_deref() {
+            None => true,
+            Some("note") => self
+                .resolution_sidecar_path(&memory.id)
+                .ok()
+                .flatten()
+                .is_some(),
+            Some(_) => false,
+        }
+    }
+
     /// `<notes_dir>/<id>.resolved.md` when `id` is backed by a write-through note file, else
     /// None. Errors if that memory was already resolved (resolutions are append-only too).
     fn resolution_sidecar_path(&self, id: &str) -> Result<Option<PathBuf>> {
