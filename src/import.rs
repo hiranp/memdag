@@ -219,7 +219,24 @@ pub fn find_repo_root(start: &Path) -> Option<PathBuf> {
     None
 }
 
+thread_local! {
+    static GIT_SPAWNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Count one `git` process started on this thread.
+pub(crate) fn note_git_spawn() {
+    GIT_SPAWNS.with(|n| n.set(n.get() + 1));
+}
+
+/// Number of `git` processes memdag started on the calling thread. Per thread, so tests
+/// running in parallel don't see each other's processes.
+#[doc(hidden)]
+pub fn git_spawns_on_this_thread() -> usize {
+    GIT_SPAWNS.with(std::cell::Cell::get)
+}
+
 pub(crate) fn git(repo: &Path, args: &[&str]) -> Result<std::process::Output> {
+    note_git_spawn();
     Command::new("git")
         .arg("-C")
         .arg(repo)
