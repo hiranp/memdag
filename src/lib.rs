@@ -3,6 +3,7 @@ pub mod db;
 pub mod embed;
 pub mod harness;
 pub mod import;
+pub mod install;
 pub mod mcp;
 pub mod models;
 pub mod notes;

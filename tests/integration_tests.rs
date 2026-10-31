@@ -723,9 +723,8 @@ fn test_mcp_install_and_uninstall_cli() {
         .expect("run uninstall");
     assert!(uninstall.status.success());
 
-    let raw_after = std::fs::read_to_string(&cfg_path).expect("read config");
-    let value_after: serde_json::Value = serde_json::from_str(&raw_after).expect("parse config");
-    assert!(value_after["mcpServers"].get("memdag").is_none());
+    // The file held nothing but memdag's entry, so uninstall removes it entirely.
+    assert!(!cfg_path.exists(), "a config left empty is deleted");
 }
 
 #[test]
@@ -756,9 +755,8 @@ fn test_mcp_install_with_custom_key_for_vscode() {
         .expect("run uninstall");
     assert!(uninstall.status.success());
 
-    let raw_after = std::fs::read_to_string(&cfg_path).expect("read config");
-    let value_after: serde_json::Value = serde_json::from_str(&raw_after).expect("parse config");
-    assert!(value_after["servers"].get("memdag").is_none());
+    // The file held nothing but memdag's entry, so uninstall removes it entirely.
+    assert!(!cfg_path.exists(), "a config left empty is deleted");
 }
 
 #[test]

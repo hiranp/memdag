@@ -36,6 +36,23 @@ Planned as 0.4.0 (new features and a schema bump, no breaking CLI/MCP changes). 
   `<!-- handoff -->` issue comments. Re-running an import never duplicates. The index refreshes
   when `HEAD` moves: on every CLI `search`, and in a running `serve` before each read tool (at
   most every 2 s).
+- **`memdag install` / `memdag uninstall`** wire memdag into Claude Code, OpenCode, Codex,
+  Cursor, Gemini CLI, GitHub Copilot (VS Code), Kiro and Antigravity: the MCP server entry,
+  the cheap-model worker subagent, an instructions block or rule file, the memdag skill and
+  approvals for the worker's two tools. Detects installed harnesses (`--target auto`), and
+  supports `--global`, `--print-config`, `--refresh`, `--no-*` per part, and `--hooks` (a
+  Claude Code SessionStart hook, `memdag hook session-start`). JSON/JSONC configs are edited
+  in place, keeping comments and formatting; Codex's TOML too. Unparseable files are refused;
+  uninstall removes only what memdag wrote. See ADR 0006.
+- **`consolidate` worker task.** A cheap model judges pairs of overlapping decisions,
+  invariants and learnings: duplicates are resolved (persisting through a note's
+  `.resolved.md`), conflicts become a "Reconcile conflicting memories" task, related ones are
+  linked. Each pair is judged once (schema v6, `reviewed_pairs`). New MCP prompt
+  `consolidate_memories`.
+- **CI.** A test workflow (fmt, then clippy + nextest + doctests in one cached Linux job;
+  macOS and Windows tests on main and before every release). Releases run the full CI on the
+  tag first, and publish the CHANGELOG section as notes plus `SHA256SUMS`. See
+  `.github/workflows/ci.yml` and `scripts/local-ci/`.
 - **Worktrees share one database.** All worktrees of a repository use
   `<main checkout>/.memdag/memdag.db`, so agents in different worktrees see the same tasks,
   blockers and links. Imported rows record which worktrees contain their source (schema v5,
@@ -81,6 +98,11 @@ Planned as 0.4.0 (new features and a schema bump, no breaking CLI/MCP changes). 
 
 ### Changed
 
+- `memdag mcp install` writes OpenCode's V2 server shape (`mcp.servers.memdag`, with
+  `codemode: false` so the tools stay native) and migrates a V1 entry; `--opencode-v1` (on
+  `memdag install`) keeps V1. `mcp install --client` accepts every install target.
+- **Schema v6** adds `reviewed_pairs` for the `consolidate` task.
+- **Schema v5** adds `memory_owners` (worktree ownership of imported rows).
 - **Schema v4** adds `memories.keywords` and rebuilds the FTS index with a `keywords` column.
 - **Schema v3** adds `origin_repo`, so rows are owned per repository: an import never prunes or
   overwrites rows from another repo sharing the database. The migration also drops orphaned
@@ -112,6 +134,12 @@ Planned as 0.4.0 (new features and a schema bump, no breaking CLI/MCP changes). 
 
 ### Fixed
 
+- Several processes opening one brand-new database at once could still fail with
+  `database is locked` while switching to WAL (SQLite can report busy there without waiting on
+  `busy_timeout`); that step now retries for up to 5 s.
+- `bump-version.yml` never started a release: a tag pushed with `GITHUB_TOKEN` doesn't
+  trigger workflows. It now starts `release.yml` explicitly. The Intel macOS build moved off
+  the retired `macos-13` runner.
 - `--tags` no longer collides with a short flag in clap.
 - Opening a brand-new database from several processes at once could fail with
   `duplicate column name` or `SQLITE_BUSY`: schema creation is now re-checked under the write

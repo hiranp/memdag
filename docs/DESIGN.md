@@ -215,7 +215,14 @@ database is per repository (`checkout::shared_db_path`); `db::merge_legacy_db` f
 per-worktree database into it (local rows and the relations between rows that exist
 afterwards). See ADR 0005.
 
-### 4.1.4 Schema v4: worker keywords
+### 4.1.4 Schema v6: reviewed pairs
+
+`reviewed_pairs(a, b, verdict, reviewed_at)`, with `a < b`, records each pair of memories a
+`consolidate` worker judged, so it is never offered again. Rows cascade when either memory is
+deleted. Like keywords, reviews live only in the database: a rebuild from git offers the pairs
+again, except duplicates, whose resolution persists through the note's `.resolved.md`.
+
+### 4.1.5 Schema v4: worker keywords
 
 `memories.keywords` holds search terms written by a cheap-model worker (`src/work.rs`). It is
 the fifth column of `memories_fts`, weighted 0.5 in `bm25()` against 1.0 for the memory's own

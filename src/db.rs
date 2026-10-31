@@ -241,8 +241,7 @@ pub fn open_in_memory() -> Result<Connection> {
 
 fn init_pragmas_and_schema(conn: &Connection) -> Result<()> {
     // Pragmas are per-connection state, always cheap to reapply.
-    conn.execute_batch(PRAGMA_SQL)
-        .context("Failed to set memdag connection pragmas")?;
+    set_pragmas(conn).context("Failed to set memdag connection pragmas")?;
 
     // The DDL batch (CREATE TABLE/INDEX/TRIGGER/VIRTUAL TABLE) is idempotent but each
     // statement still takes a schema lock to check "IF NOT EXISTS". Re-running the full
@@ -306,6 +305,29 @@ fn init_pragmas_and_schema(conn: &Connection) -> Result<()> {
         migrate_simple(conn, 6, V6_SQL).context("Failed to migrate memdag schema to v6")?;
     }
     Ok(())
+}
+
+/// Apply [`PRAGMA_SQL`], retrying while another connection holds the lock. Switching to
+/// WAL needs the database to itself, and SQLite can report busy for that immediately instead
+/// of going through `busy_timeout` (e.g. while another process is creating the schema). Gives
+/// up after the same 5 s `busy_timeout` allows.
+fn set_pragmas(conn: &Connection) -> rusqlite::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut wait = std::time::Duration::from_millis(5);
+    loop {
+        match conn.execute_batch(PRAGMA_SQL) {
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if matches!(
+                    e.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(wait);
+                wait = (wait * 2).min(std::time::Duration::from_millis(100));
+            }
+            other => return other,
+        }
+    }
 }
 
 fn memories_table_exists(conn: &Connection) -> Result<bool> {

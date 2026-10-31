@@ -1,7 +1,7 @@
 mod cli;
 
 use clap::Parser;
-use cli::{Cli, Commands, McpAction, McpClient, WorkAction};
+use cli::{Cli, Commands, McpAction, WorkAction};
 use memdag::db::{default_db_path, open_connection};
 use memdag::import::{GhCli, ImportOptions, ImportReport, find_repo_root, import_repo};
 use memdag::mcp::McpServer;
@@ -15,8 +15,49 @@ use std::str::FromStr;
 fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
 
-    if let Some(Commands::Mcp { action }) = &args.command {
-        return handle_mcp_action(action, args.db.clone());
+    // Installing touches harness configs only; no database needed.
+    match &args.command {
+        Some(Commands::Mcp { action }) => return handle_mcp_action(action, args.db.clone()),
+        Some(Commands::Install {
+            target,
+            global,
+            model,
+            refresh,
+            print_config,
+            no_mcp,
+            no_worker,
+            no_instructions,
+            no_skill,
+            no_permissions,
+            hooks,
+            opencode_v1,
+        }) => {
+            let parts = memdag::install::Parts {
+                mcp: !no_mcp,
+                worker: !no_worker,
+                instructions: !no_instructions,
+                skill: !no_skill,
+                permissions: !no_permissions,
+                hooks: *hooks,
+            };
+            let opts = install_options(parts, model.clone(), args.db.clone(), *opencode_v1)?;
+            return run_install(target, *global, *refresh, *print_config, &opts);
+        }
+        Some(Commands::Uninstall { target, global }) => {
+            return run_uninstall(target, *global, memdag::install::Parts::ALL);
+        }
+        // A hook must never break the session it runs in: no output and success on any error.
+        Some(Commands::Hook { event }) => {
+            match event {
+                cli::HookEvent::SessionStart => {
+                    if let Ok(Some(line)) = upkeep_summary(args.db.clone()) {
+                        println!("{line}");
+                    }
+                }
+            }
+            return Ok(());
+        }
+        _ => {}
     }
 
     let explicit_db = args.db.is_some() || std::env::var_os("MEMDAG_DB").is_some();
@@ -70,7 +111,10 @@ fn main() -> anyhow::Result<()> {
     store.set_embed_command(memdag::embed::command_from_env());
 
     match args.command {
-        Some(Commands::Mcp { .. }) => unreachable!("handled above"),
+        Some(Commands::Mcp { .. })
+        | Some(Commands::Install { .. })
+        | Some(Commands::Uninstall { .. })
+        | Some(Commands::Hook { .. }) => unreachable!("handled above"),
         Some(Commands::Serve) => serve(store, repo, &config)?,
         Some(Commands::Record {
             kind,
@@ -435,6 +479,7 @@ fn run_work(
             let task = work::reply_task(&reply, task.as_deref().map(parse).transpose()?)?;
             print!("{}", work::submit(store, task, &reply)?);
         }
+        // The worker-only subset of `memdag install`.
         WorkAction::Install {
             client,
             global,
@@ -442,27 +487,28 @@ fn run_work(
             no_instructions,
             no_permissions,
         } => {
-            let (harness, scope) = worker_target(client, global, repo)?;
-            let r = memdag::harness::install(
-                harness,
-                &scope,
-                model.as_deref(),
-                memdag::harness::InstallOptions {
-                    instructions: !no_instructions,
-                    permissions: !no_permissions,
-                },
-            )?;
-            print_harness_report(&r);
-            if harness == memdag::harness::Harness::Opencode && model.is_none() {
-                eprintln!(
-                    "note: no --model given, so the OpenCode worker uses the session's model. \
-                     Re-run with --model <provider>/<model> to pin a Haiku- or Flash-class one."
-                );
-            }
+            let parts = memdag::install::Parts {
+                worker: true,
+                instructions: !no_instructions,
+                permissions: !no_permissions,
+                ..memdag::install::Parts::NONE
+            };
+            let opts = install_options(parts, model, None, false)?;
+            let env = install_env(repo)?;
+            let steps = memdag::install::install(client.target(), &env, location(global), &opts)?;
+            print_steps(client.target(), &steps);
         }
         WorkAction::Uninstall { client, global } => {
-            let (harness, scope) = worker_target(client, global, repo)?;
-            print_harness_report(&memdag::harness::uninstall(harness, &scope)?);
+            let parts = memdag::install::Parts {
+                worker: true,
+                instructions: true,
+                permissions: true,
+                ..memdag::install::Parts::NONE
+            };
+            let env = install_env(repo)?;
+            let steps =
+                memdag::install::uninstall(client.target(), &env, location(global), parts, &[])?;
+            print_steps(client.target(), &steps);
         }
         WorkAction::Prompt { name, rounds } => {
             let p = work::host_prompt(&name).ok_or_else(|| {
@@ -476,40 +522,167 @@ fn run_work(
     Ok(())
 }
 
-fn worker_target(
-    client: cli::WorkerClient,
-    global: bool,
-    repo: Option<&Path>,
-) -> anyhow::Result<(memdag::harness::Harness, memdag::harness::Scope)> {
-    use memdag::harness::{Harness, Scope};
-    let harness = match client {
-        cli::WorkerClient::ClaudeCode => Harness::ClaudeCode,
-        cli::WorkerClient::Opencode => Harness::Opencode,
-    };
-    let scope = if global {
-        Scope::Global { home: home_dir()? }
+/// One line about waiting upkeep, for the SessionStart hook; None when there is none.
+fn upkeep_summary(db: Option<PathBuf>) -> anyhow::Result<Option<String>> {
+    let path = db.unwrap_or_else(default_db_path);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let mut store = MemoryStore::new(open_connection(&path)?);
+    let repo = find_repo_root(&std::env::current_dir()?);
+    store.set_repo_root(repo.clone());
+    let keywords = store.memories_needing_keywords(0)?.1;
+    let stale = if repo.is_some() {
+        store.list_stale()?.len()
     } else {
-        Scope::Project(match repo {
-            Some(r) => r.to_path_buf(),
-            None => std::env::current_dir()?,
-        })
+        0
     };
-    Ok((harness, scope))
+    if keywords == 0 && stale == 0 {
+        return Ok(None);
+    }
+    let mut parts = Vec::new();
+    let mut tasks = Vec::new();
+    if keywords > 0 {
+        parts.push(format!("{keywords} memories have no search keywords yet"));
+        tasks.push("`expand`");
+    }
+    if stale > 0 {
+        parts.push(format!("{stale} are STALE"));
+        tasks.push("`verify`");
+    }
+    Ok(Some(format!(
+        "memdag: {}. When convenient, start the memdag-worker subagent (task {}); it runs on a cheap model.",
+        parts.join(", "),
+        tasks.join(" / ")
+    )))
 }
 
-fn print_harness_report(r: &memdag::harness::InstallReport) {
-    let (path, change) = &r.worker;
-    println!("{change:?}: {}", path.display());
-    if let Some((path, change)) = &r.instructions {
-        println!("{change:?}: {} (memdag block)", path.display());
+fn location(global: bool) -> memdag::install::Location {
+    if global {
+        memdag::install::Location::Global
+    } else {
+        memdag::install::Location::Project
     }
-    if let Some((path, change)) = &r.permissions {
-        println!(
-            "{change:?}: {} (auto-approve {})",
-            path.display(),
-            memdag::harness::CLAUDE_ALLOW.join(", ")
+}
+
+/// Project files go at the repository root (or the current directory outside git).
+fn install_env(repo: Option<&Path>) -> anyhow::Result<memdag::install::Env> {
+    let cwd = std::env::current_dir()?;
+    let project = repo
+        .map(Path::to_path_buf)
+        .or_else(|| find_repo_root(&cwd))
+        .unwrap_or(cwd);
+    memdag::install::Env::current(project)
+}
+
+fn install_options(
+    parts: memdag::install::Parts,
+    model: Option<String>,
+    db: Option<PathBuf>,
+    opencode_v1: bool,
+) -> anyhow::Result<memdag::install::Options> {
+    let exe = std::env::current_exe()?;
+    let exe = exe.canonicalize().unwrap_or(exe);
+    warn_if_unstable_binary_path(&exe);
+    Ok(memdag::install::Options {
+        parts,
+        model,
+        on_path: resolves_on_path(&exe),
+        exe,
+        db,
+        opencode_v1,
+    })
+}
+
+/// Whether running plain `memdag` would start this very binary.
+fn resolves_on_path(exe: &Path) -> bool {
+    let name = if cfg!(windows) {
+        "memdag.exe"
+    } else {
+        "memdag"
+    };
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path)
+            .map(|d| d.join(name))
+            .find(|c| c.is_file())
+            .and_then(|c| c.canonicalize().ok())
+            .is_some_and(|c| c == exe)
+    })
+}
+
+fn print_steps(t: memdag::install::Target, steps: &[memdag::install::Step]) {
+    println!("{}:", t.name());
+    for s in steps {
+        if s.path.as_os_str().is_empty() {
+            if let Some(n) = &s.note {
+                println!("  {}: {n}", s.part);
+            }
+            continue;
+        }
+        println!("  {:?}: {} ({})", s.change, s.path.display(), s.part);
+        if let Some(n) = &s.note {
+            println!("    note: {n}");
+        }
+    }
+}
+
+fn run_install(
+    spec: &str,
+    global: bool,
+    refresh: bool,
+    print_config: bool,
+    opts: &memdag::install::Options,
+) -> anyhow::Result<()> {
+    use memdag::install::{self, Target};
+    let env = install_env(None)?;
+    let loc = location(global);
+    let mut targets = install::parse_targets(spec, &env)?;
+    if refresh {
+        let base = if spec == "auto" {
+            Target::ALL.to_vec()
+        } else {
+            targets
+        };
+        targets = base
+            .into_iter()
+            .filter(|t| install::is_configured(*t, &env, loc))
+            .collect();
+    }
+    if targets.is_empty() {
+        anyhow::bail!(
+            "No harness {} (pass --target, e.g. --target claude-code,opencode)",
+            if refresh {
+                "has a memdag entry to refresh"
+            } else {
+                "detected"
+            }
         );
     }
+    for t in targets {
+        if print_config {
+            println!("{}", install::print_config(t, &env, loc, opts)?);
+        } else {
+            print_steps(t, &install::install(t, &env, loc, opts)?);
+        }
+    }
+    Ok(())
+}
+
+fn run_uninstall(spec: &str, global: bool, parts: memdag::install::Parts) -> anyhow::Result<()> {
+    use memdag::install::{self, Target};
+    let env = install_env(None)?;
+    let loc = location(global);
+    let targets = install::parse_targets(spec, &env)?;
+    // Shared files (one AGENTS.md, one .agents/skills/memdag) stay while a harness that
+    // isn't being uninstalled still has memdag configured.
+    let remaining: Vec<Target> = Target::ALL
+        .into_iter()
+        .filter(|t| !targets.contains(t) && install::is_configured(*t, &env, loc))
+        .collect();
+    for t in targets {
+        print_steps(t, &install::uninstall(t, &env, loc, parts, &remaining)?);
+    }
+    Ok(())
 }
 
 /// Run the stdio MCP server. The index is refreshed at startup and, while the server runs,
@@ -535,205 +708,6 @@ fn auto_refresh(store: &mut MemoryStore, repo: Option<&Path>, config: &RepoConfi
     }
 }
 
-fn home_dir() -> anyhow::Result<PathBuf> {
-    Ok(directories::BaseDirs::new()
-        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
-        .home_dir()
-        .to_path_buf())
-}
-
-/// `opencode.jsonc` if it exists in `dir`, else `opencode.json`.
-fn opencode_file(dir: &Path) -> PathBuf {
-    let jsonc = dir.join("opencode.jsonc");
-    if jsonc.exists() {
-        jsonc
-    } else {
-        dir.join("opencode.json")
-    }
-}
-
-/// Default config file for a client preset. Claude Code: project-local `.mcp.json` (cwd) or
-/// user-global `~/.claude.json`. OpenCode: `./opencode.json[c]` or
-/// `$XDG_CONFIG_HOME/opencode/opencode.json[c]` (default `~/.config/opencode`, on every OS).
-/// Antigravity only loads `~/.gemini/config/mcp_config.json`, so it ignores `--global`.
-/// Cursor/Windsurf/VS Code use the Claude Code shape in their own files; pass `--path`.
-fn mcp_config_path(
-    client: McpClient,
-    global: bool,
-    path: Option<PathBuf>,
-) -> anyhow::Result<PathBuf> {
-    if let Some(p) = path {
-        return Ok(p);
-    }
-    Ok(match (client, global) {
-        (McpClient::ClaudeCode, true) => home_dir()?.join(".claude.json"),
-        (McpClient::ClaudeCode, false) => std::env::current_dir()?.join(".mcp.json"),
-        (McpClient::Opencode, true) => {
-            let base = std::env::var_os("XDG_CONFIG_HOME")
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
-                .map_or_else(|| home_dir().map(|h| h.join(".config")), Ok)?;
-            opencode_file(&base.join("opencode"))
-        }
-        (McpClient::Opencode, false) => opencode_file(&std::env::current_dir()?),
-        (McpClient::Antigravity, _) => home_dir()?
-            .join(".gemini")
-            .join("config")
-            .join("mcp_config.json"),
-    })
-}
-
-fn default_key(client: McpClient) -> &'static str {
-    match client {
-        McpClient::Opencode => "mcp",
-        McpClient::ClaudeCode | McpClient::Antigravity => "mcpServers",
-    }
-}
-
-/// The server entry in the shape each client expects.
-fn mcp_entry(client: McpClient, exe: &Path, db: Option<&Path>) -> serde_json::Value {
-    let exe = exe.to_string_lossy();
-    match client {
-        // https://opencode.ai/docs/mcp-servers/ — local servers take a single argv array.
-        McpClient::Opencode => {
-            let mut entry = serde_json::json!({
-                "type": "local",
-                "command": [exe, "serve"],
-                "enabled": true,
-            });
-            if let Some(db) = db {
-                entry["environment"] = serde_json::json!({ "MEMDAG_DB": db.to_string_lossy() });
-            }
-            entry
-        }
-        McpClient::ClaudeCode | McpClient::Antigravity => {
-            let mut entry = serde_json::json!({ "command": exe, "args": ["serve"] });
-            if let Some(db) = db {
-                entry["env"] = serde_json::json!({ "MEMDAG_DB": db.to_string_lossy() });
-            }
-            entry
-        }
-    }
-}
-
-/// Strip `//` and `/* */` comments and trailing commas so JSONC (opencode.jsonc) parses
-/// as JSON. String contents are left untouched.
-fn strip_jsonc(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut chars = raw.chars().peekable();
-    let mut in_str = false;
-    while let Some(c) = chars.next() {
-        if in_str {
-            out.push(c);
-            if c == '\\' {
-                if let Some(n) = chars.next() {
-                    out.push(n);
-                }
-            } else if c == '"' {
-                in_str = false;
-            }
-            continue;
-        }
-        match (c, chars.peek()) {
-            ('"', _) => {
-                in_str = true;
-                out.push(c);
-            }
-            ('/', Some('/')) => {
-                for n in chars.by_ref() {
-                    if n == '\n' {
-                        out.push('\n');
-                        break;
-                    }
-                }
-            }
-            ('/', Some('*')) => {
-                chars.next();
-                let mut prev = ' ';
-                for n in chars.by_ref() {
-                    if prev == '*' && n == '/' {
-                        break;
-                    }
-                    prev = n;
-                }
-                out.push(' ');
-            }
-            (',', _) => {
-                // Drop the comma if the next significant char closes an object/array.
-                let rest: String = chars.clone().collect();
-                let next = strip_jsonc_lookahead(&rest);
-                if !matches!(next, Some('}') | Some(']')) {
-                    out.push(c);
-                }
-            }
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-/// First char after whitespace and comments.
-fn strip_jsonc_lookahead(rest: &str) -> Option<char> {
-    let mut s = rest;
-    loop {
-        s = s.trim_start();
-        if let Some(r) = s.strip_prefix("//") {
-            s = r.split_once('\n').map_or("", |(_, r)| r);
-        } else if let Some(r) = s.strip_prefix("/*") {
-            s = r.split_once("*/").map_or("", |(_, r)| r);
-        } else {
-            return s.chars().next();
-        }
-    }
-}
-
-/// Load a JSON (or JSONC) object. Returns whether the file had comments, which a rewrite
-/// would drop (the caller backs the file up first).
-fn load_json_object(path: &Path) -> anyhow::Result<(serde_json::Value, bool)> {
-    if !path.exists() {
-        return Ok((serde_json::json!({}), false));
-    }
-    let raw = std::fs::read_to_string(path)?;
-    let (value, had_comments) = match serde_json::from_str::<serde_json::Value>(&raw) {
-        Ok(v) => (v, false),
-        Err(e) => {
-            let stripped = strip_jsonc(&raw);
-            let v = serde_json::from_str(&stripped).map_err(|_| {
-                anyhow::anyhow!("Failed to parse existing JSON at {}: {}", path.display(), e)
-            })?;
-            (v, true)
-        }
-    };
-    if !value.is_object() {
-        anyhow::bail!(
-            "{} does not contain a JSON object at its root",
-            path.display()
-        );
-    }
-    Ok((value, had_comments))
-}
-
-fn save_json_object(
-    path: &Path,
-    root: &serde_json::Value,
-    had_comments: bool,
-) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    if had_comments {
-        let backup = PathBuf::from(format!("{}.bak", path.display()));
-        std::fs::copy(path, &backup)?;
-        eprintln!(
-            "Note: {} contained comments, which JSON rewriting drops; original saved as {}",
-            path.display(),
-            backup.display()
-        );
-    }
-    std::fs::write(path, serde_json::to_string_pretty(root)?)?;
-    Ok(())
-}
-
 /// Warn (not block) if the binary being registered lives somewhere likely to disappear or
 /// move: not on PATH, or inside a Downloads/tmp/cargo-build directory. The MCP config will
 /// keep pointing at this exact file path, so if it's deleted or moved, the server stops
@@ -746,7 +720,7 @@ fn warn_if_unstable_binary_path(exe: &Path) {
             "Warning: registering memdag from {}, which is {reason}. \
              If this file is moved or deleted, the MCP server entry will stop working.\n\
              Move the binary to a stable location on PATH (e.g. ~/.local/bin on Linux/macOS) \
-             and rerun `memdag mcp install` from there to avoid this.",
+             and rerun `memdag install` from there to avoid this.",
             exe.display(),
         );
     }
@@ -779,6 +753,11 @@ fn unstable_binary_reason(exe: &Path, path_dirs: &[PathBuf]) -> Option<&'static 
 }
 
 fn handle_mcp_action(action: &McpAction, cli_db: Option<PathBuf>) -> anyhow::Result<()> {
+    use memdag::install::{self, Parts};
+    let mcp_only = Parts {
+        mcp: true,
+        ..Parts::NONE
+    };
     match action {
         McpAction::Install {
             global,
@@ -786,29 +765,25 @@ fn handle_mcp_action(action: &McpAction, cli_db: Option<PathBuf>) -> anyhow::Res
             client,
             key,
         } => {
-            let cfg_path = mcp_config_path(*client, *global, path.clone())?;
-            let key = key.as_deref().unwrap_or(default_key(*client));
-            let (mut root, had_comments) = load_json_object(&cfg_path)?;
-
-            let exe = std::env::current_exe()?;
-            warn_if_unstable_binary_path(&exe);
-            let entry = mcp_entry(*client, &exe, cli_db.as_deref());
-
-            root.as_object_mut()
-                .unwrap()
-                .entry(key)
-                .or_insert_with(|| serde_json::json!({}))
-                .as_object_mut()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("'{key}' in {} is not an object", cfg_path.display())
-                })?
-                .insert("memdag".to_string(), entry);
-
-            save_json_object(&cfg_path, &root, had_comments)?;
-            println!(
-                "Installed memdag MCP server into {} (key: '{key}')",
-                cfg_path.display()
-            );
+            let opts = install_options(mcp_only, None, cli_db, false)?;
+            let t = client.target();
+            let env = install_env(None)?;
+            match (path, key) {
+                (None, None) => {
+                    print_steps(t, &install::install(t, &env, location(*global), &opts)?)
+                }
+                _ => {
+                    let (path, change) = install::install_entry_at(
+                        t,
+                        &env,
+                        location(*global),
+                        &opts,
+                        path.as_deref(),
+                        key.as_deref(),
+                    )?;
+                    println!("{change:?}: {} (MCP server)", path.display());
+                }
+            }
         }
         McpAction::Uninstall {
             global,
@@ -816,41 +791,27 @@ fn handle_mcp_action(action: &McpAction, cli_db: Option<PathBuf>) -> anyhow::Res
             client,
             key,
         } => {
-            let cfg_path = mcp_config_path(*client, *global, path.clone())?;
-            let key = key.as_deref().unwrap_or(default_key(*client));
-            let (mut root, had_comments) = load_json_object(&cfg_path)?;
-
-            let removed = root
-                .get_mut(key)
-                .and_then(|s| s.as_object_mut())
-                .and_then(|m| m.remove("memdag"))
-                .is_some();
-
-            if removed {
-                save_json_object(&cfg_path, &root, had_comments)?;
-                println!(
-                    "Removed memdag MCP server entry from {}",
-                    cfg_path.display()
-                );
-            } else {
-                println!("No memdag MCP server entry found in {}", cfg_path.display());
+            let t = client.target();
+            let env = install_env(None)?;
+            match (path, key) {
+                (None, None) => print_steps(
+                    t,
+                    &install::uninstall(t, &env, location(*global), mcp_only, &[])?,
+                ),
+                _ => {
+                    let (path, change) = install::remove_entry_at(
+                        t,
+                        &env,
+                        location(*global),
+                        path.as_deref(),
+                        key.as_deref(),
+                    )?;
+                    println!("{change:?}: {} (MCP server)", path.display());
+                }
             }
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod jsonc_tests {
-    use super::strip_jsonc;
-
-    #[test]
-    fn strips_comments_and_trailing_commas_but_not_strings() {
-        let raw = "{\n  // c\n  \"a\": \"http://x//y\", /* b */\n  \"l\": [1, 2,],\n}\n";
-        let v: serde_json::Value = serde_json::from_str(&strip_jsonc(raw)).unwrap();
-        assert_eq!(v["a"], "http://x//y");
-        assert_eq!(v["l"], serde_json::json!([1, 2]));
-    }
 }
 
 #[cfg(test)]

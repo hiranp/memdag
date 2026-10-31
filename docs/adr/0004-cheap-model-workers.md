@@ -107,5 +107,6 @@ Option 3.
   apply last, so the worker file's `allow` rules also override a user's `ask` rule. A broad
   `read` allow was deliberately left out, because it would override OpenCode's default `ask`
   for `.env` files.
-- Not done yet: MCP sampling as a third path; worker files for Codex, Cursor and Gemini;
-  consolidation of duplicate memories as a third task.
+- Follow-ups since: a third task, `consolidate` (duplicate and conflicting memories), and
+  worker files for Cursor, Gemini CLI, Codex and Copilot via `memdag install` (ADR 0006).
+  MCP sampling was considered there and deferred.

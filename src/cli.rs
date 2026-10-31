@@ -24,7 +24,64 @@ pub enum Commands {
     /// Start the Model Context Protocol (MCP) server over stdio
     Serve,
 
-    /// Install or remove memdag as an MCP server in a client config (project or global scope)
+    /// Wire memdag into your agent harnesses: MCP server entry, cheap-model worker subagent,
+    /// instructions, skill and tool approvals. Detects installed harnesses by default.
+    Install {
+        /// auto (detected harnesses), all, or a comma-separated list of: claude-code,
+        /// opencode, codex, cursor, gemini, vscode, kiro, antigravity
+        #[arg(long, default_value = "auto")]
+        target: String,
+        /// User-global configs instead of this project's
+        #[arg(long)]
+        global: bool,
+        /// Worker model (Claude Code default: haiku; others use their own default unless set)
+        #[arg(long)]
+        model: Option<String>,
+        /// Only update harnesses that already have a memdag entry (e.g. after upgrading)
+        #[arg(long)]
+        refresh: bool,
+        /// Print what would be written, change nothing
+        #[arg(long)]
+        print_config: bool,
+        /// Skip the MCP server entry
+        #[arg(long)]
+        no_mcp: bool,
+        /// Skip the memdag-worker subagent
+        #[arg(long)]
+        no_worker: bool,
+        /// Skip the instructions block / rule file
+        #[arg(long)]
+        no_instructions: bool,
+        /// Skip the memdag skill
+        #[arg(long)]
+        no_skill: bool,
+        /// Don't auto-approve the worker's get_work / submit_work
+        #[arg(long)]
+        no_permissions: bool,
+        /// Also add a Claude Code SessionStart hook that mentions waiting upkeep
+        #[arg(long)]
+        hooks: bool,
+        /// OpenCode: write the V1 server shape (mcp.memdag) instead of V2 (mcp.servers.memdag)
+        #[arg(long)]
+        opencode_v1: bool,
+    },
+
+    /// Remove everything `memdag install` wrote (only memdag's own files, blocks and keys)
+    Uninstall {
+        /// auto (detected harnesses), all, or a comma-separated list (see install)
+        #[arg(long, default_value = "auto")]
+        target: String,
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Entry points for harness hooks (installed by `memdag install --hooks`)
+    Hook {
+        #[command(subcommand)]
+        event: HookEvent,
+    },
+
+    /// Install or remove only the MCP server entry in one client's config
     Mcp {
         #[command(subcommand)]
         action: McpAction,
@@ -222,15 +279,47 @@ pub enum Commands {
     },
 }
 
-/// MCP client presets for `memdag mcp install|uninstall --client`.
+/// Agent harnesses, for `--client` (see `memdag install --target` for all of them at once).
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum McpClient {
-    /// `.mcp.json` / `~/.claude.json`, key `mcpServers`
+    /// `.mcp.json` / `~/.claude.json`
     ClaudeCode,
-    /// `opencode.json[c]` / `~/.config/opencode/opencode.json[c]`, key `mcp`
+    /// `opencode.json[c]` / `~/.config/opencode/opencode.json[c]`
     Opencode,
-    /// `~/.gemini/config/mcp_config.json`, key `mcpServers` (always the global file)
+    /// `.codex/config.toml` / `~/.codex/config.toml`
+    Codex,
+    /// `.cursor/mcp.json` / `~/.cursor/mcp.json`
+    Cursor,
+    /// `.gemini/settings.json` / `~/.gemini/settings.json`
+    Gemini,
+    /// GitHub Copilot: `.vscode/mcp.json` / the VS Code user `mcp.json`
+    Vscode,
+    /// `.kiro/settings/mcp.json` / `~/.kiro/settings/mcp.json`
+    Kiro,
+    /// `.agents/mcp_config.json` / `~/.gemini/config/mcp_config.json`
     Antigravity,
+}
+
+impl McpClient {
+    pub fn target(self) -> memdag::install::Target {
+        use memdag::install::Target;
+        match self {
+            McpClient::ClaudeCode => Target::ClaudeCode,
+            McpClient::Opencode => Target::Opencode,
+            McpClient::Codex => Target::Codex,
+            McpClient::Cursor => Target::Cursor,
+            McpClient::Gemini => Target::Gemini,
+            McpClient::Vscode => Target::Vscode,
+            McpClient::Kiro => Target::Kiro,
+            McpClient::Antigravity => Target::Antigravity,
+        }
+    }
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HookEvent {
+    /// Print a one-line note about waiting memdag upkeep (Claude Code SessionStart hook)
+    SessionStart,
 }
 
 #[derive(Subcommand, Debug)]
@@ -301,7 +390,7 @@ pub enum WorkAction {
     /// harness's instructions file (CLAUDE.md / AGENTS.md)
     Install {
         #[arg(long, value_enum, default_value = "claude-code")]
-        client: WorkerClient,
+        client: McpClient,
         /// User-global files instead of the project's
         #[arg(long)]
         global: bool,
@@ -321,7 +410,7 @@ pub enum WorkAction {
     /// Remove what `work install` wrote (only files and blocks memdag marked as its own)
     Uninstall {
         #[arg(long, value_enum, default_value = "claude-code")]
-        client: WorkerClient,
+        client: McpClient,
         #[arg(long)]
         global: bool,
     },
@@ -333,13 +422,4 @@ pub enum WorkAction {
         #[arg(long, default_value_t = memdag::work::DEFAULT_ROUNDS)]
         rounds: usize,
     },
-}
-
-/// Harnesses `memdag work install` can add the worker subagent to.
-#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WorkerClient {
-    /// `.claude/agents/memdag-worker.md` + CLAUDE.md
-    ClaudeCode,
-    /// `.opencode/agents/memdag-worker.md` + AGENTS.md
-    Opencode,
 }

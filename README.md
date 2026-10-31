@@ -70,12 +70,12 @@ memdag exposes a standard Model Context Protocol (MCP) surface over stdio:
 | `list_ready` | `limit` | Lists claimable tasks/blockers: active, with no incoming active `blocks` edge. |
 | `resolve_memory` | `id`, `note` | Marks tasks or blockers as resolved with a completion note. |
 | `consolidate_session` | `session_id`, `learnings`, `purge_ephemeral` | Promotes session learnings and prunes ephemeral scratchpads. |
-| `get_work` | `task` (`expand` or `verify`), `limit` | Hands out a batch of bulk upkeep, with the instructions for it, to run on a cheap model. See [Cheap-model workers](#cheap-model-workers). |
+| `get_work` | `task` (`expand`, `verify` or `consolidate`), `limit` | Hands out a batch of bulk upkeep, with the instructions for it, to run on a cheap model. See [Cheap-model workers](#cheap-model-workers). |
 | `submit_work` | `task`, `results` or `reply` | Applies the worker's answers: search keywords, or confirm/correct STALE memories. |
 
 MCP prompts (slash commands in clients that support them, e.g. `/mcp__memdag__verify_stale` in
-Claude Code, `/memdag:verify_stale` in OpenCode): `expand_keywords` and `verify_stale` run those
-tasks end to end on a cheap subagent.
+Claude Code, `/memdag:verify_stale` in OpenCode): `expand_keywords`, `verify_stale` and
+`consolidate_memories` run those tasks end to end on a cheap subagent.
 
 ---
 
@@ -88,7 +88,7 @@ and Windows via [GitHub Actions](.github/workflows/release.yml) — see the
 [Releases](https://github.com/hiranp/memdag/releases) page.
 
 Extract it somewhere stable and on `PATH`, not left in `~/Downloads` or a temp directory —
-both the CLI and the MCP config `memdag mcp install` writes reference this exact file path:
+both the CLI and the configs `memdag install` writes reference this exact file path:
 
 ```bash
 # Linux / macOS
@@ -99,7 +99,7 @@ chmod +x ~/.local/bin/memdag
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-`memdag mcp install` warns if it's run from a Downloads/tmp/build directory or a path that
+`memdag install` warns if it's run from a Downloads/tmp/build directory or a path that
 isn't on `PATH`, since moving or deleting that file later breaks the registered MCP entry.
 
 ### Build from source
@@ -111,47 +111,63 @@ cargo build --release
 ```
 
 The optimized binary is built at `target/release/memdag` — move it to `~/.local/bin` (see
-above) before running `memdag mcp install`, rather than registering it straight out of
+above) before running `memdag install`, rather than registering it straight out of
 `target/release/`.
 
-### Install MCP Client Configuration
-
-`memdag mcp install` automatically registers the server in your client configuration. Only
-Claude Code reads `.mcp.json` / `~/.claude.json` directly, so that's the zero-flag default;
-every other client keeps its own file, location, and (for VS Code) top-level JSON key —
-`install`/`uninstall` only ever touch one key in whatever file you point `--path` at via
-`--key`, so it's safe on a config shared with other servers.
-
-| Client | Command | Notes |
-|---|---|---|
-| **Claude Code** (project) | `memdag mcp install` | writes `./.mcp.json`, key `mcpServers` |
-| **Claude Code** (user) / **Claude Desktop** | `memdag mcp install --global` | macOS/Linux: `~/.claude.json`; Windows: `%APPDATA%\Claude\claude_desktop_config.json` for Desktop |
-| **Codex CLI** | manual — see below | `~/.codex/config.toml`, TOML table `[mcp_servers.memdag]`, not JSON |
-| **Cursor** (project) | `memdag mcp install --path .cursor/mcp.json` | key `mcpServers` |
-| **Cursor** (user) | `memdag mcp install --path ~/.cursor/mcp.json` | key `mcpServers` |
-| **VS Code** (workspace) | `memdag mcp install --path .vscode/mcp.json --key servers` | VS Code uses `servers`, not `mcpServers` — `--key` is required here |
-| **VS Code** (user profile) | `memdag mcp install --path <user-mcp.json> --key servers` | Linux: `~/.config/Code/User/mcp.json`; macOS: `~/Library/Application Support/Code/User/mcp.json`; Windows: `%APPDATA%\Code\User\mcp.json`. Easiest: run **MCP: Open User Configuration** in VS Code once (creates the file), note the path it opens, then run the command above |
-| **Windsurf** | `memdag mcp install --path ~/.codeium/windsurf/mcp_config.json` | key `mcpServers` |
-| **Antigravity** (global, works today) | `memdag mcp install --path ~/.gemini/config/mcp_config.json` | key `mcpServers`; the project-local `.antigravitycli/mcp_config.json` file uses the same shape but [isn't actually loaded yet](https://github.com/google-antigravity/antigravity-cli/issues/60) as of Antigravity CLI v1.0.0 |
-
-pi has no MCP client at all, by design (see [pi's README](https://github.com/earendil-works/pi-coding-agent) for the
-rationale) — use the Skill below instead.
-
-Codex stores config as TOML, not JSON, so `mcp install`'s JSON merge doesn't apply. Either
-run `codex mcp add memdag -- /path/to/memdag serve`, or add by hand:
-
-```toml
-# ~/.codex/config.toml
-[mcp_servers.memdag]
-command = "/path/to/memdag"
-args = ["serve"]
-```
-
-To uninstall (same `--path`/`--key` flags as install):
+### Connect your agents: `memdag install`
 
 ```bash
-memdag mcp uninstall --global
+memdag install                 # every harness detected on this machine, for this project
+memdag install --global        # the same, in your user-level configs (all projects)
+memdag install --target claude-code,opencode --model <cheap model>
+memdag install --print-config  # show what would be written; change nothing
+memdag install --refresh       # after upgrading: update only harnesses already set up
+memdag uninstall               # remove all of it (only what memdag wrote)
 ```
+
+For each harness it writes:
+
+- **the MCP server entry**, edited in place. Comments, formatting and other servers in the file
+  are kept, and a file memdag can't parse is refused, not rewritten.
+- **the `memdag-worker` subagent** on a cheap model, for [cheap-model workers](#cheap-model-workers).
+- **instructions**: a marked `<!-- MEMDAG_START -->` block in the harness's instructions file,
+  or a rule/steering file of memdag's own.
+- **the memdag skill** (`SKILL.md`), in a skills folder the harness reads.
+- **approvals** for the worker's two tools, where a file can grant them.
+
+Each part can be skipped: `--no-mcp`, `--no-worker`, `--no-instructions`, `--no-skill`,
+`--no-permissions`. `--hooks` also adds a Claude Code SessionStart hook
+(`memdag hook session-start`), which mentions memories waiting for upkeep.
+
+| `--target` | MCP config (project / `--global`) | Worker | Instructions | Skill |
+|---|---|---|---|---|
+| `claude-code` | `.mcp.json` / `~/.claude.json` | `.claude/agents/` (model: haiku) | `CLAUDE.md` | `.claude/skills/` |
+| `opencode` | `opencode.json[c]` / `~/.config/opencode/` (V2 `mcp.servers`, `codemode: false`) | `.opencode/agents/` | `AGENTS.md` | `.agents/skills/` |
+| `codex` | `.codex/config.toml` / `~/.codex/config.toml` | `.codex/agents/*.toml` | `AGENTS.md` | `.agents/skills/` |
+| `cursor` | `.cursor/mcp.json` / `~/.cursor/mcp.json` | `.cursor/agents/` | `.cursor/rules/memdag.mdc` (project) | `.agents/skills/` |
+| `gemini` | `.gemini/settings.json` / `~/.gemini/settings.json` | `.gemini/agents/` | `GEMINI.md` | `.agents/skills/` |
+| `vscode` (Copilot) | `.vscode/mcp.json` / VS Code user `mcp.json` (`servers`) | `.github/agents/` | `.github/copilot-instructions.md` | `.agents/skills/` |
+| `kiro` | `.kiro/settings/mcp.json` / `~/.kiro/settings/` (`autoApprove`) | — | `.kiro/steering/memdag.md` | `.kiro/skills/` |
+| `antigravity` | `.agents/mcp_config.json` / `~/.gemini/config/mcp_config.json` | — | `.agents/rules/memdag.md` | `.agents/skills/` |
+
+Notes:
+
+- **Command path.** Project configs say plain `memdag` when that resolves to the same binary
+  on `PATH`, so a committed config works for every collaborator. Global configs, and
+  Antigravity (whose macOS app doesn't see the shell's `PATH`), use the absolute path.
+- **Shared files.** Files several harnesses use (one `AGENTS.md`, one `.agents/skills/memdag`)
+  are kept on uninstall while another harness still has memdag configured.
+- **OpenCode.** OpenCode V2 reads the V1 shape too, but V1 can't read V2's; use
+  `--opencode-v1` for V1. An existing V1 entry is migrated when V2 is written.
+- **Codex.** Codex reads a project's `.codex/config.toml` only once the project is trusted.
+- **Worker model.** Only Claude Code has a model alias to default to (`haiku`). Elsewhere,
+  pass `--model` with a Haiku- or Flash-class model id, or the worker uses the harness's
+  default model.
+
+`memdag mcp install --client <target>` writes only the MCP entry. With `--path`/`--key` it
+writes it into any file, which covers clients without a target, e.g. Windsurf:
+`memdag mcp install --path ~/.codeium/windsurf/mcp_config.json`. pi has no MCP client by design;
+use the skill below instead.
 
 ### Will agents actually call these tools?
 
@@ -181,21 +197,13 @@ This project uses memdag (MCP) for durable memory and task tracking.
   purge scratch/ephemeral notes.
 ```
 
-**Or install it as a Skill.** [`.agents/skills/memdag/`](.agents/skills/memdag/SKILL.md) is the
-canonical location for the shared [Agent Skills standard](https://agentskills.io/specification):
-**pi**, **Codex CLI**, and **VS Code Copilot** all discover `.agents/skills/` in your repo
-automatically — no setup needed, nothing to symlink. **Claude Code** looks in `.claude/skills/`
-instead, so that's a symlink (already committed in this repo, `.claude/skills/memdag ->
-../../.agents/skills/memdag`; do the same in your own project):
-
-```bash
-mkdir -p .claude/skills
-ln -s "$(pwd)/.agents/skills/memdag" .claude/skills/memdag
-```
-
-Antigravity supports `SKILL.md` too, but its exact discovery directory wasn't confirmed at
-the time of writing — check its `/skills` panel for the workspace/global paths it's actually
-scanning and symlink `.agents/skills/memdag` there if needed.
+**The skill.** `memdag install` puts the memdag skill
+([`.agents/skills/memdag/SKILL.md`](.agents/skills/memdag/SKILL.md), shipped inside the binary)
+where each harness looks for skills: `.agents/skills/` for the
+[Agent Skills standard](https://agentskills.io/specification) (Codex, Cursor, Gemini CLI,
+Copilot, OpenCode, Antigravity), `.claude/skills/` for Claude Code and `.kiro/skills/` for
+Kiro. pi reads `.agents/skills/` too. A skill folder memdag didn't write (like this repo's own
+`.claude/skills/memdag` symlink) is left alone.
 
 ### Manual Configuration
 
@@ -409,7 +417,7 @@ dropped (vectors from two models can't be compared) and `memdag embed` recompute
 
 Some upkeep is bulk text work that a small, cheap model does well. memdag never calls a model
 itself and needs no API key. It hands out batches of work, with the instructions for them,
-and your agent runs them on a Claude Haiku, Gemini Flash or similar subagent. Two tasks exist:
+and your agent runs them on a Claude Haiku, Gemini Flash or similar subagent. Three tasks exist:
 
 - **`expand`: search keywords.** For each memory, the worker writes the synonyms, related
   terms, abbreviations and error codes someone might search for. They go into the full-text
@@ -431,12 +439,24 @@ and your agent runs them on a Claude Haiku, Gemini Flash or similar subagent. Tw
   reply, so a repeated, late or invented answer does nothing. Likewise, keywords can only be
   written for memories still waiting for them.
 
+- **`consolidate`: duplicates and conflicts.** memdag pairs active decisions, invariants and
+  learnings whose text overlaps, and the worker judges each pair:
+  - `duplicate`, naming the one to keep: the other is resolved as a duplicate (for a note, via
+    its `.resolved.md` file, so this survives a rebuild) and linked to the kept one.
+  - `conflict`: a task "Reconcile conflicting memories A and B" is recorded for a person or
+    agent to settle; neither memory changes.
+  - `related`: the two are linked.
+  - `distinct`: nothing changes.
+
+  Each pair is judged once. Only pairs memdag itself would offer are accepted.
+
 **With an MCP client**, install the worker subagent once, then run the prompt:
 
 ```bash
-memdag work install --client claude-code              # .claude/agents/memdag-worker.md (model: haiku) + CLAUDE.md block
-memdag work install --client opencode --model <provider>/<haiku-or-flash-model>   # .opencode/agents/ + AGENTS.md block
-# add --global for ~/.claude or ~/.config/opencode; `memdag work uninstall` removes only what memdag wrote
+memdag install --target claude-code                   # .claude/agents/memdag-worker.md (model: haiku) + CLAUDE.md block
+memdag install --target opencode --model <provider>/<haiku-or-flash-model>   # .opencode/agents/ + AGENTS.md block
+# Cursor, Gemini CLI, Codex and Copilot get a worker too (pass --model); see the install table
+# add --global for user-level configs; `memdag uninstall` removes only what memdag wrote
 ```
 
 The install also auto-approves the worker's two tools, `get_work` and `submit_work`, so a
