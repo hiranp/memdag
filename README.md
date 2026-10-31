@@ -31,6 +31,24 @@ memdag combines the strengths of each approach into a single in-process, SQLite-
 - **Ephemeral session lifecycle**: Automatic TTL sweeping keeps scratch context from polluting long-term memory.
 - **Dependency-aware task tracking, for free**: `task`/`blocker` kinds plus `depends_on`/`blocks` edges and `resolve_memory` give you lightweight, DAG-aware task tracking on the same schema — no separate issue tracker for agent-scoped work. See [Task Tracking](#task-tracking) below, and [Scope & Limitations](#scope--limitations) for where this stops being enough.
 
+### Does it help?
+
+A [benchmark](bench/RESULTS.md) gives a Claude Haiku agent eight ordinary tasks on a small
+project. Each task quietly depends on a house rule a past session recorded but the code
+doesn't state. With memdag installed (MCP server plus the instructions `memdag install`
+writes), the agent needed **71% fewer corrections**: 0.42 → 0.12 per task, a pass rate of
+57% → 88% (p = 0.005). Cost per task went up about 38%, because the agent reads search
+results.
+
+- **Install, don't just connect.** With only the MCP server connected, the agent rarely
+  searched and did no better than having no memory.
+- **Stronger models gain less.** Sonnet went from 71% to 83%, not significant at 24 runs.
+- **Retrieval bug found.** The benchmark exposed a search bug: an agent's natural phrases
+  found nothing whenever one word was missing from the memory. It's fixed in 0.4.1.
+
+Read [the results and their limits](bench/RESULTS.md) before relying on these numbers: one
+synthetic project, small samples.
+
 ---
 
 ## Architecture Overview
@@ -449,7 +467,8 @@ and your agent runs them on a Claude Haiku, Gemini Flash or similar subagent. Th
   terms, abbreviations and error codes someone might search for. They go into the full-text
   index at half the weight of the memory's own text. So `lock contention` finds "Use WAL
   journal mode" with no embedding model. This is the lightweight alternative to
-  `MEMDAG_EMBED_CMD`; you can use both.
+  `MEMDAG_EMBED_CMD`; you can use both. In the [benchmark](bench/RESULTS.md) it showed no gain
+  once search had its any-word fallback, so treat it as optional.
 - **`verify`: check STALE memories.** The worker reads the cited files that changed and answers
   for each memory:
   - `valid`: the files become the new baseline, so the memory is no longer stale. A

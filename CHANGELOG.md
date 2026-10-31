@@ -34,6 +34,12 @@ versions follow [Semantic Versioning](https://semver.org/). Releases are cut wit
 
 ### Fixed
 
+- **Keyword search found nothing for natural phrases.** FTS5 terms were ANDed, so a query
+  like "VAT invoice" or "order created_at timestamp" missed a memory that lacked one of the
+  words. Search now returns memories with every word first, then, while there's room,
+  memories with any of them (3+ characters, filler words skipped), ranked by BM25. In the
+  benchmark this raised how often the relevant memory reached the agent from 15% to 55%, and
+  the pass rate with memdag installed from 65% to 88%.
 - `search_vector` no longer returns resolved, superseded or other-kind memories. It applies
   `include_resolved` and `kind` (new optional MCP arguments), over-fetches so filtering doesn't
   cut results short, and returns relations and staleness like keyword search.

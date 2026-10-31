@@ -127,6 +127,17 @@ open:
 
 ## Validation
 
+First results (`bench/RESULTS.md`, October 2026): on a synthetic project with eight hidden
+house rules, a Claude Haiku agent with memdag installed needed 71% fewer corrections than
+without memory (pass rate 57% → 88%, p = 0.005, 40 runs per condition). It cost about 38% more
+per task. With only the MCP server connected, without the instructions `memdag install` writes,
+there was no gain. Sonnet's gain (71% → 83%) was not significant at 24 runs. Worker keyword
+expansion showed no benefit. The run also exposed and fixed a retrieval bug (all-words FTS
+matching). Still to do: replaying real `email-agent` tasks, comparing with Hindsight, and
+measuring STALE flag accuracy.
+
+Original plan:
+
 The claim to test is Hindsight's: memory should cut corrections and cost, not raise solve
 rate. Replay a fixed set of recent tasks from `email-agent` with (a) no memory, (b) memdag,
 (c) Hindsight daemon mode, and compare corrections per task, tokens, and wall time. Check

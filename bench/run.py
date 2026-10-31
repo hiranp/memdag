@@ -4,12 +4,19 @@
 Runs each task in `tasks.py` with a coding agent (Claude Code, headless) on a fresh copy of
 `fixture/`, under three conditions:
 
-  none      no memory: the agent sees only the code.
-  memdag    the memdag MCP server, holding the memories in `memories.py`.
-  keywords  the same, after a cheap model expanded the memories' search keywords
-            (`memdag work next expand`), to test the vocabulary gap.
+  none                no memory: the agent sees only the code.
+  mcp                 the memdag MCP server, holding the memories in `memories.py`.
+  installed           the same, plus the instructions `memdag install` adds to CLAUDE.md.
+  installed+keywords  the same, after a cheap model expanded the memories' search keywords
+                      (`memdag work next expand`), to test the vocabulary gap.
 
-and grades the result with each task's deterministic grader. A failed grade is one
+and grades the result with each task's deterministic grader.
+
+The memdag conditions come in two forms: `mcp` only connects the server (the agent sees the
+server's own instructions and tool descriptions), while `installed` adds the instructions
+block `memdag install` writes to CLAUDE.md. `--bare` doesn't read CLAUDE.md, so the block is
+passed with --append-system-prompt; it is taken from `memdag install --print-config`, so it is
+exactly what an install writes. A failed grade is one
 correction a reviewer would have to ask for.
 
 Isolation: `claude --bare` (no CLAUDE.md discovery, no auto-memory, no hooks, no plugins),
@@ -38,7 +45,8 @@ sys.path.insert(0, str(HERE))
 import memories  # noqa: E402
 import tasks  # noqa: E402
 
-CONDITIONS = ["none", "memdag", "keywords"]
+CONDITIONS = ["none", "mcp", "installed", "installed+keywords"]
+DB_FOR = {"mcp": "plain", "installed": "plain", "installed+keywords": "keywords"}
 MEMDAG_TOOLS = ["search_memory", "get_memory", "list_memories", "search_vector"]
 SETTINGS_KEYS = ("apiKeyHelper", "provider")
 ENV_KEYS = (
@@ -95,7 +103,18 @@ def build_dbs(binary: Path, work: Path, settings: Path, model: str) -> dict[str,
             capture_output=True, text=True, cwd=expanded.parent, timeout=300,
         )
         print(memdag(binary, expanded, "work", "submit", "--task", "expand", stdin=reply.stdout).splitlines()[0], file=sys.stderr)
-    return {"memdag": plain, "keywords": expanded}
+    return {"plain": plain, "keywords": expanded}
+
+
+def instructions_block(binary: Path) -> str:
+    """The block `memdag install` writes to CLAUDE.md, from the binary itself."""
+    out = subprocess.run(
+        [str(binary), "install", "--print-config", "--target", "claude-code", "--global",
+         "--no-mcp", "--no-worker", "--no-skill", "--no-permissions"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    start, end = out.index("<!-- MEMDAG_START -->"), out.index("<!-- MEMDAG_END -->")
+    return out[start:end + len("<!-- MEMDAG_END -->")]
 
 
 def claude_cmd(settings: Path, model: str) -> list[str]:
@@ -119,13 +138,15 @@ def run_one(args, settings: Path, dbs: dict, binary: Path, task, cond: str, rep:
     ]
     if cond != "none":
         db = work / "memdag.db"
-        shutil.copy(dbs[cond], db)
+        shutil.copy(dbs[DB_FOR[cond]], db)
         cfg = work / "mcp.json"
         cfg.write_text(json.dumps({"mcpServers": {"memdag": {
             "type": "stdio", "command": str(binary), "args": ["serve"],
             "env": {"MEMDAG_DB": str(db), "MEMDAG_NO_AUTO_IMPORT": "1"},
         }}}))
         cmd += [f"mcp__memdag__{t}" for t in MEMDAG_TOOLS] + ["--mcp-config", str(cfg)]
+        if cond.startswith("installed"):
+            cmd += ["--append-system-prompt", args.instructions]
     cmd += ["-p", prompt + "\n\nMake the change in this repository; don't ask questions."]
 
     started = time.time()
@@ -160,11 +181,27 @@ def run_one(args, settings: Path, dbs: dict, binary: Path, task, cond: str, rep:
         "input_tokens": usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0) + usage.get("cache_creation_input_tokens", 0),
         "output_tokens": usage.get("output_tokens", 0),
         "memdag_calls": sum(v for k, v in tool_calls.items() if k.startswith("mcp__memdag__")),
+        "recalled": rule in json.dumps(lines_with_tool_results(lines)),
         "error": result.get("subtype") if result.get("is_error") else (None if result else "no result"),
     }
     if not args.keep:
         shutil.rmtree(work, ignore_errors=True)
     return row
+
+
+def lines_with_tool_results(lines: list[str]) -> list:
+    """memdag tool results the agent received (to see whether the rule was in front of it)."""
+    found = []
+    for line in lines:
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if ev.get("type") == "user":
+            for block in ev.get("message", {}).get("content", []) or []:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    found.append(block.get("content"))
+    return found
 
 
 def summarize(rows: list[dict], out: Path) -> str:
@@ -179,16 +216,17 @@ def summarize(rows: list[dict], out: Path) -> str:
             "secs": statistics.mean(r["duration_s"] for r in rs) if rs else 0,
             "tokens": statistics.mean(r["input_tokens"] + r["output_tokens"] for r in rs) if rs else 0,
             "memdag": statistics.mean(r["memdag_calls"] for r in rs) if rs else 0,
+            "recalled": sum(r.get("recalled", False) for r in rs) / len(rs) if rs else 0,
         }
 
-    lines = ["| Condition | Runs | Pass rate | Corrections / task | Cost / task | Tokens / task | Turns | Seconds | memdag calls |",
-             "|---|---|---|---|---|---|---|---|---|"]
+    lines = ["| Condition | Runs | Pass rate | Corrections / task | Cost / task | Tokens / task | Turns | Seconds | memdag calls | Rule recalled |",
+             "|---|---|---|---|---|---|---|---|---|---|"]
     for c in CONDITIONS:
         rs = [r for r in rows if r["condition"] == c]
         if not rs:
             continue
         s = stats(rs)
-        lines.append(f"| {c} | {s['runs']} | {s['pass']:.0%} | {s['corrections']:.2f} | ${s['cost']:.4f} | {s['tokens']:,.0f} | {s['turns']:.1f} | {s['secs']:.0f} | {s['memdag']:.1f} |")
+        lines.append(f"| {c} | {s['runs']} | {s['pass']:.0%} | {s['corrections']:.2f} | ${s['cost']:.4f} | {s['tokens']:,.0f} | {s['turns']:.1f} | {s['secs']:.0f} | {s['memdag']:.1f} | {s['recalled']:.0%} |")
     lines += ["", "| Task (rule) | " + " | ".join(CONDITIONS) + " |", "|---|" + "---|" * len(CONDITIONS)]
     for name, _, rule, _ in tasks.TASKS:
         cells = []
@@ -219,6 +257,7 @@ def main():
     binary = Path(args.memdag).resolve()
     if not binary.exists():
         sys.exit(f"memdag binary not found at {binary}; build it (cargo build --release) or pass --memdag")
+    args.instructions = instructions_block(binary)
     conds = [c for c in args.conditions.split(",") if c]
     chosen = [t for t in tasks.TASKS if not args.tasks or t[0] in args.tasks.split(",")]
 
