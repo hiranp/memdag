@@ -1,9 +1,11 @@
 use memdag::db::open_connection;
 use memdag::import::{
-    CommentSource, GhComment, ImportOptions, import_repo, last_imported_head, refresh_if_stale,
+    CommentSource, GhComment, ImportOptions, import_repo, last_gh_import, last_imported_head,
+    refresh_if_stale,
 };
 use memdag::models::{MemoryKind, MemoryStatus};
 use memdag::store::{MemoryStore, RecordOptions};
+use std::cell::RefCell;
 use std::path::Path;
 use std::process::Command;
 
@@ -65,6 +67,7 @@ fn fake_gh() -> FakeGh {
             author: Some("hiranp".into()),
             association: Some("OWNER".into()),
             url: Some("https://github.com/o/r/issues/752#issuecomment-9001".into()),
+            ..Default::default()
         },
         GhComment {
             id: 9002,
@@ -399,6 +402,16 @@ fn import_cli_end_to_end() {
     assert!(stats.contains("Total Memories:       6"), "{stats}");
     let found = run(&["search", "WAL"]);
     assert!(found.contains("ADR-0002"), "{found}");
+    let bad = Command::new(bin)
+        .args(["import", "--full"])
+        .env("MEMDAG_DB", &db)
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        !bad.status.success(),
+        "--full without --gh must be rejected"
+    );
 }
 
 #[test]
@@ -457,4 +470,167 @@ fn cli_write_through_via_memdag_toml_and_search_auto_refresh() {
     ]);
     let notes = std::fs::read_dir(repo.join("docs/memory")).unwrap().count();
     assert_eq!(notes, 5, "README + 3 seeded + DEC-cli");
+}
+
+/// Serves a mutable comment list and records the `since` of every fetch.
+#[derive(Default)]
+struct RecordingGh {
+    comments: RefCell<Vec<GhComment>>,
+    asked: RefCell<Vec<Option<String>>>,
+}
+impl CommentSource for RecordingGh {
+    fn fetch_comments(&self, _: &Path) -> anyhow::Result<Vec<GhComment>> {
+        Ok(self.comments.borrow().clone())
+    }
+    fn fetch_comments_since(
+        &self,
+        _: &Path,
+        since: Option<&str>,
+    ) -> anyhow::Result<Vec<GhComment>> {
+        self.asked.borrow_mut().push(since.map(str::to_string));
+        Ok(self
+            .comments
+            .borrow()
+            .iter()
+            .filter(|c| since.is_none_or(|s| c.updated_at.as_deref().is_none_or(|t| t >= s)))
+            .cloned()
+            .collect())
+    }
+}
+
+fn handoff(id: u64, updated: &str) -> GhComment {
+    GhComment {
+        id,
+        issue_number: Some(7),
+        body: format!("<!-- handoff -->\n**Handoff {id}**"),
+        created_at: Some(updated.into()),
+        updated_at: Some(updated.into()),
+        association: Some("MEMBER".into()),
+        ..Default::default()
+    }
+}
+
+fn gh_only(full: bool) -> ImportOptions {
+    ImportOptions {
+        git: false,
+        adr: false,
+        notes: false,
+        gh: true,
+        gh_full: full,
+        ..ImportOptions::all()
+    }
+}
+
+#[test]
+fn gh_import_is_incremental_after_the_first_fetch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    init_repo(&repo);
+    let mut store = store_at(&tmp.path().join("m.db"));
+    let gh = RecordingGh::default();
+    gh.comments
+        .borrow_mut()
+        .push(handoff(1, "2020-01-01T00:00:00Z"));
+
+    assert_eq!(last_gh_import(&store, &repo).unwrap(), None);
+    let r = import_repo(&mut store, &repo, &gh_only(false), &gh).unwrap();
+    assert_eq!(r.gh, 1, "{:?}", r.warnings);
+    let recorded = last_gh_import(&store, &repo).unwrap().expect("recorded");
+    assert_eq!(recorded.len(), 20, "{recorded}");
+    assert!(
+        recorded.ends_with('Z') && recorded.contains('T'),
+        "{recorded}"
+    );
+
+    // A comment edited after the first fetch comes back; the old one isn't asked for.
+    gh.comments
+        .borrow_mut()
+        .push(handoff(2, "2999-01-01T00:00:00Z"));
+    let r = import_repo(&mut store, &repo, &gh_only(false), &gh).unwrap();
+    assert_eq!(r.gh, 1);
+    assert_eq!(r.changed, 1);
+    assert_eq!(*gh.asked.borrow(), vec![None, Some(recorded)]);
+    assert!(store.get_memory("GH-1").unwrap().is_some());
+    assert!(store.get_memory("GH-2").unwrap().is_some());
+
+    // A failed fetch leaves the recorded time alone.
+    let before = last_gh_import(&store, &repo).unwrap();
+    let r = import_repo(&mut store, &repo, &gh_only(false), &BrokenGh).unwrap();
+    assert!(r.warnings.iter().any(|w| w.starts_with("gh: skipped")));
+    assert_eq!(last_gh_import(&store, &repo).unwrap(), before);
+}
+
+#[test]
+fn only_a_full_gh_fetch_prunes_deleted_comments() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    init_repo(&repo);
+    let mut store = store_at(&tmp.path().join("m.db"));
+    let gh = RecordingGh::default();
+    gh.comments.borrow_mut().extend([
+        handoff(1, "2020-01-01T00:00:00Z"),
+        handoff(2, "2020-01-01T00:00:00Z"),
+    ]);
+    import_repo(&mut store, &repo, &gh_only(false), &gh).unwrap();
+    assert!(store.get_memory("GH-2").unwrap().is_some());
+
+    // Comment 2 is deleted on GitHub: an incremental fetch can't tell.
+    gh.comments.borrow_mut().retain(|c| c.id != 2);
+    let r = import_repo(&mut store, &repo, &gh_only(false), &gh).unwrap();
+    assert_eq!(r.pruned, 0);
+    assert!(store.get_memory("GH-2").unwrap().is_some());
+
+    // --full fetches everything and removes it.
+    let r = import_repo(&mut store, &repo, &gh_only(true), &gh).unwrap();
+    assert_eq!(gh.asked.borrow().last(), Some(&None));
+    assert_eq!(r.pruned, 1);
+    assert!(store.get_memory("GH-2").unwrap().is_none());
+    assert!(store.get_memory("GH-1").unwrap().is_some());
+}
+
+#[test]
+fn incremental_gh_fetch_drops_a_comment_edited_out_of_being_a_handoff() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    init_repo(&repo);
+    let mut store = store_at(&tmp.path().join("m.db"));
+    let gh = RecordingGh::default();
+    gh.comments
+        .borrow_mut()
+        .push(handoff(1, "2020-01-01T00:00:00Z"));
+    import_repo(&mut store, &repo, &gh_only(false), &gh).unwrap();
+    assert!(store.get_memory("GH-1").unwrap().is_some());
+
+    gh.comments.borrow_mut()[0] = GhComment {
+        body: "never mind".into(),
+        updated_at: Some("2999-01-01T00:00:00Z".into()),
+        ..handoff(1, "2020-01-01T00:00:00Z")
+    };
+    let r = import_repo(&mut store, &repo, &gh_only(false), &gh).unwrap();
+    assert_eq!(r.pruned, 1);
+    assert!(store.get_memory("GH-1").unwrap().is_none());
+}
+
+#[test]
+fn default_since_filter_keeps_comments_updated_at_or_after() {
+    let gh = FakeGh(vec![
+        handoff(1, "2026-01-01T00:00:00Z"),
+        handoff(2, "2026-06-01T00:00:00Z"),
+        GhComment {
+            id: 3,
+            ..Default::default()
+        },
+    ]);
+    let ids = |since| -> Vec<u64> {
+        gh.fetch_comments_since(Path::new("."), since)
+            .unwrap()
+            .iter()
+            .map(|c| c.id)
+            .collect()
+    };
+    assert_eq!(ids(None), vec![1, 2, 3]);
+    assert_eq!(ids(Some("2026-06-01T00:00:00Z")), vec![2, 3]);
 }

@@ -29,6 +29,9 @@ pub struct ImportOptions {
     pub adr: bool,
     pub notes: bool,
     pub gh: bool,
+    /// Fetch every GitHub comment (and prune memories of deleted ones) instead of only those
+    /// updated since the last successful gh import of this checkout.
+    pub gh_full: bool,
     /// Only scan commits in `<since>..HEAD` (ADRs and notes are always rescanned; it's cheap).
     pub since: Option<String>,
     /// Repo-relative (or absolute) directories.
@@ -56,6 +59,7 @@ impl ImportOptions {
             adr: true,
             notes: true,
             gh: true,
+            gh_full: false,
             since: None,
             adr_dir: PathBuf::from(DEFAULT_ADR_DIR),
             notes_dir: PathBuf::from(crate::notes::DEFAULT_NOTES_DIR),
@@ -98,6 +102,8 @@ pub struct GhComment {
     pub issue_number: Option<u64>,
     pub body: String,
     pub created_at: Option<String>,
+    /// Last edit (GitHub's `updated_at`); what an incremental fetch filters on.
+    pub updated_at: Option<String>,
     pub author: Option<String>,
     /// GitHub's `author_association` (OWNER, MEMBER, COLLABORATOR, CONTRIBUTOR, NONE, ...).
     pub association: Option<String>,
@@ -107,20 +113,59 @@ pub struct GhComment {
 /// Where issue comments come from. [`GhCli`] in production; tests inject a fake.
 pub trait CommentSource {
     fn fetch_comments(&self, repo: &Path) -> Result<Vec<GhComment>>;
+
+    /// Comments updated at or after `since` (UTC ISO 8601, `YYYY-MM-DDTHH:MM:SSZ`); every
+    /// comment when `None`. The default fetches everything and filters here; a comment
+    /// without timestamps is kept (re-importing it is harmless).
+    fn fetch_comments_since(&self, repo: &Path, since: Option<&str>) -> Result<Vec<GhComment>> {
+        let all = self.fetch_comments(repo)?;
+        Ok(match since {
+            None => all,
+            Some(s) => all
+                .into_iter()
+                .filter(|c| {
+                    c.updated_at
+                        .as_deref()
+                        .or(c.created_at.as_deref())
+                        .is_none_or(|t| t >= s)
+                })
+                .collect(),
+        })
+    }
 }
 
 /// Fetches comments via `gh api --paginate repos/{owner}/{repo}/issues/comments`, run inside
 /// the repo so `gh` resolves `{owner}/{repo}` from its remote.
 pub struct GhCli;
 
+/// `YYYY-MM-DDTHH:MM:SSZ`, the only form put into the API URL.
+fn is_iso_utc(s: &str) -> bool {
+    s.len() == 20
+        && s.bytes().enumerate().all(|(i, b)| match i {
+            4 | 7 => b == b'-',
+            10 => b == b'T',
+            13 | 16 => b == b':',
+            19 => b == b'Z',
+            _ => b.is_ascii_digit(),
+        })
+}
+
 impl CommentSource for GhCli {
     fn fetch_comments(&self, repo: &Path) -> Result<Vec<GhComment>> {
+        self.fetch_comments_since(repo, None)
+    }
+
+    fn fetch_comments_since(&self, repo: &Path, since: Option<&str>) -> Result<Vec<GhComment>> {
+        let mut endpoint = String::from("repos/{owner}/{repo}/issues/comments?per_page=100");
+        if let Some(s) = since {
+            if !is_iso_utc(s) {
+                bail!("invalid gh `since` timestamp '{s}'");
+            }
+            endpoint.push_str("&since=");
+            endpoint.push_str(s);
+        }
         let out = Command::new("gh")
-            .args([
-                "api",
-                "--paginate",
-                "repos/{owner}/{repo}/issues/comments?per_page=100",
-            ])
+            .args(["api", "--paginate", &endpoint])
             .current_dir(repo)
             .output()
             .context("`gh` CLI not found on PATH")?;
@@ -154,6 +199,7 @@ pub fn parse_gh_comments(raw: &str) -> Result<Vec<GhComment>> {
                     .and_then(|u| u.rsplit('/').next().and_then(|n| n.parse().ok())),
                 body: s("body").unwrap_or_default(),
                 created_at: s("created_at"),
+                updated_at: s("updated_at"),
                 author: c
                     .get("user")
                     .and_then(|u| u.get("login"))
@@ -199,11 +245,19 @@ struct Batch {
     /// Ids to keep although no item was produced for them (the file exists but couldn't be
     /// read or parsed this time; deleting its row would be a surprise).
     keep: HashMap<&'static str, HashSet<String>>,
+    /// Ids whose source was seen but no longer yields an item (a comment edited so it is no
+    /// longer a trusted handoff). Dropped from this checkout even when the source wasn't
+    /// scanned completely.
+    forget: HashMap<&'static str, HashSet<String>>,
 }
 
 impl Batch {
     fn keep(&mut self, source: &'static str, id: String) {
         self.keep.entry(source).or_default().insert(id);
+    }
+
+    fn forget(&mut self, source: &'static str, id: String) {
+        self.forget.entry(source).or_default().insert(id);
     }
 }
 
@@ -249,6 +303,12 @@ fn is_ancestor(repo: &Path, ancestor: &str, head: &str) -> bool {
 /// The last imported HEAD is per checkout: every worktree has its own HEAD.
 fn head_meta_key(repo: &Path) -> String {
     format!("last_import_head:{}", crate::checkout::worktree_key(repo))
+}
+
+/// When the last successful gh fetch for this checkout started, per checkout like the HEAD
+/// (each checkout holds its own claims on the rows).
+fn gh_meta_key(repo: &Path) -> String {
+    format!("last_gh_import:{}", crate::checkout::worktree_key(repo))
 }
 
 /// Who an import is for: the repository (shared by its worktrees) and this checkout.
@@ -704,6 +764,7 @@ fn collect_gh(comments: Vec<GhComment>, batch: &mut Batch, report: &mut ImportRe
         // The marker must open the comment: a reply that quotes a handoff would otherwise
         // import a duplicate (and quoting is how someone untrusted gets text near the marker).
         if !c.body.trim_start().starts_with(HANDOFF_MARKER) {
+            batch.forget("gh", format!("GH-{}", c.id));
             continue;
         }
         // Fail closed: a comment with no association, or from outside the team, is ignored.
@@ -717,6 +778,7 @@ fn collect_gh(comments: Vec<GhComment>, batch: &mut Batch, report: &mut ImportRe
                 c.id,
                 c.association.as_deref().unwrap_or("unknown association")
             ));
+            batch.forget("gh", format!("GH-{}", c.id));
             continue;
         }
         let body = c.body.replace(HANDOFF_MARKER, "").trim().to_string();
@@ -785,17 +847,42 @@ pub fn import_repo(
     if opts.notes && collect_notes(&repo.join(&opts.notes_dir), &mut batch, &mut report) {
         batch.prune.push("note");
     }
+    let mut gh_fetched_at = None;
     if opts.gh {
-        match gh.fetch_comments(repo) {
+        let since = if opts.gh_full {
+            None
+        } else {
+            last_gh_import(store, repo)?
+        };
+        // Taken before the fetch, so a comment posted while it runs is fetched next time.
+        // Five minutes earlier covers clock skew against GitHub; refetching is harmless.
+        let started: String = store.connection().query_row(
+            "SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-5 minutes')",
+            [],
+            |r| r.get(0),
+        )?;
+        match gh.fetch_comments_since(repo, since.as_deref()) {
             Ok(comments) => {
                 collect_gh(comments, &mut batch, &mut report);
-                batch.prune.push("gh");
+                // Only a full fetch proves a comment was deleted.
+                if since.is_none() {
+                    batch.prune.push("gh");
+                }
+                gh_fetched_at = Some(started);
             }
             Err(e) => report.warnings.push(format!("gh: skipped ({e:#})")),
         }
     }
 
     apply(store, &batch, &mut report, &Checkout::of(repo))?;
+
+    if let Some(at) = gh_fetched_at {
+        store.connection().execute(
+            "INSERT INTO memdag_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![gh_meta_key(repo), at],
+        )?;
+    }
 
     if opts.record_head
         && let Some(head) = &report.head
@@ -1072,6 +1159,18 @@ fn apply(
             )?;
         }
     }
+    for (&source, ids) in &batch.forget {
+        if batch.prune.contains(&source) {
+            continue;
+        }
+        for id in ids {
+            tx.execute(
+                "DELETE FROM memory_owners WHERE id = ?1 AND worktree = ?2
+                   AND id IN (SELECT id FROM memories WHERE source = ?3)",
+                params![id, checkout.worktree, source],
+            )?;
+        }
+    }
     // Claims of worktrees git no longer knows about (removed with `git worktree remove`, or
     // deleted by hand) are dropped too, or their rows would stay forever.
     if checkout.known {
@@ -1158,6 +1257,19 @@ pub fn last_imported_head(store: &MemoryStore, repo: &Path) -> Result<Option<Str
         .query_row(
             "SELECT value FROM memdag_meta WHERE key = ?1",
             params![head_meta_key(repo)],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// Start time (UTC ISO 8601) of the last successful gh fetch for `repo`'s checkout; the next
+/// `--gh` import without `--full` asks only for comments updated since then.
+pub fn last_gh_import(store: &MemoryStore, repo: &Path) -> Result<Option<String>> {
+    Ok(store
+        .connection()
+        .query_row(
+            "SELECT value FROM memdag_meta WHERE key = ?1",
+            params![gh_meta_key(repo)],
             |r| r.get(0),
         )
         .optional()?)
@@ -1289,11 +1401,21 @@ mod tests {
 
     #[test]
     fn gh_paginated_output() {
-        let raw = r#"[{"id":1,"body":"a","issue_url":"https://api.github.com/repos/o/r/issues/752","user":{"login":"u"}}]
+        let raw = r#"[{"id":1,"body":"a","issue_url":"https://api.github.com/repos/o/r/issues/752","user":{"login":"u"},"updated_at":"2026-10-30T10:00:00Z"}]
 [{"id":2,"body":"b"}]"#;
         let c = parse_gh_comments(raw).unwrap();
         assert_eq!(c.len(), 2);
         assert_eq!(c[0].issue_number, Some(752));
         assert_eq!(c[0].author.as_deref(), Some("u"));
+        assert_eq!(c[0].updated_at.as_deref(), Some("2026-10-30T10:00:00Z"));
+        assert_eq!(c[1].updated_at, None);
+    }
+
+    #[test]
+    fn gh_since_must_be_plain_utc() {
+        assert!(is_iso_utc("2026-10-30T10:00:00Z"));
+        assert!(!is_iso_utc("2026-10-30T10:00:00+01:00"));
+        assert!(!is_iso_utc("2026-10-30T10:00:0&Z"));
+        assert!(!is_iso_utc(""));
     }
 }

@@ -270,9 +270,15 @@ pub enum Commands {
         notes: bool,
 
         /// GitHub issue comments starting with `<!-- handoff -->` from OWNER/MEMBER/COLLABORATOR
-        /// authors, via the `gh` CLI (network, slow). Never part of a bare `import`.
+        /// authors, via the `gh` CLI (network, slow). Never part of a bare `import`. After the
+        /// first run only comments updated since the last `--gh` import are fetched.
         #[arg(long)]
         gh: bool,
+
+        /// With --gh: fetch every comment again and remove memories of deleted comments
+        /// (an incremental fetch can't see deletions).
+        #[arg(long, requires = "gh")]
+        full: bool,
 
         /// Only scan commits in `<REV>..HEAD` (ADRs and notes are always rescanned)
         #[arg(long)]
