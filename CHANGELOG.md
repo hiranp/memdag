@@ -7,6 +7,8 @@ versions follow [Semantic Versioning](https://semver.org/). Releases are cut wit
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-31
+
 New features and schema v6; existing databases migrate on open. The reasoning is in ADRs
 [0001](docs/adr/0001-evidence-informed-memory-direction.md) to
 [0006](docs/adr/0006-one-installer-for-every-harness.md).
