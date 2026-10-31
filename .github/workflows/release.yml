@@ -1,6 +1,7 @@
 name: Release
 
-# Builds memdag for Linux, macOS (Intel + Apple Silicon) and Windows, after the full CI
+# Builds memdag for Linux (static musl for x86_64 and arm64, plus glibc x86_64), macOS (Intel +
+# Apple Silicon) and Windows, after the full CI
 # (including the macOS and Windows tests) passes on the tagged commit, then publishes a
 # GitHub Release whose notes are the version's CHANGELOG.md section, with a SHA256SUMS file.
 #
@@ -20,6 +21,10 @@ on:
       tag:
         description: "Existing tag to build and publish, e.g. v0.4.0"
         required: true
+      publish:
+        description: "Publish the release (off: build and check only)"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -50,6 +55,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Static: runs on any x86_64/arm64 Linux, whatever its glibc (the glibc build needs
+          # the runner's 2.39 or newer).
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            ext: tar.gz
+            musl: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            ext: tar.gz
+            musl: true
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             ext: tar.gz
@@ -73,8 +88,28 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
+      # Bundled SQLite and sqlite-vec are C; musl-gcc compiles them for the static targets.
+      - name: musl toolchain
+        if: matrix.musl
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q musl-tools
+          target_env="${{ matrix.target }}"
+          echo "CC_${target_env//-/_}=musl-gcc" >> "$GITHUB_ENV"
+
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # A "static" binary that still links libc would bring the glibc problem back.
+      - name: Check the binary is static and runs
+        if: matrix.musl
+        run: |
+          bin="target/${{ matrix.target }}/release/memdag"
+          file "$bin"
+          if ldd "$bin" 2>&1 | grep -q '=>'; then
+            echo "::error::$bin is dynamically linked"; ldd "$bin"; exit 1
+          fi
+          "$bin" --version
 
       - name: Package (unix)
         if: matrix.ext == 'tar.gz'
@@ -97,6 +132,7 @@ jobs:
   publish:
     name: Publish release
     needs: build
+    if: github.event_name == 'push' || inputs.publish
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
