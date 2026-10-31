@@ -1,0 +1,3 @@
+__pycache__/
+# Raw runs; curated results go in bench/RESULTS.md
+results/
