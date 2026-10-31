@@ -799,13 +799,20 @@ impl MemoryStore {
 
     /// Attach 1-hop relations and staleness to ranked hits.
     fn finish_results(&self, ranked: Vec<(Memory, f64)>) -> Result<Vec<MemorySearchResult>> {
+        let elsewhere: Vec<bool> = ranked
+            .iter()
+            .map(|(m, _)| self.only_in_other_checkout(m))
+            .collect();
+        let memories: Vec<&Memory> = ranked.iter().map(|(m, _)| m).collect();
+        let stale = self.stale_paths_checked(&memories, &elsewhere);
         ranked
             .into_iter()
-            .map(|(memory, rank)| {
+            .zip(elsewhere.into_iter().zip(stale))
+            .map(|((memory, rank), (other_checkout, stale_paths))| {
                 Ok(MemorySearchResult {
-                    other_checkout: self.only_in_other_checkout(&memory),
+                    other_checkout,
                     relations: self.get_memory_relations(&memory.id)?,
-                    stale_paths: self.stale_paths(&memory),
+                    stale_paths,
                     memory,
                     rank,
                 })
@@ -820,42 +827,104 @@ impl MemoryStore {
     /// or no baseline is comparable: no signal, never a false alarm. Everything read from
     /// note files is re-validated before it reaches `git`.
     pub fn stale_paths(&self, memory: &Memory) -> Vec<String> {
+        self.stale_paths_many(&[memory]).pop().unwrap_or_default()
+    }
+
+    /// [`Self::stale_paths`] for many memories at once, with a constant number of git
+    /// processes for all their fingerprints (plus one `git diff` per distinct commit for
+    /// memories that only have a commit baseline). One entry per memory, in order.
+    pub fn stale_paths_many(&self, memories: &[&Memory]) -> Vec<Vec<String>> {
+        let elsewhere: Vec<bool> = memories
+            .iter()
+            .map(|m| self.only_in_other_checkout(m))
+            .collect();
+        self.stale_paths_checked(memories, &elsewhere)
+    }
+
+    /// [`Self::stale_paths_many`] with `only_in_other_checkout` already answered per memory.
+    fn stale_paths_checked(&self, memories: &[&Memory], elsewhere: &[bool]) -> Vec<Vec<String>> {
+        let mut out = vec![Vec::new(); memories.len()];
         let Some(root) = self.repo_root.as_deref() else {
-            return Vec::new();
+            return out;
         };
-        if memory.paths.is_empty() || self.only_in_other_checkout(memory) {
-            return Vec::new();
+        let checkable: Vec<usize> = (0..memories.len())
+            .filter(|&i| {
+                let m = memories[i];
+                !m.paths.is_empty()
+                    && !elsewhere[i]
+                    && m.paths.iter().all(|p| is_valid_repo_path(p))
+            })
+            .collect();
+        let (by_content, by_commit): (Vec<usize>, Vec<usize>) = checkable
+            .into_iter()
+            .partition(|&i| provenance::comparable(&memories[i].paths, &memories[i].fingerprints));
+
+        if !by_content.is_empty() {
+            let cited: Vec<&str> = by_content
+                .iter()
+                .flat_map(|&i| memories[i].paths.iter().map(String::as_str))
+                .collect();
+            let now = provenance::fingerprints_many(root, &cited);
+            for &i in &by_content {
+                out[i] =
+                    provenance::changed_since(&memories[i].paths, &memories[i].fingerprints, &now);
+            }
         }
-        if memory.paths.is_empty() || !memory.paths.iter().all(|p| is_valid_repo_path(p)) {
-            return Vec::new();
+
+        let mut by_sha: Vec<(&str, Vec<usize>)> = Vec::new();
+        for i in by_commit {
+            let Some(commit) = memories[i].commit.as_deref().filter(|c| is_valid_commit(c)) else {
+                continue;
+            };
+            match by_sha.iter_mut().find(|(c, _)| *c == commit) {
+                Some((_, group)) => group.push(i),
+                None => by_sha.push((commit, vec![i])),
+            }
         }
-        if !memory.fingerprints.is_empty()
-            && let Some(changed) = provenance::changed(root, &memory.paths, &memory.fingerprints)
-        {
-            return changed;
+        for (commit, group) in by_sha {
+            // One diff serves the whole group only if its output can be split back per memory:
+            // `diff --name-only` prints paths from the top level, so `root` must be one, and every
+            // cited path must be plain.
+            let shared = group.len() > 1
+                && root.join(".git").exists()
+                && group.iter().all(|&i| {
+                    memories[i]
+                        .paths
+                        .iter()
+                        .all(|p| provenance::is_plain_path(p))
+                });
+            let split = shared
+                .then(|| {
+                    let paths: Vec<&str> = group
+                        .iter()
+                        .flat_map(|&i| memories[i].paths.iter().map(String::as_str))
+                        .collect();
+                    changed_since_commit(root, commit, &paths)
+                })
+                .flatten()
+                // A quoted name (`core.quotePath`) can't be matched to a cited path.
+                .filter(|lines| !lines.iter().any(|l| l.starts_with('"')));
+            for i in group {
+                out[i] = match &split {
+                    Some(lines) => lines
+                        .iter()
+                        .filter(|l| {
+                            memories[i]
+                                .paths
+                                .iter()
+                                .any(|p| provenance::pathspec_covers(p, l))
+                        })
+                        .cloned()
+                        .collect(),
+                    None => {
+                        let paths: Vec<&str> =
+                            memories[i].paths.iter().map(String::as_str).collect();
+                        changed_since_commit(root, commit, &paths).unwrap_or_default()
+                    }
+                };
+            }
         }
-        let Some(commit) = memory.commit.as_deref().filter(|c| is_valid_commit(c)) else {
-            return Vec::new();
-        };
-        // --literal-pathspecs: a cited path like ":(exclude)x" must be a file name, not magic.
-        let mut args = vec![
-            "--literal-pathspecs",
-            "diff",
-            "--name-only",
-            "--no-renames",
-            commit,
-            "--",
-        ];
-        args.extend(memory.paths.iter().map(String::as_str));
-        match git(root, &args) {
-            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(str::to_string)
-                .collect(),
-            _ => Vec::new(),
-        }
+        out
     }
 
     /// Active memories whose cited paths changed since they were recorded.
@@ -870,12 +939,11 @@ impl MemoryStore {
             ))?
             .query_map([], row_to_memory)?
             .collect::<Result<Vec<_>, _>>()?;
+        let stale = self.stale_paths_many(&candidates.iter().collect::<Vec<_>>());
         Ok(candidates
             .into_iter()
-            .filter_map(|m| {
-                let stale = self.stale_paths(&m);
-                (!stale.is_empty()).then_some((m, stale))
-            })
+            .zip(stale)
+            .filter(|(_, stale)| !stale.is_empty())
             .collect())
     }
 
@@ -1992,4 +2060,36 @@ pub fn format_search_results_with_budget(
         ));
     }
     out
+}
+
+/// `git diff --name-only <commit> -- <paths>` (working tree included), or `None` if git
+/// failed. Long path lists are split over several runs and the names merged in path order.
+fn changed_since_commit(root: &Path, commit: &str, paths: &[&str]) -> Option<Vec<String>> {
+    let chunks = provenance::arg_chunks(paths);
+    let mut names = Vec::new();
+    for chunk in &chunks {
+        // --literal-pathspecs: a cited path like ":(exclude)x" must be a file name, not magic.
+        let mut args = vec![
+            "--literal-pathspecs",
+            "diff",
+            "--name-only",
+            "--no-renames",
+            commit,
+            "--",
+        ];
+        args.extend_from_slice(chunk);
+        let out = git(root, &args).ok().filter(|o| o.status.success())?;
+        names.extend(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string),
+        );
+    }
+    if chunks.len() > 1 {
+        names.sort();
+        names.dedup();
+    }
+    Some(names)
 }
