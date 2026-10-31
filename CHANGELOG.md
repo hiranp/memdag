@@ -7,9 +7,16 @@ versions follow [Semantic Versioning](https://semver.org/). Releases are cut wit
 
 ## [Unreleased]
 
-Planned as 0.4.0 (new features and a schema bump, no breaking CLI/MCP changes). See
-[ADR 0001](docs/adr/0001-evidence-informed-memory-direction.md) and
-[ADR 0003](docs/adr/0003-imported-rows-follow-their-sources.md) for the reasoning.
+New features and schema v6; existing databases migrate on open. The reasoning is in ADRs
+[0001](docs/adr/0001-evidence-informed-memory-direction.md) to
+[0006](docs/adr/0006-one-installer-for-every-harness.md).
+
+Upgrading, in short:
+
+- Run `memdag install` (or `memdag install --refresh`) to set up or update every harness.
+- Linked git worktrees now share the main checkout's database; an old per-worktree database
+  is merged in automatically on first use.
+- Bare `memdag import` no longer includes GitHub comments; pass `--gh`.
 
 ### Added
 

@@ -23,6 +23,7 @@ Modern AI coding workflows tend to fail in one of three ways:
 memdag combines the strengths of each approach into a single in-process, SQLite-backed engine:
 
 - **WAL-backed SQLite**: Safe concurrent access across multiple agent processes without background daemons.
+- **Worktree-aware**: Agents in different git worktrees of a repository share one database, so they see the same tasks and blockers. Agents on other machines share only what is committed to git (see [Scope & Limitations](#scope--limitations)).
 - **FTS5 BM25 search**: Deterministic retrieval of symbols, error signatures, and architectural phrases.
 - **Relational DAG semantics**: Explicit memory supersession and causal dependency tracking (`depends_on`, `blocks`, `references`).
 - **Bidirectional 1-hop expansion**: Automatically retrieves related incoming (`◄`) and outgoing (`➔`) graph edges with search results.
@@ -330,6 +331,10 @@ memdag records which worktrees' checkouts contain each imported memory:
   recent import is the one shown. Notes are append-only, so this only happens with hand
   edits.
 
+This is for worktrees on one machine. Agents on other machines, including cloud agents
+working on their own clone, don't share the database; see
+[Scope & Limitations](#scope--limitations).
+
 Before 0.4, memdag kept a separate database in each linked worktree. The first time a worktree
 opens the shared database, memdag merges the memories recorded there (tasks, blockers, links)
 into it and renames the old file to `memdag.db.merged`. Imported rows are rebuilt from git. Set
@@ -510,20 +515,35 @@ until you switch back. See [ADR 0003](docs/adr/0003-imported-rows-follow-their-s
 
 ### Scope & Limitations
 
-memdag is a **single-machine, single-writer** SQLite store. It is not a replacement for a
-distributed, multi-agent task tracker like [beads](https://github.com/steveyegge/beads):
+memdag is a **local** SQLite store: one database per repository, on one machine. Several
+agents can use it at once, including agents in different
+[worktrees](#several-agents-several-worktrees) of the same repository: they share one
+database, so tasks, blockers and `list_ready` cover all of them.
+
+It does **not** coordinate agents on other machines. That includes cloud agents that run in
+their own VM or container (hosted coding agents working on a fresh clone). They never see
+your database. What they can share is what travels through git:
+
+- **From you to them:** committed write-through notes, ADRs and `Decision:` commit trailers.
+  `memdag import` rebuilds those in any clone.
+- **From them to you:** a note they commit and push reaches you on your next pull and import.
+  Tasks, blockers, links and resolutions of tasks stay in the database they were recorded in.
+
+It is not a replacement for a distributed, multi-agent task tracker like
+[beads](https://github.com/steveyegge/beads):
 
 | | memdag | beads |
 | --- | --- | --- |
 | Storage | Local SQLite file | Dolt (versioned SQL, git-synced) |
-| Cross-machine sync | None (copy/sync the file yourself) | `bd dolt push`/`pull` across git remotes |
-| Concurrent agents | Safe reads/writes on one machine (WAL) | Atomic `--claim` (assignee + in_progress) prevents two agents grabbing the same task |
+| Worktrees on one machine | One shared database per repository; branch-only notes labelled | — |
+| Agents on other machines / cloud agents | Only git-tracked notes, ADRs and commits, via `memdag import`; no shared tasks | `bd dolt push`/`pull` across git remotes |
+| Concurrent agents | Safe concurrent reads/writes on one machine (WAL) | Atomic `--claim` (assignee + in_progress) prevents two agents grabbing the same task |
 | Ready queue | `memdag ready` / `list_ready` (not atomic — no claim) | `bd ready` + atomic `--claim` |
 | Priority / epics / sub-tasks | Not modeled (encode in `tags` if needed) | First-class fields and hierarchical IDs |
 
-If you need agents on different machines or git branches claiming and syncing work without
-colliding, use beads. If you want one lightweight, zero-daemon store for a single agent's
-decisions, invariants, and tasks on one machine, memdag covers it.
+If agents on different machines need to claim and sync work without colliding, use beads.
+If your agents run on one machine, in one checkout or several worktrees, and you want one
+lightweight, zero-daemon store for their decisions, invariants and tasks, memdag covers it.
 
 ---
 
