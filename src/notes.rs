@@ -12,6 +12,8 @@
 //! paths: ["src/store.rs"]   (optional: files the note is about)
 //! commit: 1a2b3c4           (optional: HEAD when the note was recorded)
 //! fingerprints: ["<hash>"]  (optional: content hash of each path when recorded)
+//! recorded: 2026-10-30 12:34:56  (optional: UTC creation time, restored on rebuild)
+//! session: <session id>     (optional: the agent session that recorded it)
 //! ---
 //! # Title
 //!
@@ -42,6 +44,11 @@ pub struct Note {
     pub commit: Option<String>,
     /// Content fingerprint per path (aligned with `paths`); the staleness baseline.
     pub fingerprints: Vec<String>,
+    /// When the memory was recorded (UTC, `YYYY-MM-DD HH:MM:SS`, SQLite's
+    /// `CURRENT_TIMESTAMP` form); becomes `created_at` on import.
+    pub recorded: Option<String>,
+    /// Session that recorded the memory; see [`is_valid_session_id`].
+    pub session: Option<String>,
 }
 
 impl Note {
@@ -82,6 +89,13 @@ impl Note {
                 .collect::<Vec<_>>()
                 .join(", ");
             provenance.push_str(&format!("fingerprints: [{fps}]\n"));
+        }
+        // Validated here too: an unchecked value could break out of the front matter.
+        if let Some(r) = self.recorded.as_deref().filter(|r| is_valid_recorded(r)) {
+            provenance.push_str(&format!("recorded: {r}\n"));
+        }
+        if let Some(s) = self.session.as_deref().filter(|s| is_valid_session_id(s)) {
+            provenance.push_str(&format!("session: {s}\n"));
         }
         let mut out = format!(
             "---\nid: {}\nkind: {}\ntags: [{tags}]\nsupersedes: {}\nrefs: [{refs}]\n{provenance}---\n# {}\n",
@@ -124,6 +138,8 @@ pub fn parse_note(text: &str, fallback_id: &str) -> Result<Note> {
     let mut paths = Vec::new();
     let mut commit = None;
     let mut fingerprints = Vec::new();
+    let mut recorded = None;
+    let mut session = None;
 
     let mut lines = front.lines().peekable();
     while let Some(line) = lines.next() {
@@ -169,6 +185,8 @@ pub fn parse_note(text: &str, fallback_id: &str) -> Result<Note> {
             "paths" => paths = parse_list(&value),
             "commit" => commit = Some(unquote(&value)).filter(|s| !s.is_empty()),
             "fingerprints" => fingerprints = parse_list(&value),
+            "recorded" => recorded = Some(unquote(&value)).filter(|s| !s.is_empty()),
+            "session" => session = Some(unquote(&value)).filter(|s| !s.is_empty()),
             _ => {}
         }
     }
@@ -189,6 +207,8 @@ pub fn parse_note(text: &str, fallback_id: &str) -> Result<Note> {
         paths,
         commit,
         fingerprints,
+        recorded,
+        session,
     })
 }
 
@@ -362,6 +382,26 @@ pub fn clean_provenance(
         None => None,
     };
     Ok((out, commit))
+}
+
+/// A session id goes into a note's front matter as-is, so it must stay one plain token.
+pub fn is_valid_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 120
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
+}
+
+/// `YYYY-MM-DD HH:MM:SS`, the form SQLite's `CURRENT_TIMESTAMP` produces.
+pub fn is_valid_recorded(ts: &str) -> bool {
+    ts.len() == 19
+        && ts.bytes().enumerate().all(|(i, b)| match i {
+            4 | 7 => b == b'-',
+            10 => b == b' ',
+            13 | 16 => b == b':',
+            _ => b.is_ascii_digit(),
+        })
 }
 
 /// A memory id is used as a file name, so keep it portable (Windows included).
@@ -578,6 +618,8 @@ mod tests {
             paths: Vec::new(),
             commit: None,
             fingerprints: Vec::new(),
+            recorded: None,
+            session: None,
         }
     }
 
@@ -605,6 +647,26 @@ mod tests {
         assert!(text.contains("commit: 1a2b3c4d\nfingerprints: ["));
         assert!(text.contains("\"-\"]\n---\n# Use WAL"));
         assert_eq!(parse_note(&text, "x").unwrap(), n);
+    }
+
+    #[test]
+    fn recorded_and_session_round_trip_and_are_omitted_when_unset() {
+        let plain = sample().render();
+        assert!(!plain.contains("recorded:") && !plain.contains("session:"));
+
+        let mut n = sample();
+        n.recorded = Some("2026-10-30 12:34:56".into());
+        n.session = Some("ses_01:a-b.c".into());
+        let text = n.render();
+        assert!(text.contains("recorded: 2026-10-30 12:34:56\nsession: ses_01:a-b.c\n---\n"));
+        assert_eq!(parse_note(&text, "x").unwrap(), n);
+
+        assert!(is_valid_session_id("ses_01:a-b.c"));
+        assert!(!is_valid_session_id("a b"));
+        assert!(!is_valid_session_id("a\n---"));
+        assert!(!is_valid_session_id(&"a".repeat(121)));
+        assert!(is_valid_recorded("2026-10-30 12:34:56"));
+        assert!(!is_valid_recorded("2026-10-30T12:34:56"));
     }
 
     #[test]

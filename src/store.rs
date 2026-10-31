@@ -6,8 +6,8 @@ use crate::models::{
 };
 use crate::notes::{
     Note, RESOLVED_SUFFIX, clean_provenance, is_valid_commit, is_valid_note_id, is_valid_repo_path,
-    join_paths, join_tags, parse_note, render_resolution, resolution_suffix, slugify, split_paths,
-    split_tags, write_new_file_atomic,
+    is_valid_session_id, join_paths, join_tags, parse_note, render_resolution, resolution_suffix,
+    slugify, split_paths, split_tags, write_new_file_atomic,
 };
 use crate::provenance;
 use anyhow::{Context, Result, bail};
@@ -375,6 +375,8 @@ impl MemoryStore {
         let mut fingerprints = Vec::new();
         self.stamp_provenance(&mut opts.paths, &mut opts.commit, &mut fingerprints)?;
         let mut source: Option<&'static str> = None;
+        // One timestamp for the note and the row, so a rebuild from the note reproduces it.
+        let now = self.now()?;
 
         let mut written: Option<PathBuf> = None;
         if let Some(dir) = self
@@ -393,6 +395,8 @@ impl MemoryStore {
                 paths: opts.paths.clone(),
                 commit: opts.commit.clone(),
                 fingerprints: fingerprints.clone(),
+                recorded: Some(now.clone()),
+                session: opts.session_id.clone().filter(|s| is_valid_session_id(s)),
             };
             let (note, path) = self.write_note(&dir, draft)?;
             opts.id = Some(note.id);
@@ -408,7 +412,7 @@ impl MemoryStore {
         }
 
         let had_embedding = opts.embedding.is_some();
-        let result = self.insert_memory(opts, &fingerprints, source);
+        let result = self.insert_memory(opts, &fingerprints, source, &now);
         if result.is_err()
             && let Some(path) = written
         {
@@ -511,11 +515,21 @@ impl MemoryStore {
         Ok(done)
     }
 
+    /// The current UTC time as SQLite's `CURRENT_TIMESTAMP` writes it.
+    fn now(&self) -> Result<String> {
+        Ok(self
+            .conn
+            .query_row("SELECT strftime('%Y-%m-%d %H:%M:%S', 'now')", [], |r| {
+                r.get(0)
+            })?)
+    }
+
     fn insert_memory(
         &mut self,
         opts: RecordOptions,
         fingerprints: &[String],
         source: Option<&str>,
+        now: &str,
     ) -> Result<Memory> {
         let new_id = opts.id.unwrap_or_else(|| {
             let short_uuid = &uuid::Uuid::new_v4().to_string()[..8];
@@ -561,8 +575,8 @@ impl MemoryStore {
         // Insert new entity FIRST so foreign keys can reference it
         tx.execute(
             r#"
-            INSERT INTO memories (id, kind, title, body, tags, status, session_id, paths, commit_sha, fingerprints, source, origin_repo)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            INSERT INTO memories (id, kind, title, body, tags, status, session_id, paths, commit_sha, fingerprints, source, origin_repo, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)
             "#,
             params![
                 new_id,
@@ -577,6 +591,7 @@ impl MemoryStore {
                 join_paths(fingerprints),
                 source,
                 origin,
+                now,
             ],
         )
         .context("Failed to insert memory record")?;
@@ -957,6 +972,7 @@ impl MemoryStore {
         let mut prepared: Vec<PreparedLearning> = Vec::with_capacity(learnings.len());
         let mut written: Vec<PathBuf> = Vec::new();
         let result = (|| -> Result<ConsolidationResult> {
+            let now = self.now()?;
             for learning in &learnings {
                 check_for_secrets(&learning.title, &learning.body, learning.tags.as_deref())?;
                 let mut paths = learning.paths.clone();
@@ -980,6 +996,9 @@ impl MemoryStore {
                             paths,
                             commit,
                             fingerprints,
+                            recorded: Some(now.clone()),
+                            session: Some(session_id.to_string())
+                                .filter(|s| is_valid_session_id(s)),
                         };
                         let (note, path) = self.write_note(&dir, draft)?;
                         written.push(path);
@@ -1009,7 +1028,7 @@ impl MemoryStore {
                     }
                 }
             }
-            self.consolidate_tx(session_id, &learnings, &prepared, purge_ephemeral)
+            self.consolidate_tx(session_id, &learnings, &prepared, purge_ephemeral, &now)
         })();
         if result.is_err() {
             for path in written {
@@ -1046,6 +1065,7 @@ impl MemoryStore {
         learnings: &[SessionLearning],
         prepared: &[PreparedLearning],
         purge_ephemeral: bool,
+        now: &str,
     ) -> Result<ConsolidationResult> {
         let origin = self.origin_for(Some("note"));
         let owner = self.owner_for(Some("note"));
@@ -1058,8 +1078,8 @@ impl MemoryStore {
         for (learning, p) in learnings.iter().zip(prepared) {
             tx.execute(
                 r#"
-                INSERT INTO memories (id, kind, title, body, tags, status, session_id, paths, commit_sha, fingerprints, source, origin_repo)
-                VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7, ?8, ?9, ?10, ?11)
+                INSERT INTO memories (id, kind, title, body, tags, status, session_id, paths, commit_sha, fingerprints, source, origin_repo, created_at, updated_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)
                 "#,
                 params![
                     p.id,
@@ -1073,6 +1093,7 @@ impl MemoryStore {
                     join_paths(&p.fingerprints),
                     p.source,
                     p.source.and(origin.as_deref()),
+                    now,
                 ],
             )
             .context("Failed to insert consolidated session learning")?;

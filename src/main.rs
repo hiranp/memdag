@@ -390,6 +390,7 @@ fn main() -> anyhow::Result<()> {
             adr,
             notes,
             gh,
+            full,
             since,
         }) => {
             let root = match repo_arg {
@@ -407,6 +408,7 @@ fn main() -> anyhow::Result<()> {
                 adr: !any || adr,
                 notes: !any || notes,
                 gh,
+                gh_full: full,
                 record_head: since.is_none(),
                 since,
                 notes_dir: config.notes_dir(),
