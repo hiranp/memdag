@@ -8,8 +8,8 @@
 use crate::models::{MemoryKind, RelationType};
 use crate::notes::{
     RESOLVED_SUFFIX, is_valid_commit, is_valid_note_id, is_valid_recorded, is_valid_repo_path,
-    is_valid_session_id, join_paths, join_tags, parse_note, parse_resolution, resolution_suffix,
-    split_front_matter, split_title,
+    is_valid_session_id, join_fingerprints, join_paths, join_tags, parse_note, parse_resolution,
+    resolution_suffix, split_front_matter, split_title,
 };
 use crate::provenance::is_valid_fingerprint;
 use crate::store::MemoryStore;
@@ -744,6 +744,8 @@ fn collect_notes(dir: &Path, batch: &mut Batch, report: &mut ImportReport) -> bo
             // Note files come from the repo, so re-validate before trusting them. Fingerprints
             // are aligned with paths, so they survive only if every path does.
             fingerprints: if note.paths.iter().all(|p| is_valid_repo_path(p))
+                // A repeated path would be stored once, misaligning the fingerprints.
+                && note.paths.iter().collect::<HashSet<_>>().len() == note.paths.len()
                 && note.fingerprints.len() == note.paths.len()
                 && note.fingerprints.iter().all(|f| is_valid_fingerprint(f))
             {
@@ -1059,7 +1061,7 @@ fn apply(
                 item.superseded,
                 join_paths(&item.paths),
                 item.commit,
-                join_paths(&item.fingerprints),
+                join_fingerprints(&item.fingerprints),
                 item.source,
                 repo,
                 item.resolved,

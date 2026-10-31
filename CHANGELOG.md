@@ -7,6 +7,40 @@ versions follow [Semantic Versioning](https://semver.org/). Releases are cut wit
 
 ## [Unreleased]
 
+### Added
+
+- **Static Linux binaries.** Releases include `x86_64-unknown-linux-musl` and
+  `aarch64-unknown-linux-musl` builds, checked to be statically linked, which run on any Linux
+  whatever its glibc. The glibc build needs glibc 2.38+ and fails on e.g. RHEL/Oracle Linux 9
+  (#5).
+- `MEMDAG_EMBED_MODEL`: when set, it identifies the embedding model instead of the
+  `MEMDAG_EMBED_CMD` string, so a model change behind an unchanged command drops the stale
+  vectors. Databases without it keep their vectors.
+- Write-through notes record `recorded:` (UTC creation time) and `session:` in their front
+  matter, so a rebuild from git restores `created_at` and the session id. Notes without them
+  import as before.
+- `bench/`: a reproducible benchmark of memdag's effect on an agent's corrections and cost
+  (see `bench/RESULTS.md`).
+
+### Changed
+
+- `memdag import --gh` fetches only comments updated since the last successful `--gh`
+  import of this checkout. `--gh --full` fetches everything and removes memories of deleted
+  comments.
+- Staleness checks are batched: search, `memdag stale` and `record` fingerprint all cited
+  paths with at most three git processes, instead of one to three per path per memory (50
+  results: 251 → 4 git processes, ~600 ms → ~13 ms).
+- `MemoryStore::search_vector` takes `&SearchOptions` instead of a limit.
+
+### Fixed
+
+- `search_vector` no longer returns resolved, superseded or other-kind memories. It applies
+  `include_resolved` and `kind` (new optional MCP arguments), over-fetches so filtering doesn't
+  cut results short, and returns relations and staleness like keyword search.
+- A memory whose cited paths had equal fingerprints (two absent files, two identical files)
+  stored them deduplicated and silently fell back to a commit diff for staleness.
+- `Decision:` commits whose subject or body contain the byte 0x1f are no longer misparsed.
+
 ## [0.4.0] - 2026-10-31
 
 New features and schema v6; existing databases migrate on open. The reasoning is in ADRs

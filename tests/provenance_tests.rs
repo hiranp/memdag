@@ -506,3 +506,51 @@ fn vector_tool_is_advertised_only_with_an_embedder() {
     s.set_embed_command(Some("true".into()));
     assert!(list(s).contains(&"search_vector".to_string()));
 }
+
+#[test]
+fn equal_fingerprints_stay_aligned_with_their_paths() {
+    // Two cited files that don't exist yet both fingerprint as "-". Storing them deduplicated
+    // left one fingerprint for two paths, and staleness silently fell back to a commit diff.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    for args in [
+        &["init", "-q"][..],
+        &["config", "user.email", "t@e.com"],
+        &["config", "user.name", "T"],
+        &["config", "commit.gpgsign", "false"],
+        &["commit", "-q", "--allow-empty", "-m", "init"],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let mut store = memdag::MemoryStore::new(memdag::open_in_memory().unwrap());
+    store.set_repo_root(Some(repo.to_path_buf()));
+    let mem = store
+        .record_memory(memdag::RecordOptions {
+            id: None,
+            kind: memdag::models::MemoryKind::Task,
+            title: "write a.rs and b.rs".into(),
+            body: "todo".into(),
+            tags: None,
+            supersedes_id: None,
+            session_id: None,
+            embedding: None,
+            paths: vec!["a.rs".into(), "b.rs".into()],
+            commit: None,
+        })
+        .unwrap();
+    assert_eq!(mem.fingerprints, vec!["-", "-"]);
+    std::fs::write(repo.join("a.rs"), "fn a() {}\n").unwrap();
+    assert_eq!(
+        store.stale_paths(&mem),
+        vec!["a.rs"],
+        "only the file that appeared"
+    );
+}

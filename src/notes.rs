@@ -331,6 +331,14 @@ pub fn join_paths(paths: &[String]) -> Option<String> {
     (!seen.is_empty()).then(|| seen.join("\n"))
 }
 
+/// Join fingerprints into the newline-separated form stored in `memories.fingerprints`. Unlike
+/// [`join_paths`] this keeps duplicates: fingerprints are aligned with `paths`, and two cited
+/// paths can have the same one (two absent paths, two identical files).
+pub fn join_fingerprints(fingerprints: &[String]) -> Option<String> {
+    let kept: Vec<&str> = fingerprints.iter().map(|f| f.trim()).collect();
+    (!kept.is_empty() && kept.iter().all(|f| !f.is_empty())).then(|| kept.join("\n"))
+}
+
 /// Inverse of [`join_paths`].
 pub fn split_paths(stored: Option<&str>) -> Vec<String> {
     stored

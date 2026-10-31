@@ -6,8 +6,8 @@ use crate::models::{
 };
 use crate::notes::{
     Note, RESOLVED_SUFFIX, clean_provenance, is_valid_commit, is_valid_note_id, is_valid_repo_path,
-    is_valid_session_id, join_paths, join_tags, parse_note, render_resolution, resolution_suffix,
-    slugify, split_paths, split_tags, write_new_file_atomic,
+    is_valid_session_id, join_fingerprints, join_paths, join_tags, parse_note, render_resolution,
+    resolution_suffix, slugify, split_paths, split_tags, write_new_file_atomic,
 };
 use crate::provenance;
 use anyhow::{Context, Result, bail};
@@ -588,7 +588,7 @@ impl MemoryStore {
                 opts.session_id,
                 join_paths(&opts.paths),
                 opts.commit,
-                join_paths(fingerprints),
+                join_fingerprints(fingerprints),
                 source,
                 origin,
                 now,
@@ -1090,7 +1090,7 @@ impl MemoryStore {
                     session_id,
                     join_paths(&p.paths),
                     p.commit,
-                    join_paths(&p.fingerprints),
+                    join_fingerprints(&p.fingerprints),
                     p.source,
                     p.source.and(origin.as_deref()),
                     now,
@@ -1441,7 +1441,7 @@ impl MemoryStore {
                     "UPDATE memories SET fingerprints = ?2, commit_sha = ?3,
                      updated_at = CURRENT_TIMESTAMP WHERE id = ?1 RETURNING {MEMORY_COLS}"
                 ),
-                params![id, join_paths(&fingerprints), commit],
+                params![id, join_fingerprints(&fingerprints), commit],
                 row_to_memory,
             )
             .context("Failed to re-baseline memory")

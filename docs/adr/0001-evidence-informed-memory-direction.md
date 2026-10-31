@@ -117,13 +117,13 @@ Found by an independent review of the branch. Pruning, resolutions in git, refre
 `serve`, embedder identity and atomic note files were fixed afterwards; see ADR 0003. Still
 open:
 
-- A rebuild reproduces note-backed content and resolutions, but not timestamps or session ids.
-- The embedder's identity is its command string; a different model behind the same command
-  is not detected.
-- A commit body containing the byte `0x1f` (the git importer's field separator) is misparsed.
-- Staleness spawns git once per cited path (twice for directories) per result shown, and
-  `gh` import fetches every comment in the repository.
-- `search_vector` ignores status and kind filters (the hybrid path honours them).
+- Fixed in 0.4.1: a rebuild now restores the creation time and session id of write-through
+  notes (`recorded:`, `session:`); `MEMDAG_EMBED_MODEL` names the model behind an unchanged
+  command; commit messages containing `0x1f` parse correctly; staleness takes a constant
+  number of git processes per search; `gh` import is incremental; `search_vector` applies
+  status and kind filters.
+- Still open: a `0x1f` inside a `Decision:`/`Refs:` trailer value; notes written before 0.4.1
+  have no `recorded:`, so their rebuild time is the import time.
 
 ## Validation
 

@@ -86,7 +86,9 @@ Claude Code, `/memdag:verify_stale` in OpenCode): `expand_keywords`, `verify_sta
 
 Each tagged release (`vX.Y.Z`) publishes binaries for Linux, macOS (Intel + Apple Silicon),
 and Windows via [GitHub Actions](.github/workflows/release.yml) — see the
-[Releases](https://github.com/hiranp/memdag/releases) page.
+[Releases](https://github.com/hiranp/memdag/releases) page, with a `SHA256SUMS` file. On Linux,
+take a `*-linux-musl` archive (x86_64 or aarch64): it is statically linked and runs on any
+distribution. The `x86_64-unknown-linux-gnu` one needs glibc 2.38 or newer.
 
 Extract it somewhere stable and on `PATH`, not left in `~/Downloads` or a temp directory —
 both the CLI and the configs `memdag install` writes reference this exact file path:
@@ -423,9 +425,19 @@ memdag embed                                      # backfill vectors for existin
 
 New memories are embedded on write (best effort: an embedder outage never blocks recording).
 If the command is missing or failing, search falls back to BM25. The command is read from the
-environment only, so a cloned repository can't make memdag run anything. memdag records which
-command produced the stored vectors; if you switch to a different command, the old vectors are
-dropped (vectors from two models can't be compared) and `memdag embed` recomputes them.
+environment only, so a cloned repository can't make memdag run anything.
+
+Vector search (`search_vector`, and the vector half of `search_memory`) applies the same
+filters as keyword search: resolved and superseded memories are left out unless
+`include_resolved` is set, and `kind` limits the results to one kind.
+
+memdag records which embedder produced the stored vectors and drops them when it changes
+(vectors from two models can't be compared); `memdag embed` recomputes them. The identity is
+the `MEMDAG_EMBED_CMD` string. If your command can switch models without its text changing
+(a script that reads the model name from a config file), also set `MEMDAG_EMBED_MODEL`
+(e.g. `bge-small-en-v1.5`). The model name is then the identity: changing it drops the
+vectors, and changing only the command (a new path or flag) keeps them. It is read from the
+environment only too.
 
 ### Cheap-model workers
 
@@ -518,9 +530,16 @@ rebuilding. See [ADR 0004](docs/adr/0004-cheap-model-workers.md).
   next to the note, so the resolution survives a rebuild from git. Commit it with the note.
 - Several repositories can share one database (`MEMDAG_DB`); each import only touches rows
   from its own repository.
+- Write-through notes carry `recorded:` and `session:` in their front matter, so a rebuild
+  restores when and in which session a memory was recorded.
+- `memdag import --gh` is incremental: it asks GitHub only for comments updated since the last
+  successful fetch from this checkout. That can't see deleted comments, so
+  `memdag import --gh --full` fetches everything and removes memories of deleted ones.
 
-The index reflects the current checkout: notes and commits on other branches are not in it
-until you switch back. See [ADR 0003](docs/adr/0003-imported-rows-follow-their-sources.md).
+The index covers every worktree of the repository: notes and commits on a branch that isn't
+checked out here are labelled as such (see [worktrees](#several-agents-several-worktrees)).
+See [ADR 0003](docs/adr/0003-imported-rows-follow-their-sources.md) and
+[ADR 0005](docs/adr/0005-worktrees-share-one-database.md).
 
 ### Scope & Limitations
 
