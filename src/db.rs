@@ -24,7 +24,7 @@ PRAGMA synchronous = NORMAL;
 "#;
 
 /// Bump when the schema changes; `init_pragmas_and_schema` migrates older databases up to it.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// `CREATE TABLE` for the core memories table, parameterised on its name so the v1
 /// migration can build a replacement table before swapping it in.
@@ -133,6 +133,19 @@ INSERT OR IGNORE INTO memory_owners (id, worktree)
     SELECT id, origin_repo FROM memories WHERE source IS NOT NULL AND origin_repo IS NOT NULL;
 "#;
 
+/// v6: pairs of memories a consolidate worker has judged (duplicate, conflict, related,
+/// distinct), so a pair is offered once. `a` is the smaller id.
+const V6_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS reviewed_pairs (
+    a TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    b TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    verdict TEXT NOT NULL,
+    reviewed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (a, b)
+);
+CREATE INDEX IF NOT EXISTS idx_reviewed_pairs_b ON reviewed_pairs(b);
+"#;
+
 /// The FTS index. `keywords` holds search terms an LLM worker generated for the memory
 /// (see `work.rs`); it lives in the same index so one query can match body and keywords.
 const FTS_TABLE_SQL: &str = r#"
@@ -205,7 +218,7 @@ DELETE FROM memories_vec WHERE id NOT IN (SELECT id FROM memories);
 /// The full schema for a fresh database.
 pub fn ddl_sql() -> String {
     format!(
-        "{}{}{MEMORIES_DEPENDENTS_SQL}{VEC_TRIGGERS_SQL}{V1_DDL_SQL}{V3_SQL}{V5_SQL}",
+        "{}{}{MEMORIES_DEPENDENTS_SQL}{VEC_TRIGGERS_SQL}{V1_DDL_SQL}{V3_SQL}{V5_SQL}{V6_SQL}",
         memories_table_sql("memories"),
         REST_DDL_SQL.replace("{FTS_TABLE_SQL}", FTS_TABLE_SQL)
     )
@@ -288,6 +301,9 @@ fn init_pragmas_and_schema(conn: &Connection) -> Result<()> {
     }
     if version < 5 {
         migrate_simple(conn, 5, V5_SQL).context("Failed to migrate memdag schema to v5")?;
+    }
+    if version < 6 {
+        migrate_simple(conn, 6, V6_SQL).context("Failed to migrate memdag schema to v6")?;
     }
     Ok(())
 }
@@ -742,5 +758,37 @@ INSERT INTO memory_relations (source_id, target_id, relation_type) VALUES ('TSK-
             .query_row("SELECT count(*) FROM memories_vec", [], |r| r.get(0))
             .unwrap();
         assert_eq!(orphans, 0);
+    }
+
+    #[test]
+    fn migrates_v5_database_adding_reviewed_pairs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v5.db");
+        let conn = open_connection(&path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE reviewed_pairs;
+             INSERT INTO memories (id, kind, title, body) VALUES ('DEC-1', 'decision', 'a', 'b');
+             INSERT INTO memories (id, kind, title, body) VALUES ('DEC-2', 'decision', 'c', 'd');
+             PRAGMA user_version = 5;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = open_connection(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        conn.execute(
+            "INSERT INTO reviewed_pairs (a, b, verdict) VALUES ('DEC-1', 'DEC-2', 'distinct')",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM memories WHERE id = 'DEC-2'", [])
+            .unwrap();
+        let left: i64 = conn
+            .query_row("SELECT count(*) FROM reviewed_pairs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "cascades with the memory");
     }
 }

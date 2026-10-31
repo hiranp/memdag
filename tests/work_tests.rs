@@ -340,7 +340,10 @@ fn mcp_prompts_and_work_tools_round_trip() {
         .iter()
         .map(|p| p["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(names, ["expand_keywords", "verify_stale"]);
+    assert_eq!(
+        names,
+        ["expand_keywords", "verify_stale", "consolidate_memories"]
+    );
     let prompt = call(
         &mcp,
         "prompts/get",

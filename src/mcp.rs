@@ -49,7 +49,7 @@ const AGENT_INSTRUCTIONS: &str = "memdag is your durable project memory and ligh
 - When one memory depends on, blocks, or references another, call link_entities to keep the DAG connected.\n\
 - Call resolve_memory when a task or blocker is done, with a short note on how it was resolved.\n\
 - Before ending a session, call consolidate_session to promote durable learnings and purge scratch/ephemeral notes.\n\
-- Bulk upkeep (search keywords for memories; checking STALE memories against the code) is work for a cheap model: call get_work, hand the batch to a low-cost subagent (e.g. Claude Haiku or Gemini Flash), then submit_work its JSON. The prompts expand_keywords and verify_stale run this end to end.";
+- Bulk upkeep (search keywords for memories; checking STALE memories against the code; finding duplicate or conflicting memories) is work for a cheap model: call get_work, hand the batch to a low-cost subagent (e.g. Claude Haiku or Gemini Flash), then submit_work its JSON. The prompts expand_keywords, verify_stale and consolidate_memories run this end to end.";
 
 /// A JSON array of strings, or a single comma/newline separated string.
 fn string_list(value: Option<&Value>) -> Vec<String> {
@@ -658,7 +658,9 @@ impl McpServer {
                 let task: crate::work::WorkTask = args
                     .get("task")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'task' (expand or verify)"))?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Missing 'task' (expand, verify or consolidate)")
+                    })?
                     .parse()
                     .map_err(|e: String| anyhow::anyhow!(e))?;
                 let limit = args
@@ -909,11 +911,11 @@ impl McpServer {
         ];
         tools.push(json!({
             "name": "get_work",
-            "description": "Get a batch of bulk memory upkeep for a cheap worker model: task 'expand' (write search keywords for memories that have none) or 'verify' (check STALE memories against the code they cite). Returns {instructions, items, remaining}. Hand instructions + items to a low-cost subagent (e.g. Claude Haiku, Gemini Flash), then pass its JSON to submit_work.",
+            "description": "Get a batch of bulk memory upkeep for a cheap worker model: task 'expand' (write search keywords for memories that have none), 'verify' (check STALE memories against the code they cite) or 'consolidate' (judge pairs of similar memories: duplicate, conflict, related or distinct). Returns {instructions, items, remaining}. Hand instructions + items to a low-cost subagent (e.g. Claude Haiku, Gemini Flash), then pass its JSON to submit_work.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "task": { "type": "string", "enum": ["expand", "verify"] },
+                    "task": { "type": "string", "enum": ["expand", "verify", "consolidate"] },
                     "limit": { "type": "integer", "description": "Items per batch (default 20, max 50)." }
                 },
                 "required": ["task"]
@@ -921,11 +923,11 @@ impl McpServer {
         }));
         tools.push(json!({
             "name": "submit_work",
-            "description": "Apply a worker's answers to a get_work batch. Each item is validated on its own; keywords are stored for search, 'valid' verdicts re-baseline a STALE memory, 'outdated' ones record the correction as a new memory superseding the old.",
+            "description": "Apply a worker's answers to a get_work batch. Each item is validated on its own; keywords are stored for search, 'valid' verdicts re-baseline a STALE memory, 'outdated' ones record the correction as a new memory superseding the old; consolidate results (keyed by 'pair') resolve duplicates, turn conflicts into tasks and link related memories.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "task": { "type": "string", "enum": ["expand", "verify"] },
+                    "task": { "type": "string", "enum": ["expand", "verify", "consolidate"] },
                     "results": { "type": "array", "items": { "type": "object" }, "description": "The worker's results array." },
                     "reply": { "type": "string", "description": "Alternative to results: the worker's raw reply text (JSON is extracted)." }
                 }
