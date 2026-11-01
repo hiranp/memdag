@@ -10,7 +10,7 @@ keywords = ["memory", "dag", "sqlite", "fts5", "mcp"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
-rusqlite = { version = "0.40.2", features = ["bundled", "vtab"] }
+rusqlite = { version = "0.41.1", features = ["bundled", "vtab"] }
 sqlite-vec = "=0.1.9"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
